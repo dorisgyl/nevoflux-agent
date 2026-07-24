@@ -85,25 +85,25 @@ pub fn message_to_wire(msg: Message) -> Option<Wire> {
     }
 }
 
-/// Connect to the relay and serve the portal gateway forever, reconnecting with
-/// exponential backoff. `relay_base` is e.g. `wss://portal-relay.<sub>.workers.dev`;
-/// `token` is the better-auth account JWT (URL-safe base64, no encoding needed);
-/// `key` enables E2E (`None` = plaintext S1). `register` installs the gateway in
-/// the daemon's registry so the M2 tap fans chat into it.
+/// Connect to the relay and serve the portal `gateway` forever, reconnecting
+/// with exponential backoff. `relay_base` is e.g. `wss://portal-relay.<sub>.workers.dev`;
+/// `token` is the better-auth account JWT (URL-safe base64, no encoding needed).
+/// `sink` is the same `WsSink` the `gateway` holds — this loop swaps its write
+/// half on each (re)connect so the gateway/`SendSequencer` state persists.
 pub async fn run_gateway(
     relay_base: &str,
     channel_id: &str,
     token: &str,
-    key: Option<[u8; 32]>,
     session_id: String,
     injector: Arc<dyn Injector>,
-    register: impl Fn(Arc<PortalGateway>),
+    sink: Arc<WsSink>,
+    gateway: Arc<PortalGateway>,
 ) {
+    // The caller creates `sink` + `gateway` (key baked in) and registers the
+    // gateway in the `GatewayRegistry` *before* spawning this, so registration
+    // (an async Mutex lock) stays out of this loop.
     // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
     let url = format!("{relay_base}/?c={channel_id}&t={token}");
-    let sink = Arc::new(WsSink::new());
-    let gateway = Arc::new(PortalGateway::new(key, sink.clone()));
-    register(gateway.clone());
 
     let mut backoff_ms = 500u64;
     loop {

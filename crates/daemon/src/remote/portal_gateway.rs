@@ -28,13 +28,21 @@ pub trait WireSink: Send + Sync {
 pub struct PortalGateway {
     session: Mutex<PortalSession>,
     sink: Arc<dyn WireSink>,
+    /// Only chat for this session is projected — the M2 tap fans *every* chat
+    /// `DaemonEnvelope` to every gateway.
+    session_id: String,
 }
 
 impl PortalGateway {
-    pub fn new(key: Option<[u8; 32]>, sink: Arc<dyn WireSink>) -> Self {
+    pub fn new(
+        key: Option<[u8; 32]>,
+        sink: Arc<dyn WireSink>,
+        session_id: impl Into<String>,
+    ) -> Self {
         Self {
             session: Mutex::new(PortalSession::new(key)),
             sink,
+            session_id: session_id.into(),
         }
     }
 
@@ -75,6 +83,16 @@ impl RemoteGateway for PortalGateway {
 
     async fn project(&self, ev: &OutboundEvent) {
         if let OutboundEvent::Chat(env) = ev {
+            // The chat payload is an `AgentMessage` (`{type, payload:{session_id,..}}`);
+            // skip anything not for this gateway's session.
+            let sid = env
+                .payload
+                .get("payload")
+                .and_then(|p| p.get("session_id"))
+                .and_then(|s| s.as_str());
+            if sid != Some(self.session_id.as_str()) {
+                return;
+            }
             let wires = self.session.lock().await.on_chat(&env.payload);
             for w in wires {
                 self.sink.send(w).await;
@@ -117,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn project_chat_sends_sequenced_wires_to_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone());
+        let gw = PortalGateway::new(None, sink.clone(), "sess");
         assert_eq!(gw.id(), "portal");
         assert_eq!(gw.capability(), Capability::FullParity);
         gw.project(&OutboundEvent::Chat(chat_env("s1", "hi"))).await;
@@ -125,10 +143,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_skips_other_sessions_chat() {
+        let sink = Arc::new(CollectSink::default());
+        // chat_env's payload session_id is "sess"; this gateway is a different one.
+        let gw = PortalGateway::new(None, sink.clone(), "other-session");
+        gw.project(&OutboundEvent::Chat(chat_env("s1", "hi"))).await;
+        assert!(sink.sent.lock().await.is_empty()); // filtered out
+    }
+
+    #[tokio::test]
     async fn project_ignores_non_chat_events() {
         use super::super::gateway::NotificationEvent;
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone());
+        let gw = PortalGateway::new(None, sink.clone(), "sess");
         gw.project(&OutboundEvent::Notification(NotificationEvent {
             title: None,
             body: "hi".into(),
@@ -141,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone());
+        let gw = PortalGateway::new(None, sink.clone(), "sess");
         gw.project(&OutboundEvent::Chat(chat_env("s1", "a"))).await; // seq 0,1
         sink.sent.lock().await.clear();
         gw.resume(1).await;
@@ -168,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_wire_in_user_message_injects_uplink() {
-        let gw = PortalGateway::new(None, Arc::new(CollectSink::default()));
+        let gw = PortalGateway::new(None, Arc::new(CollectSink::default()), "sess");
         let inj = CollectInjector::default();
         gw.on_wire_in(
             frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
@@ -184,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn on_wire_in_resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone());
+        let gw = PortalGateway::new(None, sink.clone(), "sess");
         gw.project(&OutboundEvent::Chat(chat_env("s1", "a"))).await; // seq 0,1 buffered
         sink.sent.lock().await.clear();
         let resume = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 1 }).unwrap());
