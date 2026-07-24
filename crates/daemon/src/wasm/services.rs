@@ -310,6 +310,16 @@ pub struct HostServices {
     /// (e.g. `notify_user` → `ui:notification:agent`). `None` in tests /
     /// standalone contexts; wired at daemon startup via `with_event_bus`.
     pub event_bus: Option<Arc<crate::event_bus::EventBus>>,
+
+    /// Portal remote-gateway registry — the M2 tap's fan-out target. The
+    /// `remote.start` command registers a `PortalGateway` here; the response
+    /// writer task fans every chat `DaemonEnvelope` to it. `None` = remote
+    /// access is not wired for this daemon instance.
+    pub remote_registry: Option<Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>>,
+    /// Daemon message-pipeline sender, cloned into a `ChannelInjector` so a
+    /// portal uplink `SidebarMessage` can be injected as if from the local
+    /// sidebar (M2). `None` when remote access is not wired.
+    pub remote_msg_tx: Option<mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>>,
 }
 
 impl HostServices {
@@ -379,6 +389,8 @@ impl HostServices {
             recording_collector: None,
             recordings_dir: std::path::PathBuf::new(),
             event_bus: None,
+            remote_registry: None,
+            remote_msg_tx: None,
         }
     }
 
@@ -427,6 +439,8 @@ impl HostServices {
             recording_collector: None,
             recordings_dir: std::path::PathBuf::new(),
             event_bus: None,
+            remote_registry: None,
+            remote_msg_tx: None,
         }
     }
 
@@ -446,6 +460,20 @@ impl HostServices {
     ) -> Self {
         self.recording_collector = Some(collector);
         self.recordings_dir = recordings_dir;
+        self
+    }
+
+    /// Attach the portal remote-gateway plumbing (builder pattern). `registry`
+    /// receives `PortalGateway`s registered by the `remote.start` command and is
+    /// fanned to by the response writer task's M2 tap; `msg_tx` is cloned into
+    /// each gateway's `ChannelInjector` for portal→daemon uplink injection.
+    pub fn with_remote_gateway(
+        mut self,
+        registry: Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
+        msg_tx: mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
+    ) -> Self {
+        self.remote_registry = Some(registry);
+        self.remote_msg_tx = Some(msg_tx);
         self
     }
 

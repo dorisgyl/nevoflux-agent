@@ -1823,12 +1823,25 @@ pub async fn start_server(
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
+    // Portal remote-gateway registry (§2.D M2 tap target). The `remote.start`
+    // command registers a `PortalGateway` here; the response writer task below
+    // fans every chat `DaemonEnvelope` to it. Empty until a portal session is
+    // started, so the tap is a no-op for the local-only case.
+    let remote_registry = Arc::new(tokio::sync::Mutex::new(
+        crate::remote::gateway::GatewayRegistry::new(),
+    ));
+
     // Wire the response channel into HostServices so
     // `mcp_tool_executor::execute_canvas_video_tool` can emit the
     // canvas_video_open_render_tab broadcast on the MCP/ACP path. The
     // in-scope TCP-proxy canvas_video_render_start handler already has its
     // own direct broadcast; this one covers the LLM-driven tool call path.
     services = services.with_broadcast_tx(response_tx.clone());
+
+    // Wire the remote-gateway registry + the daemon message sender into
+    // HostServices so the `remote.start` command can register a `PortalGateway`
+    // and build a `ChannelInjector` for portal→daemon uplink (§2.D).
+    services = services.with_remote_gateway(remote_registry.clone(), msg_tx.clone());
 
     // Wire the recording subsystem into HostServices so start_recording /
     // stop_recording agent tools can ingest JSONL trace lines.
@@ -1887,9 +1900,25 @@ pub async fn start_server(
 
     // Response writer task: receives (identity, DaemonEnvelope) and writes to correct proxy
     let writer_map = writers.clone();
+    let tap_registry = remote_registry.clone();
     tokio::spawn(async move {
         while let Some((identity, response)) = response_rx.recv().await {
             let proxy_id = String::from_utf8_lossy(&identity).to_string();
+
+            // M2 tap (§2.D / design Q11): copy chat frames out to every
+            // registered remote gateway before the local write below. This is a
+            // read-only fan-out — local sidebar delivery is unaffected; each
+            // gateway filters to its own session. No-op when no portal session
+            // is active (empty registry).
+            if response.channel == Channel::Chat {
+                tap_registry
+                    .lock()
+                    .await
+                    .fan_out(&crate::remote::gateway::OutboundEvent::Chat(
+                        response.clone(),
+                    ))
+                    .await;
+            }
             let msg_type = response
                 .payload
                 .get("type")
@@ -2565,9 +2594,7 @@ pub async fn start_server(
                                 let db = process_services.database.as_ref();
                                 let now = nevoflux_storage::models::current_timestamp();
                                 let proposal_repo =
-                                    nevoflux_storage::repositories::LoopProposalRepository::new(
-                                        db,
-                                    );
+                                    nevoflux_storage::repositories::LoopProposalRepository::new(db);
                                 match proposal_repo.respond_proposal(&proposal_id, accept, now) {
                                     Ok(Some(proposal)) => {
                                         if accept {
@@ -2589,14 +2616,12 @@ pub async fn start_server(
                                             }
                                         }
                                         let loop_session_id =
-                                            nevoflux_storage::repositories::LoopRepository::new(
-                                                db,
-                                            )
-                                            .get(&proposal.loop_id)
-                                            .ok()
-                                            .flatten()
-                                            .map(|rec| rec.session_id)
-                                            .unwrap_or_default();
+                                            nevoflux_storage::repositories::LoopRepository::new(db)
+                                                .get(&proposal.loop_id)
+                                                .ok()
+                                                .flatten()
+                                                .map(|rec| rec.session_id)
+                                                .unwrap_or_default();
                                         mgr.events()
                                             .proposal_resolved(
                                                 &loop_session_id,
@@ -2633,9 +2658,7 @@ pub async fn start_server(
                             }
                         }
                         _ => {
-                            warn!(
-                                "loop_proposal_respond_command missing proposal_id or accept"
-                            );
+                            warn!("loop_proposal_respond_command missing proposal_id or accept");
                         }
                     }
                 }
@@ -4700,7 +4723,10 @@ async fn resolve_active_soul(
                 .update_session_metadata(session_id, metadata)
                 .await
             {
-                warn!("Could not persist soul override for session {}: {}", session_id, e);
+                warn!(
+                    "Could not persist soul override for session {}: {}",
+                    session_id, e
+                );
             }
         }
     }
@@ -5095,7 +5121,11 @@ async fn load_session_history(
                     .map(|def| def.name)
                     .unwrap_or_else(|| slug.to_string())
             };
-            convert_history_messages(messages, active_soul.map(|s| s.slug.as_str()), &display_name)
+            convert_history_messages(
+                messages,
+                active_soul.map(|s| s.slug.as_str()),
+                &display_name,
+            )
         }
         Err(e) => {
             warn!("Failed to load session history for {}: {}", session_id, e);
@@ -6094,7 +6124,9 @@ async fn handle_chat_message_streaming(
                             // The re-run continues the same turn, so it keeps the
                             // soul that was resolved for it.
                             soul_context: build_soul_context(&services, active_soul.as_deref()),
-                            tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
+                            tools_config: active_soul
+                                .as_deref()
+                                .and_then(|s| s.tools_config.clone()),
                             os_platform: Some(std::env::consts::OS.to_string()),
                         };
 
@@ -7667,7 +7699,8 @@ async fn handle_chat_message(
                 "account.device_grant_start" => {
                     let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
                         .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-                    match crate::remote::account::request_device_code(&base, "nevoflux-daemon").await
+                    match crate::remote::account::request_device_code(&base, "nevoflux-daemon")
+                        .await
                     {
                         Ok(r) => serde_json::json!({
                             "type": "system_response",
@@ -7698,10 +7731,16 @@ async fn handle_chat_message(
                 "account.device_grant_poll" => {
                     let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
                         .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-                    let device_code =
-                        params.get("device_code").and_then(|v| v.as_str()).unwrap_or("");
-                    match crate::remote::account::poll_device_token(&base, "nevoflux-daemon", device_code)
-                        .await
+                    let device_code = params
+                        .get("device_code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    match crate::remote::account::poll_device_token(
+                        &base,
+                        "nevoflux-daemon",
+                        device_code,
+                    )
+                    .await
                     {
                         Ok(outcome) => {
                             use crate::remote::account::PollOutcome;
@@ -7736,6 +7775,110 @@ async fn handle_chat_message(
                                 "command": "account.device_grant_poll",
                                 "success": false,
                                 "error": { "code": "DEVICE_GRANT_ERROR", "message": e.to_string() }
+                            }
+                        }),
+                    }
+                }
+                // --- Remote-gateway S5: start a portal session. Mints a DO JWT
+                // from the stored account token, generates a channel id + a
+                // human-speakable pairing code (the E2E secret), registers a
+                // `PortalGateway` in the shared registry (so the M2 tap reaches
+                // it), and spawns the WS transport. Returns channel_id +
+                // pairing_code for the sidebar to show the user; the account
+                // token never leaves the daemon.
+                "remote.start" => {
+                    let session_id = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // Load the account token (daemon-held); refuse if not logged in.
+                    let account_token = {
+                        use crate::remote::account::TokenStore;
+                        let store = crate::remote::account::FileTokenStore::new(
+                            crate::paths::resolve_from_daemon()
+                                .data_dir
+                                .join("account-token"),
+                        );
+                        match store.load() {
+                            Ok(Some(t)) => t,
+                            _ => {
+                                return serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "remote.start",
+                                        "success": false,
+                                        "error": { "code": "NOT_LOGGED_IN", "message": "log in first" }
+                                    }
+                                });
+                            }
+                        }
+                    };
+                    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+                        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+                    let jwt = match crate::remote::account::mint_do_jwt(&base, &account_token).await
+                    {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "remote.start",
+                                    "success": false,
+                                    "error": { "code": "JWT_MINT_ERROR", "message": e.to_string() }
+                                }
+                            });
+                        }
+                    };
+                    // Channel id + human-speakable pairing code + derived E2E key.
+                    let channel_id = uuid::Uuid::new_v4().to_string();
+                    let pairing = crate::share::password::generate_password();
+                    let key = crate::remote::crypto::derive_channel_key(&pairing, &channel_id).ok();
+
+                    // Build the gateway over a swappable WS sink, register it so
+                    // the M2 tap can fan_out to it, then spawn the transport.
+                    let sink = Arc::new(crate::remote::ws::WsSink::new());
+                    let gateway = Arc::new(crate::remote::portal_gateway::PortalGateway::new(
+                        key,
+                        sink.clone(),
+                        session_id.clone(),
+                    ));
+                    match (&services.remote_registry, &services.remote_msg_tx) {
+                        (Some(registry), Some(msg_tx)) => {
+                            registry.lock().await.register(gateway.clone());
+                            let injector: Arc<dyn crate::remote::inject::Injector> =
+                                Arc::new(crate::remote::inject::ChannelInjector::new(
+                                    msg_tx.clone(),
+                                    _proxy_id.clone(),
+                                ));
+                            let relay = "wss://portal-relay.gansamuel03.workers.dev".to_string();
+                            let (ch, jwt2, sid) =
+                                (channel_id.clone(), jwt.clone(), session_id.clone());
+                            tokio::spawn(async move {
+                                crate::remote::ws::run_gateway(
+                                    &relay, &ch, &jwt2, sid, injector, sink, gateway,
+                                )
+                                .await;
+                            });
+                            serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "remote.start",
+                                    "success": true,
+                                    "data": { "channel_id": channel_id, "pairing_code": pairing }
+                                }
+                            })
+                        }
+                        _ => serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.start",
+                                "success": false,
+                                "error": { "code": "REMOTE_NOT_WIRED", "message": "remote gateway not configured" }
                             }
                         }),
                     }
@@ -11619,8 +11762,14 @@ mod soul_binding_tests {
         let out = convert_history_messages(msgs, None, &names);
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
-        assert!(matches!(out[1].role, nevoflux_builtin_wasm::MessageRole::Assistant));
+        assert!(matches!(
+            out[0].role,
+            nevoflux_builtin_wasm::MessageRole::User
+        ));
+        assert!(matches!(
+            out[1].role,
+            nevoflux_builtin_wasm::MessageRole::Assistant
+        ));
         assert_eq!(out[1].content, "hello");
         assert!(
             matches!(out[2].role, nevoflux_builtin_wasm::MessageRole::Assistant),
@@ -11636,7 +11785,10 @@ mod soul_binding_tests {
 
         let out = convert_history_messages(msgs, Some("research"), &names);
 
-        assert!(matches!(out[1].role, nevoflux_builtin_wasm::MessageRole::Assistant));
+        assert!(matches!(
+            out[1].role,
+            nevoflux_builtin_wasm::MessageRole::Assistant
+        ));
         assert_eq!(out[1].content, "hello");
     }
 
@@ -11649,8 +11801,14 @@ mod soul_binding_tests {
         let out = convert_history_messages(msgs, Some("research"), &names);
 
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
-        assert_eq!(out[0].content, "[nova] I looked it up", "labelled by name, not slug");
+        assert!(matches!(
+            out[0].role,
+            nevoflux_builtin_wasm::MessageRole::User
+        ));
+        assert_eq!(
+            out[0].content, "[nova] I looked it up",
+            "labelled by name, not slug"
+        );
     }
 
     /// The label falls back to the slug rather than vanishing when a soul has been
@@ -11671,7 +11829,10 @@ mod soul_binding_tests {
 
         let out = convert_history_messages(msgs, Some("research"), &names);
 
-        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+        assert!(matches!(
+            out[0].role,
+            nevoflux_builtin_wasm::MessageRole::User
+        ));
         assert_eq!(out[0].content, "[assistant] older reply");
     }
 
@@ -11682,7 +11843,10 @@ mod soul_binding_tests {
             let msgs = vec![tool_use("{\"tool\":\"web_search\"}"), user("hi")];
             let out = convert_history_messages(msgs, active, &names);
             assert_eq!(out.len(), 1, "only the user turn survives");
-            assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+            assert!(matches!(
+                out[0].role,
+                nevoflux_builtin_wasm::MessageRole::User
+            ));
         }
     }
 
@@ -11711,7 +11875,10 @@ mod soul_binding_tests {
 
         let meta = stamp_message_metadata(Some(existing), "firefox-container-2", None).unwrap();
 
-        assert!(meta.contains_key("attachments"), "attachment metadata must survive");
+        assert!(
+            meta.contains_key("attachments"),
+            "attachment metadata must survive"
+        );
         assert_eq!(
             meta.get(CONTAINER_METADATA_KEY).and_then(|v| v.as_str()),
             Some("firefox-container-2")
