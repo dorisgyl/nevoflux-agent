@@ -4,16 +4,23 @@
 //! transport consume this. Frame JSON is the portal's shape: `kind` snake_case,
 //! fields camelCase (`streamId`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nevoflux_protocol::chat::AgentMessage;
 use serde_json::{json, Value};
 
-/// Downlink translator. Stateful only to synthesize `stream_start` on the first
-/// chunk of each stream (the daemon has no explicit start message).
+/// Downlink translator. Stateful to (1) synthesize `stream_start` on the first
+/// chunk of each stream (the daemon has no explicit start message), and (2)
+/// attach artifacts — which carry no stream id — to the in-flight stream, and
+/// recall a completing artifact's title/type (the daemon `ArtifactComplete`
+/// carries only the id, but the portal upsert replaces the whole artifact).
 #[derive(Debug, Default)]
 pub struct Translator {
     started: HashSet<String>,
+    /// The most recent stream still open — artifacts attach here.
+    current_stream: Option<String>,
+    /// Artifact id → (title, contentType) remembered from `ArtifactStart`.
+    artifacts: HashMap<String, (String, String)>,
 }
 
 impl Translator {
@@ -26,6 +33,7 @@ impl Translator {
         match msg {
             AgentMessage::StreamChunk(c) => {
                 let mut out = Vec::new();
+                self.current_stream = Some(c.stream_id.clone());
                 if self.started.insert(c.stream_id.clone()) {
                     out.push(json!({ "kind": "stream_start", "streamId": c.stream_id }));
                 }
@@ -48,7 +56,22 @@ impl Translator {
             }
             AgentMessage::StreamEnd(e) => {
                 self.started.remove(&e.stream_id);
+                if self.current_stream.as_deref() == Some(e.stream_id.as_str()) {
+                    self.current_stream = None;
+                }
                 vec![json!({ "kind": "stream_end", "streamId": e.stream_id })]
+            }
+            AgentMessage::ArtifactStart(a) => {
+                self.artifacts
+                    .insert(a.id.clone(), (a.title.clone(), a.content_type.clone()));
+                self.artifact_frame(&a.id, &a.title, &a.content_type, "generating")
+            }
+            // Streamed artifact content has no portal representation (the artifact
+            // card shows metadata + state only), so deltas produce no frame.
+            AgentMessage::ArtifactDelta(_) => Vec::new(),
+            AgentMessage::ArtifactComplete(a) => {
+                let (title, content_type) = self.artifacts.get(&a.id).cloned().unwrap_or_default();
+                self.artifact_frame(&a.id, &title, &content_type, "ready")
             }
             AgentMessage::PlanProposal(p) => {
                 let steps: Vec<Value> = p
@@ -74,6 +97,20 @@ impl Translator {
             })],
             AgentMessage::Error(e) => vec![json!({ "kind": "error", "message": e.message })],
             _ => Vec::new(),
+        }
+    }
+
+    /// Build a portal `artifact` frame attached to the in-flight stream. Drops
+    /// (empty) when no stream is open — the portal attaches artifacts to a live
+    /// assistant message, so an artifact outside any stream has nowhere to land.
+    fn artifact_frame(&self, id: &str, title: &str, content_type: &str, state: &str) -> Vec<Value> {
+        match &self.current_stream {
+            Some(stream_id) => vec![json!({
+                "kind": "artifact",
+                "streamId": stream_id,
+                "artifact": { "id": id, "title": title, "contentType": content_type, "state": state }
+            })],
+            None => Vec::new(),
         }
     }
 }
@@ -292,5 +329,69 @@ mod tests {
             related_request_id: None,
         }));
         assert_eq!(frames, vec![json!({ "kind": "error", "message": "boom" })]);
+    }
+
+    #[test]
+    fn artifact_start_then_complete_attaches_to_stream_and_recalls_metadata() {
+        use nevoflux_protocol::chat::{ArtifactComplete, ArtifactStart};
+        let mut t = Translator::new();
+        t.downlink(&chunk("s1", "working")); // opens stream s1
+
+        let start = t.downlink(&AgentMessage::ArtifactStart(ArtifactStart {
+            id: "art1".into(),
+            title: "report.csv".into(),
+            content_type: "text/csv".into(),
+            description: None,
+            files: None,
+            entry: None,
+            is_persistent: false,
+        }));
+        assert_eq!(
+            start,
+            vec![json!({
+                "kind": "artifact", "streamId": "s1",
+                "artifact": { "id": "art1", "title": "report.csv", "contentType": "text/csv", "state": "generating" }
+            })]
+        );
+
+        // Complete carries only the id; title/contentType are recalled from Start.
+        let done = t.downlink(&AgentMessage::ArtifactComplete(ArtifactComplete {
+            id: "art1".into(),
+        }));
+        assert_eq!(
+            done,
+            vec![json!({
+                "kind": "artifact", "streamId": "s1",
+                "artifact": { "id": "art1", "title": "report.csv", "contentType": "text/csv", "state": "ready" }
+            })]
+        );
+    }
+
+    #[test]
+    fn artifact_delta_produces_no_frame() {
+        use nevoflux_protocol::chat::ArtifactDelta;
+        let mut t = Translator::new();
+        t.downlink(&chunk("s1", "x"));
+        let frames = t.downlink(&AgentMessage::ArtifactDelta(ArtifactDelta {
+            id: "art1".into(),
+            delta: "chunk".into(),
+        }));
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn artifact_outside_any_stream_is_dropped() {
+        use nevoflux_protocol::chat::ArtifactStart;
+        let mut t = Translator::new();
+        let frames = t.downlink(&AgentMessage::ArtifactStart(ArtifactStart {
+            id: "art1".into(),
+            title: "x".into(),
+            content_type: "text/plain".into(),
+            description: None,
+            files: None,
+            entry: None,
+            is_persistent: false,
+        }));
+        assert!(frames.is_empty());
     }
 }
