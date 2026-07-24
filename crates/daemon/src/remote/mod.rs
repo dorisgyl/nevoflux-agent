@@ -9,3 +9,4 @@ pub mod account;
 pub mod crypto;
 pub mod gateway;
 pub mod relay_protocol;
+pub mod translate;
