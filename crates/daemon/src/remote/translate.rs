@@ -50,6 +50,29 @@ impl Translator {
                 self.started.remove(&e.stream_id);
                 vec![json!({ "kind": "stream_end", "streamId": e.stream_id })]
             }
+            AgentMessage::PlanProposal(p) => {
+                let steps: Vec<Value> = p
+                    .steps
+                    .iter()
+                    .map(|s| {
+                        let mut v = json!({ "description": s.description });
+                        if let Some(m) = &s.model {
+                            v["model"] = json!(m);
+                        }
+                        v
+                    })
+                    .collect();
+                vec![json!({ "kind": "plan", "plan": { "summary": p.summary, "steps": steps } })]
+            }
+            AgentMessage::PermissionRequest(r) => vec![json!({
+                "kind": "gate",
+                "gate": {
+                    "id": r.request_id,
+                    "prompt": r.reason,
+                    "options": ["Allow", "Allow always", "Deny"],
+                }
+            })],
+            AgentMessage::Error(e) => vec![json!({ "kind": "error", "message": e.message })],
             _ => Vec::new(),
         }
     }
@@ -195,5 +218,79 @@ mod tests {
             "kind": "tool", "streamId": "s1",
             "tool": { "id": "t1", "name": "browser", "status": "running", "target": "read tab" }
         })));
+    }
+
+    #[test]
+    fn plan_proposal_becomes_plan_frame() {
+        use nevoflux_protocol::chat::{PlanProposal, PlanStep};
+        let mut t = Translator::new();
+        let frames = t.downlink(&AgentMessage::PlanProposal(PlanProposal {
+            summary: "Do X".into(),
+            steps: vec![PlanStep {
+                description: "step a".into(),
+                model: None,
+            }],
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({
+                "kind": "plan",
+                "plan": { "summary": "Do X", "steps": [{ "description": "step a" }] }
+            })]
+        );
+    }
+
+    #[test]
+    fn permission_request_becomes_gate_frame() {
+        use nevoflux_protocol::chat::PermissionRequest;
+        use nevoflux_protocol::common::{
+            PermissionScope, Requester, RequesterType, ResourceAction, ResourceType,
+        };
+        let mut t = Translator::new();
+        let frames = t.downlink(&AgentMessage::PermissionRequest(PermissionRequest {
+            request_id: "g1".into(),
+            session_id: "s".into(),
+            resource_type: ResourceType::File,
+            action: ResourceAction::Write,
+            resource: "report.csv".into(),
+            requester: Requester {
+                requester_type: RequesterType::Agent,
+                id: "a".into(),
+                name: "Agent".into(),
+            },
+            reason: "Write report.csv?".into(),
+            scope: PermissionScope::Once,
+            timeout_ms: 30000,
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({
+                "kind": "gate",
+                "gate": {
+                    "id": "g1",
+                    "prompt": "Write report.csv?",
+                    "options": ["Allow", "Allow always", "Deny"]
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn error_message_becomes_error_frame() {
+        use nevoflux_protocol::chat::ErrorMessage;
+        use nevoflux_protocol::common::ErrorLevel;
+        let mut t = Translator::new();
+        let frames = t.downlink(&AgentMessage::Error(ErrorMessage {
+            session_id: "s".into(),
+            error_id: "e".into(),
+            level: ErrorLevel::Error,
+            code: "x".into(),
+            message: "boom".into(),
+            details: None,
+            recoverable: false,
+            retry_action: None,
+            related_request_id: None,
+        }));
+        assert_eq!(frames, vec![json!({ "kind": "error", "message": "boom" })]);
     }
 }
