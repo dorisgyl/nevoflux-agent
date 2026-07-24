@@ -29,7 +29,16 @@ impl Translator {
                 if self.started.insert(c.stream_id.clone()) {
                     out.push(json!({ "kind": "stream_start", "streamId": c.stream_id }));
                 }
-                // thinking / tool frames are added in Task 2.
+                if let Some(nevoflux_protocol::chat::ThinkingEvent::Delta { content, .. }) =
+                    &c.thinking_event
+                {
+                    out.push(
+                        json!({ "kind": "thinking", "streamId": c.stream_id, "text": content }),
+                    );
+                }
+                if let Some(ev) = &c.event {
+                    out.push(tool_frame(&c.stream_id, ev));
+                }
                 if !c.delta.is_empty() {
                     out.push(
                         json!({ "kind": "stream_delta", "streamId": c.stream_id, "delta": c.delta }),
@@ -44,6 +53,46 @@ impl Translator {
             _ => Vec::new(),
         }
     }
+}
+
+/// Map a daemon `ToolEvent` to a portal `tool` frame (`ToolCall`: id/name/status/target?).
+fn tool_frame(stream_id: &str, ev: &nevoflux_protocol::chat::ToolEvent) -> Value {
+    use nevoflux_protocol::chat::ToolEvent;
+    use nevoflux_protocol::common::ToolStatus;
+    let (id, name, status, target) = match ev {
+        ToolEvent::Start {
+            tool_id,
+            tool_name,
+            summary,
+            ..
+        } => (
+            tool_id.as_str(),
+            tool_name.as_str(),
+            "running",
+            Some(summary.clone()),
+        ),
+        ToolEvent::Auth { tool_id, .. } => (tool_id.as_str(), "", "waitingAuth", None),
+        ToolEvent::End {
+            tool_id,
+            status,
+            summary,
+            ..
+        } => (
+            tool_id.as_str(),
+            "",
+            match status {
+                ToolStatus::Success => "done",
+                ToolStatus::Failed => "failed",
+                ToolStatus::Running => "running",
+            },
+            Some(summary.clone()),
+        ),
+    };
+    let mut tool = json!({ "id": id, "name": name, "status": status });
+    if let Some(t) = target {
+        tool["target"] = json!(t);
+    }
+    json!({ "kind": "tool", "streamId": stream_id, "tool": tool })
 }
 
 #[cfg(test)]
@@ -101,5 +150,50 @@ mod tests {
             frames,
             vec![json!({ "kind": "stream_end", "streamId": "s1" })]
         );
+    }
+
+    #[test]
+    fn thinking_delta_becomes_thinking_frame() {
+        use nevoflux_protocol::chat::ThinkingEvent;
+        let mut t = Translator::new();
+        let c = StreamChunk {
+            session_id: "sess".into(),
+            stream_id: "s1".into(),
+            delta: String::new(),
+            format: StreamFormat::Markdown,
+            event: None,
+            thinking_event: Some(ThinkingEvent::Delta {
+                thinking_id: "t".into(),
+                content: "reasoning".into(),
+            }),
+        };
+        let frames = t.downlink(&AgentMessage::StreamChunk(c));
+        assert!(
+            frames.contains(&json!({ "kind": "thinking", "streamId": "s1", "text": "reasoning" }))
+        );
+    }
+
+    #[test]
+    fn tool_start_becomes_running_tool_frame() {
+        use nevoflux_protocol::chat::ToolEvent;
+        let mut t = Translator::new();
+        let c = StreamChunk {
+            session_id: "sess".into(),
+            stream_id: "s1".into(),
+            delta: String::new(),
+            format: StreamFormat::Markdown,
+            event: Some(ToolEvent::Start {
+                tool_id: "t1".into(),
+                tool_name: "browser".into(),
+                icon: String::new(),
+                summary: "read tab".into(),
+            }),
+            thinking_event: None,
+        };
+        let frames = t.downlink(&AgentMessage::StreamChunk(c));
+        assert!(frames.contains(&json!({
+            "kind": "tool", "streamId": "s1",
+            "tool": { "id": "t1", "name": "browser", "status": "running", "target": "read tab" }
+        })));
     }
 }
