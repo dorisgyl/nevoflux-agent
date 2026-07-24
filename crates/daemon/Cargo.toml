@@ -68,6 +68,9 @@ tokio-util = "0.7"
 async-trait.workspace = true
 futures.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
+# Portal remote-gateway WS client (design §2.D). rustls to match the workspace
+# TLS stack (reqwest rustls); 0.23 keeps Message::Text(String)/Binary(Vec<u8>).
+tokio-tungstenite = { version = "0.23", features = ["connect", "rustls-tls-native-roots"] }
 
 # Error handling
 thiserror.workspace = true
