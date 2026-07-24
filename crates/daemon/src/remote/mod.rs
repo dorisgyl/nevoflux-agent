@@ -8,6 +8,7 @@
 pub mod account;
 pub mod crypto;
 pub mod gateway;
+pub mod portal_gateway;
 pub mod relay_protocol;
 pub mod session;
 pub mod translate;
