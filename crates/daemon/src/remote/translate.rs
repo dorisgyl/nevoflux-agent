@@ -155,6 +155,44 @@ fn tool_frame(stream_id: &str, ev: &nevoflux_protocol::chat::ToolEvent) -> Value
     json!({ "kind": "tool", "streamId": stream_id, "tool": tool })
 }
 
+/// Translate a portal `OutboundFrame` (JSON) into a daemon `SidebarMessage` for
+/// injection. `session_id` + `message_id` come from the gateway's session state
+/// (the portal frame doesn't carry them; the gateway generates `message_id`).
+/// Returns `None` for unknown / malformed frames.
+pub fn uplink(
+    frame: &Value,
+    session_id: &str,
+    message_id: &str,
+) -> Option<nevoflux_protocol::chat::SidebarMessage> {
+    use nevoflux_protocol::chat::{ChatMessage, PermissionResponse, PlanResponse, SidebarMessage};
+    match frame.get("kind")?.as_str()? {
+        "user_message" => Some(SidebarMessage::ChatMessage(ChatMessage {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            text: frame.get("text")?.as_str()?.to_string(),
+            attachments: Vec::new(),
+            tab_id: None,
+            tab_ids: Vec::new(),
+        })),
+        "gate_response" => {
+            let choice = frame.get("choice")?.as_str()?;
+            Some(SidebarMessage::PermissionResponse(PermissionResponse {
+                request_id: frame.get("id")?.as_str()?.to_string(),
+                granted: choice != "Deny",
+                scope: None,
+            }))
+        }
+        "plan_response" => Some(SidebarMessage::PlanResponse(
+            if frame.get("approved")?.as_bool()? {
+                PlanResponse::Confirmed
+            } else {
+                PlanResponse::Cancelled
+            },
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +415,79 @@ mod tests {
             delta: "chunk".into(),
         }));
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn uplink_user_message_becomes_chat_message() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi" }),
+            "sess",
+            "m1",
+        );
+        match msg {
+            Some(SidebarMessage::ChatMessage(c)) => {
+                assert_eq!(c.text, "hi");
+                assert_eq!(c.session_id, "sess");
+                assert_eq!(c.message_id, "m1");
+            }
+            other => panic!("expected ChatMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uplink_gate_response_maps_choice_to_granted() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        let allow = uplink(
+            &json!({ "kind": "gate_response", "id": "g1", "choice": "Allow" }),
+            "s",
+            "m",
+        );
+        let deny = uplink(
+            &json!({ "kind": "gate_response", "id": "g1", "choice": "Deny" }),
+            "s",
+            "m",
+        );
+        match allow {
+            Some(SidebarMessage::PermissionResponse(r)) => {
+                assert_eq!(r.request_id, "g1");
+                assert!(r.granted);
+            }
+            other => panic!("expected PermissionResponse, got {other:?}"),
+        }
+        match deny {
+            Some(SidebarMessage::PermissionResponse(r)) => assert!(!r.granted),
+            other => panic!("expected PermissionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uplink_plan_response_maps_approved() {
+        use nevoflux_protocol::chat::{PlanResponse, SidebarMessage};
+        let yes = uplink(
+            &json!({ "kind": "plan_response", "approved": true }),
+            "s",
+            "m",
+        );
+        let no = uplink(
+            &json!({ "kind": "plan_response", "approved": false }),
+            "s",
+            "m",
+        );
+        assert!(matches!(
+            yes,
+            Some(SidebarMessage::PlanResponse(PlanResponse::Confirmed))
+        ));
+        assert!(matches!(
+            no,
+            Some(SidebarMessage::PlanResponse(PlanResponse::Cancelled))
+        ));
+    }
+
+    #[test]
+    fn uplink_unknown_kind_is_none() {
+        assert!(uplink(&json!({ "kind": "nope" }), "s", "m").is_none());
+        assert!(uplink(&json!({ "text": "no kind" }), "s", "m").is_none());
     }
 
     #[test]
