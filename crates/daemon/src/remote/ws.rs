@@ -91,7 +91,7 @@ pub fn message_to_wire(msg: Message) -> Option<Wire> {
 }
 
 /// Connect to the relay and serve the portal `gateway`, reconnecting with
-/// exponential backoff. `relay_base` is e.g. `wss://portal-relay.<sub>.workers.dev`.
+/// exponential backoff. `relay_base` is e.g. `wss://relay.nevoflux.app`.
 ///
 /// The admission JWT is **minted fresh on every attempt** from the daemon's
 /// account token: the account origin issues it with a 15-minute lifetime, so a

@@ -7897,7 +7897,13 @@ async fn handle_chat_message(
                                     msg_tx.clone(),
                                     _proxy_id.clone(),
                                 ));
-                            let relay = "wss://portal-relay.gansamuel03.workers.dev".to_string();
+                            // The product's own zone, not `*.workers.dev`: that
+                            // host is firewall-blocked on some networks, and the
+                            // block is invisible from the portal side (the token
+                            // fetch dies before the socket is opened, so nothing
+                            // is ever attempted and nothing is logged).
+                            let relay = std::env::var("NEVOFLUX_RELAY_URL")
+                                .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
                             // The JWT is re-minted per connect attempt inside the
                             // loop, so hand it the account credentials, not a
                             // token that expires in 15 minutes.
