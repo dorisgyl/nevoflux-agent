@@ -44,13 +44,23 @@ impl PortalGateway {
         sink: Arc<dyn WireSink>,
         session_id: impl Into<String>,
         mode: Option<String>,
+        execution_tier: Option<String>,
         channel_id: &str,
     ) -> Self {
         Self {
-            session: Mutex::new(PortalSession::new(key, mode)),
+            session: Mutex::new(PortalSession::new(key, mode, execution_tier)),
             sink,
             session_id: session_id.into(),
             id: format!("portal:{channel_id}"),
+        }
+    }
+
+    /// Push the current mode / execution tier to the portal. Called on each
+    /// (re)connect so a reconnecting peer is not left showing stale settings.
+    pub async fn announce(&self) {
+        let wires = self.session.lock().await.session_state();
+        for w in wires {
+            self.sink.send(w).await;
         }
     }
 
@@ -153,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn project_chat_sends_sequenced_wires_to_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         assert_eq!(gw.id(), "portal:chan");
         assert_eq!(gw.capability(), Capability::FullParity);
         gw.project(&OutboundEvent::Chat(chat_env("hi", false)))
@@ -164,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn project_skips_other_sessions_chat() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "other-session", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "other-session", None, None, "chan");
         gw.project(&OutboundEvent::Chat(chat_env_for("sess", "hi", false)))
             .await;
         assert!(
@@ -178,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn project_drops_chat_without_a_session_id() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         let env = DaemonEnvelope::new(
             "proxy",
             Channel::Chat,
@@ -189,9 +199,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_reports_mode_and_execution_tier() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(
+            None,
+            sink.clone(),
+            "sess",
+            Some("agent".into()),
+            Some("browser-auto".into()),
+            "chan",
+        );
+        gw.announce().await;
+        let sent = sink.sent.lock().await;
+        let msg: WireMessage = match &sent[0] {
+            Wire::Text(t) => serde_json::from_str(t).unwrap(),
+            _ => panic!("plaintext"),
+        };
+        match msg {
+            WireMessage::Frame { frame, .. } => {
+                assert_eq!(frame["kind"], "session_state");
+                assert_eq!(frame["mode"], "agent");
+                assert_eq!(frame["executionTier"], "browser-auto");
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    /// With nothing reported, the portal must not be told "agent": defaulting to
+    /// the least-capable mode keeps the display from overstating the head.
+    #[tokio::test]
+    async fn announce_defaults_to_chat_when_mode_is_unknown() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
+        gw.announce().await;
+        let sent = sink.sent.lock().await;
+        if let Wire::Text(t) = &sent[0] {
+            let msg: WireMessage = serde_json::from_str(t).unwrap();
+            if let WireMessage::Frame { frame, .. } = msg {
+                assert_eq!(frame["mode"], "chat");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn id_is_unique_per_channel_so_the_registry_can_drop_one() {
-        let a = PortalGateway::new(None, Arc::new(CollectSink::default()), "s", None, "chan-a");
-        let b = PortalGateway::new(None, Arc::new(CollectSink::default()), "s", None, "chan-b");
+        let a = PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "s",
+            None,
+            None,
+            "chan-a",
+        );
+        let b = PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "s",
+            None,
+            None,
+            "chan-b",
+        );
         assert_eq!(a.id(), "portal:chan-a");
         assert_ne!(a.id(), b.id());
     }
@@ -200,7 +267,7 @@ mod tests {
     async fn project_ignores_non_chat_events() {
         use super::super::gateway::NotificationEvent;
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         gw.project(&OutboundEvent::Notification(NotificationEvent {
             title: None,
             body: "hi".into(),
@@ -213,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1
         sink.sent.lock().await.clear();
         gw.resume(1).await;
@@ -240,7 +307,14 @@ mod tests {
 
     #[tokio::test]
     async fn on_wire_in_user_message_injects_uplink() {
-        let gw = PortalGateway::new(None, Arc::new(CollectSink::default()), "sess", None, "chan");
+        let gw = PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "sess",
+            None,
+            None,
+            "chan",
+        );
         let inj = CollectInjector::default();
         gw.on_wire_in(
             frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
@@ -256,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn on_wire_in_resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1 buffered
         sink.sent.lock().await.clear();
         let resume = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 1 }).unwrap());

@@ -51,6 +51,18 @@ impl ExecutionTier {
             _ => ExecutionTier::ReadOnly,
         }
     }
+
+    /// The canonical setting string — the inverse of [`Self::from_setting`].
+    /// Used to report the tier to remote gateways without re-deriving the
+    /// mapping (and drifting from it) at the call site.
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            ExecutionTier::ReadOnly => "read-only",
+            ExecutionTier::BrowserAuto => "browser-auto",
+            ExecutionTier::BrowserAutoLocalRead => "browser-auto-local-read",
+            ExecutionTier::FullAuto => "full-auto",
+        }
+    }
 }
 
 /// Risk bucket a tool call falls into.
@@ -160,20 +172,44 @@ mod tests {
 
     #[test]
     fn from_setting_parses_all_tiers() {
-        assert_eq!(ExecutionTier::from_setting("read-only"), ExecutionTier::ReadOnly);
-        assert_eq!(ExecutionTier::from_setting("browser-auto"), ExecutionTier::BrowserAuto);
+        assert_eq!(
+            ExecutionTier::from_setting("read-only"),
+            ExecutionTier::ReadOnly
+        );
+        assert_eq!(
+            ExecutionTier::from_setting("browser-auto"),
+            ExecutionTier::BrowserAuto
+        );
         assert_eq!(
             ExecutionTier::from_setting("browser-auto-local-read"),
             ExecutionTier::BrowserAutoLocalRead
         );
-        assert_eq!(ExecutionTier::from_setting("full-auto"), ExecutionTier::FullAuto);
+        assert_eq!(
+            ExecutionTier::from_setting("full-auto"),
+            ExecutionTier::FullAuto
+        );
+    }
+
+    #[test]
+    fn as_setting_round_trips_every_tier() {
+        for t in [
+            ExecutionTier::ReadOnly,
+            ExecutionTier::BrowserAuto,
+            ExecutionTier::BrowserAutoLocalRead,
+            ExecutionTier::FullAuto,
+        ] {
+            assert_eq!(ExecutionTier::from_setting(t.as_setting()), t);
+        }
     }
 
     #[test]
     fn from_setting_safety_legacy_and_unknown_fall_back_to_read_only() {
         // Old dead-stub 'auto' must NOT become full-auto.
         assert_eq!(ExecutionTier::from_setting("auto"), ExecutionTier::ReadOnly);
-        assert_eq!(ExecutionTier::from_setting("confirm"), ExecutionTier::ReadOnly);
+        assert_eq!(
+            ExecutionTier::from_setting("confirm"),
+            ExecutionTier::ReadOnly
+        );
         assert_eq!(ExecutionTier::from_setting(""), ExecutionTier::ReadOnly);
         assert_eq!(ExecutionTier::from_setting("xxx"), ExecutionTier::ReadOnly);
         assert_eq!(ExecutionTier::default(), ExecutionTier::ReadOnly);
@@ -234,39 +270,78 @@ mod tests {
 
     #[test]
     fn classify_strips_mcp_prefix() {
-        assert_eq!(classify_tool("mcp__nevoflux-tools__web_fetch"), RiskBucket::R);
+        assert_eq!(
+            classify_tool("mcp__nevoflux-tools__web_fetch"),
+            RiskBucket::R
+        );
         assert_eq!(classify_tool("mcp__srv__read_file"), RiskBucket::L0);
     }
 
     #[test]
     fn read_only_tier_auto_approves_only_r() {
-        assert!(tier_auto_approves("browser_navigate", ExecutionTier::ReadOnly));
+        assert!(tier_auto_approves(
+            "browser_navigate",
+            ExecutionTier::ReadOnly
+        ));
         assert!(tier_auto_approves("web_fetch", ExecutionTier::ReadOnly));
-        assert!(!tier_auto_approves("browser_click", ExecutionTier::ReadOnly));
+        assert!(!tier_auto_approves(
+            "browser_click",
+            ExecutionTier::ReadOnly
+        ));
         assert!(!tier_auto_approves("read_file", ExecutionTier::ReadOnly));
         assert!(!tier_auto_approves("write_file", ExecutionTier::ReadOnly));
     }
 
     #[test]
     fn browser_auto_tier_adds_b1() {
-        assert!(tier_auto_approves("browser_click", ExecutionTier::BrowserAuto));
-        assert!(tier_auto_approves("browser_navigate", ExecutionTier::BrowserAuto));
+        assert!(tier_auto_approves(
+            "browser_click",
+            ExecutionTier::BrowserAuto
+        ));
+        assert!(tier_auto_approves(
+            "browser_navigate",
+            ExecutionTier::BrowserAuto
+        ));
         assert!(!tier_auto_approves("read_file", ExecutionTier::BrowserAuto));
-        assert!(!tier_auto_approves("write_file", ExecutionTier::BrowserAuto));
+        assert!(!tier_auto_approves(
+            "write_file",
+            ExecutionTier::BrowserAuto
+        ));
     }
 
     #[test]
     fn browser_auto_local_read_tier_adds_l0() {
-        assert!(tier_auto_approves("read_file", ExecutionTier::BrowserAutoLocalRead));
-        assert!(tier_auto_approves("browser_click", ExecutionTier::BrowserAutoLocalRead));
-        assert!(!tier_auto_approves("write_file", ExecutionTier::BrowserAutoLocalRead));
-        assert!(!tier_auto_approves("run_command", ExecutionTier::BrowserAutoLocalRead));
+        assert!(tier_auto_approves(
+            "read_file",
+            ExecutionTier::BrowserAutoLocalRead
+        ));
+        assert!(tier_auto_approves(
+            "browser_click",
+            ExecutionTier::BrowserAutoLocalRead
+        ));
+        assert!(!tier_auto_approves(
+            "write_file",
+            ExecutionTier::BrowserAutoLocalRead
+        ));
+        assert!(!tier_auto_approves(
+            "run_command",
+            ExecutionTier::BrowserAutoLocalRead
+        ));
     }
 
     #[test]
     fn full_auto_tier_approves_everything() {
-        for t in ["write_file", "run_command", "read_file", "browser_click", "some_mcp__x__y"] {
-            assert!(tier_auto_approves(t, ExecutionTier::FullAuto), "{t} should auto in full-auto");
+        for t in [
+            "write_file",
+            "run_command",
+            "read_file",
+            "browser_click",
+            "some_mcp__x__y",
+        ] {
+            assert!(
+                tier_auto_approves(t, ExecutionTier::FullAuto),
+                "{t} should auto in full-auto"
+            );
         }
     }
 }

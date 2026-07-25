@@ -48,16 +48,37 @@ pub struct PortalSession {
     /// inherit it verbatim, so the channel never grants more (or less) than the
     /// session already had.
     mode: Option<String>,
+    /// Per-session Agent-execution tier, snapshotted at `/remote-control`.
+    execution_tier: Option<String>,
 }
 
 impl PortalSession {
-    pub fn new(key: Option<[u8; 32]>, mode: Option<String>) -> Self {
+    pub fn new(
+        key: Option<[u8; 32]>,
+        mode: Option<String>,
+        execution_tier: Option<String>,
+    ) -> Self {
         Self {
             translator: Translator::new(),
             sequencer: SendSequencer::new(),
             key,
             mode,
+            execution_tier,
         }
+    }
+
+    /// Announce the remote head's settings so the portal can show what this
+    /// session would actually do. The portal cannot see the local sidebar's
+    /// controls, so without this it can only guess — and guessing wrong about
+    /// capability is worse than saying nothing.
+    pub fn session_state(&mut self) -> Vec<Wire> {
+        let frame = serde_json::json!({
+            "kind": "session_state",
+            "mode": self.mode.clone().unwrap_or_else(|| "chat".into()),
+            "executionTier": self.execution_tier.clone().unwrap_or_default(),
+        });
+        let wire = self.sequencer.tag(frame);
+        vec![self.encode(&wire)]
     }
 
     /// Translate a chat `DaemonEnvelope` payload (an `AgentMessage` JSON) into
@@ -152,7 +173,7 @@ mod tests {
 
     #[test]
     fn plaintext_on_chat_emits_seq_tagged_wire_frames() {
-        let mut s = PortalSession::new(None, None);
+        let mut s = PortalSession::new(None, None, None);
         let out = s.on_chat(&chunk("hi", false));
         // stream_start (seq 0) then stream_delta (seq 1)
         assert_eq!(out.len(), 2);
@@ -172,7 +193,7 @@ mod tests {
     #[test]
     fn e2e_on_chat_emits_binary_that_decodes_back() {
         let key = [7u8; 32];
-        let mut s = PortalSession::new(Some(key), None);
+        let mut s = PortalSession::new(Some(key), None, None);
         let out = s.on_chat(&chunk("hi", false));
         assert!(matches!(out[0], Wire::Binary(_)), "E2E should be binary");
         // decode round-trips to the same WireMessage.
@@ -188,7 +209,7 @@ mod tests {
 
     #[test]
     fn on_resume_resends_buffered_tail() {
-        let mut s = PortalSession::new(None, None);
+        let mut s = PortalSession::new(None, None, None);
         s.on_chat(&chunk("a", false)); // seq 0 (start) + 1 (delta)
         s.on_chat(&chunk("", true)); // seq 2 (end)
         let resent = s.on_resume(1);
@@ -207,7 +228,7 @@ mod tests {
 
     #[test]
     fn inbound_user_message_routes_to_uplink() {
-        let s = PortalSession::new(None, None);
+        let s = PortalSession::new(None, None, None);
         let wire = Wire::Text(
             serde_json::to_string(&WireMessage::Frame {
                 seq: None,
@@ -226,7 +247,7 @@ mod tests {
 
     #[test]
     fn inbound_resume_is_routed() {
-        let s = PortalSession::new(None, None);
+        let s = PortalSession::new(None, None, None);
         let wire = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 4 }).unwrap());
         assert_eq!(s.inbound(&wire, "sess", "m1"), Inbound::Resume(4));
     }

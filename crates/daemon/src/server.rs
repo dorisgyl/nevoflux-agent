@@ -7872,11 +7872,21 @@ async fn handle_chat_message(
                     // Build the gateway over a swappable WS sink, register it so
                     // the M2 tap can fan_out to it, then spawn the transport.
                     let sink = Arc::new(crate::remote::ws::WsSink::new());
+                    // Snapshot the Agent-execution tier for this session so the
+                    // portal can show what the remote head would actually run.
+                    // `resolve_execution_tier` keys off `services.session_id`,
+                    // which is not necessarily this session, so scope a clone.
+                    let execution_tier = crate::agent_host::resolve_execution_tier(
+                        &services.clone().with_session_id(session_id.clone()),
+                    )
+                    .as_setting()
+                    .to_string();
                     let gateway = Arc::new(crate::remote::portal_gateway::PortalGateway::new(
                         key,
                         sink.clone(),
                         session_id.clone(),
                         mode,
+                        Some(execution_tier),
                         &channel_id,
                     ));
                     match (&services.remote_registry, &services.remote_msg_tx) {

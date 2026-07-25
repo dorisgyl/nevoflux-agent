@@ -142,6 +142,8 @@ pub async fn run_gateway(
                 backoff_ms = 500;
                 let (write, mut read) = ws.split();
                 sink.set(write).await;
+                // Tell the portal what this head is set to, before any chat.
+                gateway.announce().await;
                 while let Some(item) = read.next().await {
                     match item {
                         Ok(msg) => {
