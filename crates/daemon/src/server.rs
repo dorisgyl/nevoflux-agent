@@ -1911,13 +1911,19 @@ pub async fn start_server(
             // gateway filters to its own session. No-op when no portal session
             // is active (empty registry).
             if response.channel == Channel::Chat {
-                tap_registry
-                    .lock()
-                    .await
-                    .fan_out(&crate::remote::gateway::OutboundEvent::Chat(
-                        response.clone(),
-                    ))
-                    .await;
+                let reg = tap_registry.lock().await;
+                if !reg.is_empty() {
+                    tracing::info!(
+                        target: "remote",
+                        "M2 tap: chat type={:?} -> {} gateway(s)",
+                        response.payload.get("type").and_then(|v| v.as_str()),
+                        reg.len()
+                    );
+                }
+                reg.fan_out(&crate::remote::gateway::OutboundEvent::Chat(
+                    response.clone(),
+                ))
+                .await;
             }
             let msg_type = response
                 .payload
@@ -7792,6 +7798,15 @@ async fn handle_chat_message(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // The sidebar's current chat mode. Remote turns replay it
+                    // verbatim so the channel grants exactly what the local
+                    // session had — `chat` stays `chat`, `agent` stays `agent`.
+                    // (The per-session Agent-execution tier needs no plumbing:
+                    // `resolve_execution_tier` keys off this same session_id.)
+                    let mode = params
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     // Load the account token (daemon-held); refuse if not logged in.
                     let account_token = {
                         use crate::remote::account::TokenStore;
@@ -7844,6 +7859,7 @@ async fn handle_chat_message(
                         key,
                         sink.clone(),
                         session_id.clone(),
+                        mode,
                     ));
                     match (&services.remote_registry, &services.remote_msg_tx) {
                         (Some(registry), Some(msg_tx)) => {

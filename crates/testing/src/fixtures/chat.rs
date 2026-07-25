@@ -12,6 +12,7 @@ pub fn sample_chat_message(session_id: &str, text: &str) -> ChatMessage {
         session_id: session_id.to_string(),
         message_id: format!("msg-{}", uuid_short()),
         text: text.to_string(),
+        mode: None,
         attachments: vec![],
         tab_id: None,
         tab_ids: vec![],

@@ -12,7 +12,7 @@
 //! [`inbound`]: PortalSession::inbound
 //! [`on_resume`]: PortalSession::on_resume
 
-use nevoflux_protocol::chat::{AgentMessage, SidebarMessage};
+use nevoflux_protocol::chat::SidebarMessage;
 use serde_json::Value;
 
 use super::crypto::{self, SealedFrame};
@@ -44,14 +44,19 @@ pub struct PortalSession {
     sequencer: SendSequencer,
     /// Channel key for E2E; `None` = plaintext (S1) mode.
     key: Option<[u8; 32]>,
+    /// The local sidebar's chat mode when `/remote-control` ran. Remote turns
+    /// inherit it verbatim, so the channel never grants more (or less) than the
+    /// session already had.
+    mode: Option<String>,
 }
 
 impl PortalSession {
-    pub fn new(key: Option<[u8; 32]>) -> Self {
+    pub fn new(key: Option<[u8; 32]>, mode: Option<String>) -> Self {
         Self {
             translator: Translator::new(),
             sequencer: SendSequencer::new(),
             key,
+            mode,
         }
     }
 
@@ -59,12 +64,8 @@ impl PortalSession {
     /// downlink wire frames: translate → seq-tag → encode. Non-chat / unparseable
     /// payloads yield nothing.
     pub fn on_chat(&mut self, payload: &Value) -> Vec<Wire> {
-        let msg: AgentMessage = match serde_json::from_value(payload.clone()) {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
         self.translator
-            .downlink(&msg)
+            .downlink(payload)
             .into_iter()
             .map(|frame| {
                 let wire = self.sequencer.tag(frame);
@@ -90,7 +91,7 @@ impl PortalSession {
     pub fn inbound(&self, w: &Wire, session_id: &str, message_id: &str) -> Inbound {
         match self.decode(w) {
             Some(WireMessage::Frame { frame, .. }) => {
-                match translate::uplink(&frame, session_id, message_id) {
+                match translate::uplink(&frame, session_id, message_id, self.mode.as_deref()) {
                     Some(sm) => Inbound::Uplink(sm),
                     None => Inbound::Ignore,
                 }
@@ -140,26 +141,19 @@ impl PortalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nevoflux_protocol::chat::{AgentMessage, StreamChunk, StreamEnd};
-    use nevoflux_protocol::common::StreamFormat;
     use serde_json::json;
 
-    fn chunk_payload(stream: &str, delta: &str) -> Value {
-        serde_json::to_value(AgentMessage::StreamChunk(StreamChunk {
-            session_id: "sess".into(),
-            stream_id: stream.into(),
-            delta: delta.into(),
-            format: StreamFormat::Markdown,
-            event: None,
-            thinking_event: None,
-        }))
-        .unwrap()
+    /// A real daemon chat chunk — the exact shape `server.rs` builds. Note there
+    /// is no session_id / stream_id / format on the wire; the translator
+    /// synthesizes the stream id, so ids here are `s0`, `s1`, … per turn.
+    fn chunk(content: &str, done: bool) -> Value {
+        json!({ "type": "stream_chunk", "payload": { "content": content, "done": done } })
     }
 
     #[test]
     fn plaintext_on_chat_emits_seq_tagged_wire_frames() {
-        let mut s = PortalSession::new(None);
-        let out = s.on_chat(&chunk_payload("s1", "hi"));
+        let mut s = PortalSession::new(None, None);
+        let out = s.on_chat(&chunk("hi", false));
         // stream_start (seq 0) then stream_delta (seq 1)
         assert_eq!(out.len(), 2);
         let m0: WireMessage = match &out[0] {
@@ -170,7 +164,7 @@ mod tests {
             m0,
             WireMessage::Frame {
                 seq: Some(0),
-                frame: json!({ "kind": "stream_start", "streamId": "s1" }),
+                frame: json!({ "kind": "stream_start", "streamId": "s0" }),
             }
         );
     }
@@ -178,8 +172,8 @@ mod tests {
     #[test]
     fn e2e_on_chat_emits_binary_that_decodes_back() {
         let key = [7u8; 32];
-        let mut s = PortalSession::new(Some(key));
-        let out = s.on_chat(&chunk_payload("s1", "hi"));
+        let mut s = PortalSession::new(Some(key), None);
+        let out = s.on_chat(&chunk("hi", false));
         assert!(matches!(out[0], Wire::Binary(_)), "E2E should be binary");
         // decode round-trips to the same WireMessage.
         let decoded = s.decode(&out[1]).unwrap();
@@ -187,23 +181,16 @@ mod tests {
             decoded,
             WireMessage::Frame {
                 seq: Some(1),
-                frame: json!({ "kind": "stream_delta", "streamId": "s1", "delta": "hi" }),
+                frame: json!({ "kind": "stream_delta", "streamId": "s0", "delta": "hi" }),
             }
         );
     }
 
     #[test]
     fn on_resume_resends_buffered_tail() {
-        let mut s = PortalSession::new(None);
-        s.on_chat(&chunk_payload("s1", "a")); // seq 0 (start) + 1 (delta)
-        s.on_chat(
-            &serde_json::to_value(AgentMessage::StreamEnd(StreamEnd {
-                session_id: "sess".into(),
-                stream_id: "s1".into(),
-                metadata: None,
-            }))
-            .unwrap(),
-        ); // seq 2 (end)
+        let mut s = PortalSession::new(None, None);
+        s.on_chat(&chunk("a", false)); // seq 0 (start) + 1 (delta)
+        s.on_chat(&chunk("", true)); // seq 2 (end)
         let resent = s.on_resume(1);
         let seqs: Vec<u64> = resent
             .iter()
@@ -220,7 +207,7 @@ mod tests {
 
     #[test]
     fn inbound_user_message_routes_to_uplink() {
-        let s = PortalSession::new(None);
+        let s = PortalSession::new(None, None);
         let wire = Wire::Text(
             serde_json::to_string(&WireMessage::Frame {
                 seq: None,
@@ -239,7 +226,7 @@ mod tests {
 
     #[test]
     fn inbound_resume_is_routed() {
-        let s = PortalSession::new(None);
+        let s = PortalSession::new(None, None);
         let wire = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 4 }).unwrap());
         assert_eq!(s.inbound(&wire, "sess", "m1"), Inbound::Resume(4));
     }

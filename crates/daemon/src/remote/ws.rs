@@ -59,10 +59,15 @@ impl WireSink for WsSink {
     async fn send(&self, wire: Wire) {
         let msg = wire_to_message(wire);
         let mut guard = self.write.lock().await;
-        if let Some(w) = guard.as_mut() {
-            // A write error means the socket died; the read loop will observe it
-            // and the reconnect swaps in a fresh write half.
-            let _ = w.send(msg).await;
+        match guard.as_mut() {
+            Some(w) => {
+                if let Err(e) = w.send(msg).await {
+                    tracing::warn!(target: "remote", "WsSink: send failed: {e}");
+                }
+            }
+            None => {
+                tracing::warn!(target: "remote", "WsSink: dropped a wire - socket not connected")
+            }
         }
     }
 }
@@ -109,6 +114,7 @@ pub async fn run_gateway(
     loop {
         match connect_async(url.as_str()).await {
             Ok((ws, _resp)) => {
+                tracing::info!(target: "remote", "relay connected (channel {channel_id})");
                 backoff_ms = 500;
                 let (write, mut read) = ws.split();
                 sink.set(write).await;
@@ -124,9 +130,10 @@ pub async fn run_gateway(
                         Err(_) => break, // socket error → reconnect
                     }
                 }
+                tracing::warn!(target: "remote", "relay disconnected - reconnecting");
                 sink.clear().await; // disconnected
             }
-            Err(_) => { /* fall through to backoff */ }
+            Err(e) => tracing::warn!(target: "remote", "relay connect failed: {e}"),
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(15_000);

@@ -69,6 +69,7 @@ mod tests {
             session_id: "s".into(),
             message_id: "m".into(),
             text: "hi".into(),
+            mode: Some("agent".into()),
             attachments: Vec::new(),
             tab_id: None,
             tab_ids: Vec::new(),
@@ -79,8 +80,10 @@ mod tests {
         assert_eq!(identity, b"local-proxy"); // stamped as the local head
         assert_eq!(env.proxy_id, "local-proxy");
         assert_eq!(env.channel, Channel::Chat);
-        // SidebarMessage is tagged {type, payload}.
+        // SidebarMessage is tagged {type, payload}. The body must ride as
+        // `content` — that is the only field `handle_chat_message` reads.
         assert_eq!(env.payload["type"], "chat_message");
-        assert_eq!(env.payload["payload"]["text"], "hi");
+        assert_eq!(env.payload["payload"]["content"], "hi");
+        assert!(env.payload["payload"].get("text").is_none());
     }
 }

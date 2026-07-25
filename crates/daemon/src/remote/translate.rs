@@ -4,23 +4,26 @@
 //! transport consume this. Frame JSON is the portal's shape: `kind` snake_case,
 //! fields camelCase (`streamId`).
 
-use std::collections::{HashMap, HashSet};
-
-use nevoflux_protocol::chat::AgentMessage;
 use serde_json::{json, Value};
 
-/// Downlink translator. Stateful to (1) synthesize `stream_start` on the first
-/// chunk of each stream (the daemon has no explicit start message), and (2)
-/// attach artifacts — which carry no stream id — to the in-flight stream, and
-/// recall a completing artifact's title/type (the daemon `ArtifactComplete`
-/// carries only the id, but the portal upsert replaces the whole artifact).
+/// Downlink translator: daemon chat JSON → portal frames.
+///
+/// Works on raw `Value`, deliberately **not** on `nevoflux_protocol::AgentMessage`.
+/// The daemon emits chat downlink as hand-written JSON in `server.rs`
+/// (`{"type":"stream_chunk","payload":{"content":…,"done":…}}`); the protocol
+/// crate's typed model requires `session_id`/`stream_id`/`delta`/`format`, none
+/// of which are on the wire. Parsing into it always failed and silently dropped
+/// every frame, so this layer matches observed bytes instead.
+///
+/// Stateful because the daemon has no stream identity at all: a turn is the run
+/// of `stream_chunk`s ending at `done:true`, and the portal needs a `streamId`,
+/// so one is synthesized per turn.
 #[derive(Debug, Default)]
 pub struct Translator {
-    started: HashSet<String>,
-    /// The most recent stream still open — artifacts attach here.
+    /// Synthesized id of the turn currently open, if any.
     current_stream: Option<String>,
-    /// Artifact id → (title, contentType) remembered from `ArtifactStart`.
-    artifacts: HashMap<String, (String, String)>,
+    /// Counter behind the synthesized ids.
+    next_stream: u64,
 }
 
 impl Translator {
@@ -28,141 +31,112 @@ impl Translator {
         Self::default()
     }
 
-    /// Translate one `AgentMessage` into 0+ portal `InboundFrame` values.
-    pub fn downlink(&mut self, msg: &AgentMessage) -> Vec<Value> {
-        match msg {
-            AgentMessage::StreamChunk(c) => {
-                let mut out = Vec::new();
-                self.current_stream = Some(c.stream_id.clone());
-                if self.started.insert(c.stream_id.clone()) {
-                    out.push(json!({ "kind": "stream_start", "streamId": c.stream_id }));
-                }
-                if let Some(nevoflux_protocol::chat::ThinkingEvent::Delta { content, .. }) =
-                    &c.thinking_event
-                {
-                    out.push(
-                        json!({ "kind": "thinking", "streamId": c.stream_id, "text": content }),
-                    );
-                }
-                if let Some(ev) = &c.event {
-                    out.push(tool_frame(&c.stream_id, ev));
-                }
-                if !c.delta.is_empty() {
-                    out.push(
-                        json!({ "kind": "stream_delta", "streamId": c.stream_id, "delta": c.delta }),
-                    );
-                }
-                out
+    /// Translate one daemon chat payload into 0+ portal `InboundFrame` values.
+    ///
+    /// `payload` is the raw `DaemonEnvelope.payload` — `{"type":…,"payload":{…}}`
+    /// exactly as `server.rs` builds it. Unknown types yield nothing.
+    pub fn downlink(&mut self, payload: &Value) -> Vec<Value> {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("stream_chunk") => self.stream_chunk(payload.get("payload")),
+            Some("error") => {
+                let p = payload.get("payload");
+                let message = p
+                    .and_then(|p| p.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Request failed");
+                vec![json!({ "kind": "error", "message": message })]
             }
-            AgentMessage::StreamEnd(e) => {
-                self.started.remove(&e.stream_id);
-                if self.current_stream.as_deref() == Some(e.stream_id.as_str()) {
-                    self.current_stream = None;
-                }
-                vec![json!({ "kind": "stream_end", "streamId": e.stream_id })]
-            }
-            AgentMessage::ArtifactStart(a) => {
-                self.artifacts
-                    .insert(a.id.clone(), (a.title.clone(), a.content_type.clone()));
-                self.artifact_frame(&a.id, &a.title, &a.content_type, "generating")
-            }
-            // Streamed artifact content has no portal representation (the artifact
-            // card shows metadata + state only), so deltas produce no frame.
-            AgentMessage::ArtifactDelta(_) => Vec::new(),
-            AgentMessage::ArtifactComplete(a) => {
-                let (title, content_type) = self.artifacts.get(&a.id).cloned().unwrap_or_default();
-                self.artifact_frame(&a.id, &title, &content_type, "ready")
-            }
-            AgentMessage::PlanProposal(p) => {
-                let steps: Vec<Value> = p
-                    .steps
-                    .iter()
-                    .map(|s| {
-                        let mut v = json!({ "description": s.description });
-                        if let Some(m) = &s.model {
-                            v["model"] = json!(m);
-                        }
-                        v
-                    })
-                    .collect();
-                vec![json!({ "kind": "plan", "plan": { "summary": p.summary, "steps": steps } })]
-            }
-            AgentMessage::PermissionRequest(r) => vec![json!({
-                "kind": "gate",
-                "gate": {
-                    "id": r.request_id,
-                    "prompt": r.reason,
-                    "options": ["Allow", "Allow always", "Deny"],
-                }
-            })],
-            AgentMessage::Error(e) => vec![json!({ "kind": "error", "message": e.message })],
             _ => Vec::new(),
         }
     }
 
-    /// Build a portal `artifact` frame attached to the in-flight stream. Drops
-    /// (empty) when no stream is open — the portal attaches artifacts to a live
-    /// assistant message, so an artifact outside any stream has nowhere to land.
-    fn artifact_frame(&self, id: &str, title: &str, content_type: &str, state: &str) -> Vec<Value> {
-        match &self.current_stream {
-            Some(stream_id) => vec![json!({
-                "kind": "artifact",
-                "streamId": stream_id,
-                "artifact": { "id": id, "title": title, "contentType": content_type, "state": state }
-            })],
-            None => Vec::new(),
+    /// A turn is the run of `stream_chunk`s up to `done:true`. The daemon sends
+    /// no stream id, so the first chunk opens one and `done` closes it.
+    fn stream_chunk(&mut self, p: Option<&Value>) -> Vec<Value> {
+        let Some(p) = p else { return Vec::new() };
+        let mut out = Vec::new();
+
+        let stream_id = match &self.current_stream {
+            Some(id) => id.clone(),
+            None => {
+                let id = format!("s{}", self.next_stream);
+                self.next_stream += 1;
+                self.current_stream = Some(id.clone());
+                out.push(json!({ "kind": "stream_start", "streamId": id }));
+                id
+            }
+        };
+
+        // Reasoning: only deltas carry text worth showing.
+        if let Some(te) = p.get("thinking_event") {
+            if te.get("type").and_then(Value::as_str) == Some("thinking_delta") {
+                if let Some(text) = te.get("content").and_then(Value::as_str) {
+                    out.push(json!({ "kind": "thinking", "streamId": stream_id, "text": text }));
+                }
+            }
         }
+
+        if let Some(ev) = p.get("event") {
+            if let Some(f) = tool_frame(&stream_id, ev) {
+                out.push(f);
+            }
+        }
+
+        let content = p.get("content").and_then(Value::as_str).unwrap_or("");
+        if !content.is_empty() {
+            out.push(json!({ "kind": "stream_delta", "streamId": stream_id, "delta": content }));
+        }
+
+        if p.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            out.push(json!({ "kind": "stream_end", "streamId": stream_id }));
+            self.current_stream = None;
+        }
+        out
     }
 }
 
-/// Map a daemon `ToolEvent` to a portal `tool` frame (`ToolCall`: id/name/status/target?).
-fn tool_frame(stream_id: &str, ev: &nevoflux_protocol::chat::ToolEvent) -> Value {
-    use nevoflux_protocol::chat::ToolEvent;
-    use nevoflux_protocol::common::ToolStatus;
-    let (id, name, status, target) = match ev {
-        ToolEvent::Start {
-            tool_id,
-            tool_name,
-            summary,
-            ..
-        } => (
-            tool_id.as_str(),
-            tool_name.as_str(),
+/// Map a daemon tool event (`{"type":"tool_start"|"tool_auth"|"tool_end",…}`) to
+/// a portal `tool` frame. Returns `None` for shapes we do not recognize rather
+/// than inventing a chip.
+fn tool_frame(stream_id: &str, ev: &Value) -> Option<Value> {
+    let tool_id = ev.get("tool_id").and_then(Value::as_str).unwrap_or("");
+    let summary = ev.get("summary").and_then(Value::as_str);
+    let (name, status) = match ev.get("type").and_then(Value::as_str)? {
+        "tool_start" => (
+            ev.get("tool_name").and_then(Value::as_str).unwrap_or(""),
             "running",
-            Some(summary.clone()),
         ),
-        ToolEvent::Auth { tool_id, .. } => (tool_id.as_str(), "", "waitingAuth", None),
-        ToolEvent::End {
-            tool_id,
-            status,
-            summary,
-            ..
-        } => (
-            tool_id.as_str(),
+        "tool_auth" => ("", "waitingAuth"),
+        "tool_end" => (
             "",
-            match status {
-                ToolStatus::Success => "done",
-                ToolStatus::Failed => "failed",
-                ToolStatus::Running => "running",
+            match ev.get("status").and_then(Value::as_str) {
+                Some("success") => "done",
+                Some("failed") => "failed",
+                _ => "running",
             },
-            Some(summary.clone()),
         ),
+        _ => return None,
     };
-    let mut tool = json!({ "id": id, "name": name, "status": status });
-    if let Some(t) = target {
+    let mut tool = json!({ "id": tool_id, "name": name, "status": status });
+    if let Some(t) = summary {
         tool["target"] = json!(t);
     }
-    json!({ "kind": "tool", "streamId": stream_id, "tool": tool })
+    Some(json!({ "kind": "tool", "streamId": stream_id, "tool": tool }))
 }
 
 /// Translate a portal `OutboundFrame` (JSON) into a daemon `SidebarMessage` for
 /// injection. `session_id` + `message_id` come from the gateway's session state
 /// (the portal frame doesn't carry them; the gateway generates `message_id`).
 /// Returns `None` for unknown / malformed frames.
+/// `mode` is the local sidebar's chat mode captured when `/remote-control` ran
+/// (`chat` | `browser` | `agent`). A remote turn inherits the powers the local
+/// session already had — it never picks its own privilege level. `None` leaves
+/// the field off, and the daemon falls back to `chat`.
 pub fn uplink(
     frame: &Value,
     session_id: &str,
     message_id: &str,
+    mode: Option<&str>,
 ) -> Option<nevoflux_protocol::chat::SidebarMessage> {
     use nevoflux_protocol::chat::{ChatMessage, PermissionResponse, PlanResponse, SidebarMessage};
     match frame.get("kind")?.as_str()? {
@@ -170,6 +144,11 @@ pub fn uplink(
             session_id: session_id.to_string(),
             message_id: message_id.to_string(),
             text: frame.get("text")?.as_str()?.to_string(),
+            // Mirror the local sidebar's mode — never choose one here. Omitting
+            // it would silently downgrade a remote turn to `chat` (no tools);
+            // hardcoding `agent` would silently upgrade one the user had left
+            // in `chat`.
+            mode: mode.map(str::to_string),
             attachments: Vec::new(),
             tab_id: None,
             tab_ids: Vec::new(),
@@ -200,26 +179,23 @@ mod tests {
     use nevoflux_protocol::common::StreamFormat;
     use serde_json::json;
 
-    fn chunk(stream: &str, delta: &str) -> AgentMessage {
-        AgentMessage::StreamChunk(StreamChunk {
-            session_id: "sess".into(),
-            stream_id: stream.into(),
-            delta: delta.into(),
-            format: StreamFormat::Markdown,
-            event: None,
-            thinking_event: None,
-        })
+    /// The exact chat payload `server.rs` puts on the wire. Deliberately built
+    /// as raw JSON, not via the protocol crate's types — those require
+    /// session_id/stream_id/delta/format, none of which the daemon actually
+    /// sends. Testing through them is what hid this for so long.
+    fn chunk(content: &str, done: bool) -> Value {
+        json!({ "type": "stream_chunk", "payload": { "content": content, "done": done } })
     }
 
     #[test]
     fn first_chunk_synthesizes_stream_start_then_delta() {
         let mut t = Translator::new();
-        let frames = t.downlink(&chunk("s1", "Hello"));
+        let frames = t.downlink(&chunk("Hello", false));
         assert_eq!(
             frames,
             vec![
-                json!({ "kind": "stream_start", "streamId": "s1" }),
-                json!({ "kind": "stream_delta", "streamId": "s1", "delta": "Hello" }),
+                json!({ "kind": "stream_start", "streamId": "s0" }),
+                json!({ "kind": "stream_delta", "streamId": "s0", "delta": "Hello" }),
             ]
         );
     }
@@ -227,194 +203,147 @@ mod tests {
     #[test]
     fn subsequent_chunk_only_delta() {
         let mut t = Translator::new();
-        t.downlink(&chunk("s1", "a"));
-        let frames = t.downlink(&chunk("s1", "b"));
+        t.downlink(&chunk("a", false));
+        let frames = t.downlink(&chunk("b", false));
         assert_eq!(
             frames,
-            vec![json!({ "kind": "stream_delta", "streamId": "s1", "delta": "b" })]
+            vec![json!({ "kind": "stream_delta", "streamId": "s0", "delta": "b" })]
         );
     }
 
     #[test]
-    fn stream_end_emits_end_frame() {
+    fn done_closes_the_turn_and_the_next_turn_gets_a_fresh_stream_id() {
         let mut t = Translator::new();
-        t.downlink(&chunk("s1", "a"));
-        let frames = t.downlink(&AgentMessage::StreamEnd(StreamEnd {
-            session_id: "sess".into(),
-            stream_id: "s1".into(),
-            metadata: None,
-        }));
+        t.downlink(&chunk("a", false));
+        let end = t.downlink(&chunk("", true));
+        assert_eq!(end, vec![json!({ "kind": "stream_end", "streamId": "s0" })]);
+        // A new turn must not reuse the closed stream.
+        let next = t.downlink(&chunk("b", false));
+        assert_eq!(
+            next,
+            vec![
+                json!({ "kind": "stream_start", "streamId": "s1" }),
+                json!({ "kind": "stream_delta", "streamId": "s1", "delta": "b" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn final_chunk_with_content_emits_delta_then_end() {
+        let mut t = Translator::new();
+        t.downlink(&chunk("a", false));
+        let frames = t.downlink(&chunk("!", true));
         assert_eq!(
             frames,
-            vec![json!({ "kind": "stream_end", "streamId": "s1" })]
+            vec![
+                json!({ "kind": "stream_delta", "streamId": "s0", "delta": "!" }),
+                json!({ "kind": "stream_end", "streamId": "s0" }),
+            ]
         );
     }
 
     #[test]
     fn thinking_delta_becomes_thinking_frame() {
-        use nevoflux_protocol::chat::ThinkingEvent;
         let mut t = Translator::new();
-        let c = StreamChunk {
-            session_id: "sess".into(),
-            stream_id: "s1".into(),
-            delta: String::new(),
-            format: StreamFormat::Markdown,
-            event: None,
-            thinking_event: Some(ThinkingEvent::Delta {
-                thinking_id: "t".into(),
-                content: "reasoning".into(),
-            }),
-        };
-        let frames = t.downlink(&AgentMessage::StreamChunk(c));
-        assert!(
-            frames.contains(&json!({ "kind": "thinking", "streamId": "s1", "text": "reasoning" }))
+        let payload = json!({
+            "type": "stream_chunk",
+            "payload": {
+                "content": "",
+                "done": false,
+                "thinking_event": { "type": "thinking_delta", "thinking_id": "t1", "content": "pondering" }
+            }
+        });
+        let frames = t.downlink(&payload);
+        assert_eq!(
+            frames,
+            vec![
+                json!({ "kind": "stream_start", "streamId": "s0" }),
+                json!({ "kind": "thinking", "streamId": "s0", "text": "pondering" }),
+            ]
         );
     }
 
     #[test]
-    fn tool_start_becomes_running_tool_frame() {
-        use nevoflux_protocol::chat::ToolEvent;
+    fn tool_events_map_to_tool_frames() {
         let mut t = Translator::new();
-        let c = StreamChunk {
-            session_id: "sess".into(),
-            stream_id: "s1".into(),
-            delta: String::new(),
-            format: StreamFormat::Markdown,
-            event: Some(ToolEvent::Start {
-                tool_id: "t1".into(),
-                tool_name: "browser".into(),
-                icon: String::new(),
-                summary: "read tab".into(),
-            }),
-            thinking_event: None,
-        };
-        let frames = t.downlink(&AgentMessage::StreamChunk(c));
-        assert!(frames.contains(&json!({
-            "kind": "tool", "streamId": "s1",
-            "tool": { "id": "t1", "name": "browser", "status": "running", "target": "read tab" }
-        })));
-    }
-
-    #[test]
-    fn plan_proposal_becomes_plan_frame() {
-        use nevoflux_protocol::chat::{PlanProposal, PlanStep};
-        let mut t = Translator::new();
-        let frames = t.downlink(&AgentMessage::PlanProposal(PlanProposal {
-            summary: "Do X".into(),
-            steps: vec![PlanStep {
-                description: "step a".into(),
-                model: None,
-            }],
-        }));
+        let start = json!({
+            "type": "stream_chunk",
+            "payload": { "content": "", "done": false,
+                "event": { "type": "tool_start", "tool_id": "T1", "tool_name": "browser_click", "summary": "click" } }
+        });
+        let frames = t.downlink(&start);
         assert_eq!(
-            frames,
-            vec![json!({
-                "kind": "plan",
-                "plan": { "summary": "Do X", "steps": [{ "description": "step a" }] }
-            })]
+            frames[1],
+            json!({ "kind": "tool", "streamId": "s0",
+                "tool": { "id": "T1", "name": "browser_click", "status": "running", "target": "click" } })
+        );
+
+        let end = json!({
+            "type": "stream_chunk",
+            "payload": { "content": "", "done": false,
+                "event": { "type": "tool_end", "tool_id": "T1", "status": "success", "summary": "ok" } }
+        });
+        assert_eq!(
+            t.downlink(&end)[0],
+            json!({ "kind": "tool", "streamId": "s0",
+                "tool": { "id": "T1", "name": "", "status": "done", "target": "ok" } })
         );
     }
 
     #[test]
-    fn permission_request_becomes_gate_frame() {
-        use nevoflux_protocol::chat::PermissionRequest;
-        use nevoflux_protocol::common::{
-            PermissionScope, Requester, RequesterType, ResourceAction, ResourceType,
-        };
+    fn tool_auth_becomes_waiting_auth() {
         let mut t = Translator::new();
-        let frames = t.downlink(&AgentMessage::PermissionRequest(PermissionRequest {
-            request_id: "g1".into(),
-            session_id: "s".into(),
-            resource_type: ResourceType::File,
-            action: ResourceAction::Write,
-            resource: "report.csv".into(),
-            requester: Requester {
-                requester_type: RequesterType::Agent,
-                id: "a".into(),
-                name: "Agent".into(),
-            },
-            reason: "Write report.csv?".into(),
-            scope: PermissionScope::Once,
-            timeout_ms: 30000,
-        }));
+        let auth = json!({
+            "type": "stream_chunk",
+            "payload": { "content": "", "done": false,
+                "event": { "type": "tool_auth", "tool_id": "T9" } }
+        });
+        let frames = t.downlink(&auth);
+        assert_eq!(frames[1]["tool"]["status"], "waitingAuth");
+        assert_eq!(frames[1]["tool"]["id"], "T9");
+    }
+
+    #[test]
+    fn unknown_tool_event_is_dropped_not_invented() {
+        let mut t = Translator::new();
+        let odd = json!({
+            "type": "stream_chunk",
+            "payload": { "content": "", "done": false, "event": { "type": "brand_new_thing" } }
+        });
+        // stream_start only — no fabricated tool chip.
         assert_eq!(
-            frames,
-            vec![json!({
-                "kind": "gate",
-                "gate": {
-                    "id": "g1",
-                    "prompt": "Write report.csv?",
-                    "options": ["Allow", "Allow always", "Deny"]
-                }
-            })]
+            t.downlink(&odd),
+            vec![json!({ "kind": "stream_start", "streamId": "s0" })]
         );
     }
 
     #[test]
     fn error_message_becomes_error_frame() {
-        use nevoflux_protocol::chat::ErrorMessage;
-        use nevoflux_protocol::common::ErrorLevel;
         let mut t = Translator::new();
-        let frames = t.downlink(&AgentMessage::Error(ErrorMessage {
-            session_id: "s".into(),
-            error_id: "e".into(),
-            level: ErrorLevel::Error,
-            code: "x".into(),
-            message: "boom".into(),
-            details: None,
-            recoverable: false,
-            retry_action: None,
-            related_request_id: None,
-        }));
-        assert_eq!(frames, vec![json!({ "kind": "error", "message": "boom" })]);
-    }
-
-    #[test]
-    fn artifact_start_then_complete_attaches_to_stream_and_recalls_metadata() {
-        use nevoflux_protocol::chat::{ArtifactComplete, ArtifactStart};
-        let mut t = Translator::new();
-        t.downlink(&chunk("s1", "working")); // opens stream s1
-
-        let start = t.downlink(&AgentMessage::ArtifactStart(ArtifactStart {
-            id: "art1".into(),
-            title: "report.csv".into(),
-            content_type: "text/csv".into(),
-            description: None,
-            files: None,
-            entry: None,
-            is_persistent: false,
-        }));
+        let payload = json!({ "type": "error", "payload": { "message": "boom" } });
         assert_eq!(
-            start,
-            vec![json!({
-                "kind": "artifact", "streamId": "s1",
-                "artifact": { "id": "art1", "title": "report.csv", "contentType": "text/csv", "state": "generating" }
-            })]
-        );
-
-        // Complete carries only the id; title/contentType are recalled from Start.
-        let done = t.downlink(&AgentMessage::ArtifactComplete(ArtifactComplete {
-            id: "art1".into(),
-        }));
-        assert_eq!(
-            done,
-            vec![json!({
-                "kind": "artifact", "streamId": "s1",
-                "artifact": { "id": "art1", "title": "report.csv", "contentType": "text/csv", "state": "ready" }
-            })]
+            t.downlink(&payload),
+            vec![json!({ "kind": "error", "message": "boom" })]
         );
     }
 
     #[test]
-    fn artifact_delta_produces_no_frame() {
-        use nevoflux_protocol::chat::ArtifactDelta;
+    fn unknown_message_type_yields_nothing() {
         let mut t = Translator::new();
-        t.downlink(&chunk("s1", "x"));
-        let frames = t.downlink(&AgentMessage::ArtifactDelta(ArtifactDelta {
-            id: "art1".into(),
-            delta: "chunk".into(),
-        }));
-        assert!(frames.is_empty());
+        assert!(t
+            .downlink(&json!({ "type": "agent_state", "payload": {} }))
+            .is_empty());
+        assert!(t.downlink(&json!({ "type": "system_response" })).is_empty());
+    }
+
+    #[test]
+    fn empty_content_alone_emits_no_delta() {
+        let mut t = Translator::new();
+        // Keep-alive style chunk: opens the stream but adds no text.
+        assert_eq!(
+            t.downlink(&chunk("", false)),
+            vec![json!({ "kind": "stream_start", "streamId": "s0" })]
+        );
     }
 
     #[test]
@@ -424,15 +353,42 @@ mod tests {
             &json!({ "kind": "user_message", "text": "hi" }),
             "sess",
             "m1",
+            Some("agent"),
         );
         match msg {
             Some(SidebarMessage::ChatMessage(c)) => {
                 assert_eq!(c.text, "hi");
                 assert_eq!(c.session_id, "sess");
                 assert_eq!(c.message_id, "m1");
+                assert_eq!(c.mode.as_deref(), Some("agent"));
             }
             other => panic!("expected ChatMessage, got {other:?}"),
         }
+    }
+
+    /// Guards the exact bytes `server::handle_chat_message` parses. It reads
+    /// `payload.content` (not `text`) and `payload.mode`; an uplink that gets
+    /// either wrong is delivered but rejected as `EMPTY_MESSAGE`, or silently
+    /// downgraded to the tool-less `chat` mode.
+    #[test]
+    fn uplink_user_message_serializes_to_the_wire_shape_the_daemon_parses() {
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "Hi" }),
+            "sess-1",
+            "m1",
+            Some("agent"),
+        )
+        .expect("user_message must translate");
+        let v = serde_json::to_value(&msg).unwrap();
+
+        assert_eq!(v["type"], "chat_message");
+        assert_eq!(v["payload"]["content"], "Hi");
+        assert!(
+            v["payload"].get("text").is_none(),
+            "`text` is the stale name; the daemon would read an empty body"
+        );
+        assert_eq!(v["payload"]["session_id"], "sess-1");
+        assert_eq!(v["payload"]["mode"], "agent");
     }
 
     #[test]
@@ -442,11 +398,13 @@ mod tests {
             &json!({ "kind": "gate_response", "id": "g1", "choice": "Allow" }),
             "s",
             "m",
+            None,
         );
         let deny = uplink(
             &json!({ "kind": "gate_response", "id": "g1", "choice": "Deny" }),
             "s",
             "m",
+            None,
         );
         match allow {
             Some(SidebarMessage::PermissionResponse(r)) => {
@@ -468,11 +426,13 @@ mod tests {
             &json!({ "kind": "plan_response", "approved": true }),
             "s",
             "m",
+            None,
         );
         let no = uplink(
             &json!({ "kind": "plan_response", "approved": false }),
             "s",
             "m",
+            None,
         );
         assert!(matches!(
             yes,
@@ -486,23 +446,19 @@ mod tests {
 
     #[test]
     fn uplink_unknown_kind_is_none() {
-        assert!(uplink(&json!({ "kind": "nope" }), "s", "m").is_none());
-        assert!(uplink(&json!({ "text": "no kind" }), "s", "m").is_none());
+        assert!(uplink(&json!({ "kind": "nope" }), "s", "m", None).is_none());
+        assert!(uplink(&json!({ "text": "no kind" }), "s", "m", None).is_none());
     }
 
+    /// Artifacts are not part of the daemon's real chat downlink — `server.rs`
+    /// emits no `artifact_*` message type. The old translator mapped
+    /// `AgentMessage::Artifact*`, which never arrives; that path is gone rather
+    /// than kept as dead code that implies a feature exists.
     #[test]
-    fn artifact_outside_any_stream_is_dropped() {
-        use nevoflux_protocol::chat::ArtifactStart;
+    fn artifact_types_are_not_part_of_the_wire_protocol() {
         let mut t = Translator::new();
-        let frames = t.downlink(&AgentMessage::ArtifactStart(ArtifactStart {
-            id: "art1".into(),
-            title: "x".into(),
-            content_type: "text/plain".into(),
-            description: None,
-            files: None,
-            entry: None,
-            is_persistent: false,
-        }));
-        assert!(frames.is_empty());
+        assert!(t
+            .downlink(&json!({ "type": "artifact_start", "payload": { "id": "a1" } }))
+            .is_empty());
     }
 }

@@ -62,8 +62,18 @@ pub struct ChatMessage {
     pub session_id: String,
     /// Message ID (UUID)
     pub message_id: String,
-    /// Message text
+    /// Message text.
+    ///
+    /// Serialized as `content`: that is the wire name the sidebar sends and the
+    /// only one `server::handle_chat_message` reads. This struct said `text`
+    /// while the live protocol had long since moved on, so anything built from
+    /// it arrived with an empty body (`EMPTY_MESSAGE`).
+    #[serde(rename = "content")]
     pub text: String,
+    /// Agent mode for this turn (`chat` | `browser` | `agent`). `None` lets the
+    /// daemon fall back to its default (`chat`), which cannot run tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Attachments
     #[serde(default)]
     pub attachments: Vec<Attachment>,
@@ -594,6 +604,7 @@ mod tests {
             session_id: "sess-001".into(),
             message_id: "msg-001".into(),
             text: "Hello, Agent!".into(),
+            mode: Some("agent".into()),
             attachments: vec![],
             tab_id: Some(123),
             tab_ids: vec![],
@@ -601,6 +612,11 @@ mod tests {
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"session_id\":\"sess-001\""));
+        // The body goes on the wire as `content` — `handle_chat_message` reads
+        // that and nothing else; emitting `text` yields an EMPTY_MESSAGE error.
+        assert!(json.contains("\"content\":\"Hello, Agent!\""));
+        assert!(!json.contains("\"text\":"));
+        assert!(json.contains("\"mode\":\"agent\""));
 
         let decoded: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, decoded);
@@ -638,6 +654,7 @@ mod tests {
             session_id: "sess-001".into(),
             message_id: "msg-001".into(),
             text: "Hello".into(),
+            mode: None,
             attachments: vec![],
             tab_id: None,
             tab_ids: vec![],
