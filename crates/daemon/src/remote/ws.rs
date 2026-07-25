@@ -90,31 +90,55 @@ pub fn message_to_wire(msg: Message) -> Option<Wire> {
     }
 }
 
-/// Connect to the relay and serve the portal `gateway` forever, reconnecting
-/// with exponential backoff. `relay_base` is e.g. `wss://portal-relay.<sub>.workers.dev`;
-/// `token` is the better-auth account JWT (URL-safe base64, no encoding needed).
+/// Connect to the relay and serve the portal `gateway`, reconnecting with
+/// exponential backoff. `relay_base` is e.g. `wss://portal-relay.<sub>.workers.dev`.
+///
+/// The admission JWT is **minted fresh on every attempt** from the daemon's
+/// account token: the account origin issues it with a 15-minute lifetime, so a
+/// gateway that cached one could never reconnect afterwards — every retry came
+/// back `401 Unauthorized`, forever.
+///
+/// The loop gives up after [`MAX_CONSECUTIVE_FAILURES`] failed attempts and
+/// unregisters the gateway, so a dead channel stops retrying and stops eating
+/// every chat frame the M2 tap fans to it.
+///
 /// `sink` is the same `WsSink` the `gateway` holds — this loop swaps its write
-/// half on each (re)connect so the gateway/`SendSequencer` state persists.
+/// half on each (re)connect so the gateway/`SendSequencer` state survives.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     relay_base: &str,
     channel_id: &str,
-    token: &str,
+    account_base: String,
+    account_token: String,
     session_id: String,
     injector: Arc<dyn Injector>,
     sink: Arc<WsSink>,
     gateway: Arc<PortalGateway>,
+    registry: Arc<tokio::sync::Mutex<super::gateway::GatewayRegistry>>,
 ) {
-    // The caller creates `sink` + `gateway` (key baked in) and registers the
-    // gateway in the `GatewayRegistry` *before* spawning this, so registration
-    // (an async Mutex lock) stays out of this loop.
-    // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
-    let url = format!("{relay_base}/?c={channel_id}&t={token}");
-
+    let gateway_id = super::gateway::RemoteGateway::id(gateway.as_ref()).to_string();
     let mut backoff_ms = 500u64;
+    let mut failures = 0u32;
+
     loop {
+        // Re-mint per attempt; a cached JWT expires after 15 minutes.
+        let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "remote", "mint relay JWT failed: {e}");
+                if !retry(&mut failures, &mut backoff_ms, &registry, &gateway_id).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
+        let url = format!("{relay_base}/?c={channel_id}&t={token}");
+
         match connect_async(url.as_str()).await {
             Ok((ws, _resp)) => {
                 tracing::info!(target: "remote", "relay connected (channel {channel_id})");
+                failures = 0;
                 backoff_ms = 500;
                 let (write, mut read) = ws.split();
                 sink.set(write).await;
@@ -131,13 +155,44 @@ pub async fn run_gateway(
                     }
                 }
                 tracing::warn!(target: "remote", "relay disconnected - reconnecting");
-                sink.clear().await; // disconnected
+                sink.clear().await;
+                // A clean disconnect is not a failure; reconnect promptly.
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
-            Err(e) => tracing::warn!(target: "remote", "relay connect failed: {e}"),
+            Err(e) => {
+                tracing::warn!(target: "remote", "relay connect failed: {e}");
+                if !retry(&mut failures, &mut backoff_ms, &registry, &gateway_id).await {
+                    return;
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(15_000);
     }
+}
+
+/// How many consecutive failed attempts before a gateway gives up and
+/// unregisters itself.
+const MAX_CONSECUTIVE_FAILURES: u32 = 8;
+
+/// Back off after a failure. Returns `false` once the gateway has given up (and
+/// has been unregistered), telling the caller to stop.
+async fn retry(
+    failures: &mut u32,
+    backoff_ms: &mut u64,
+    registry: &Arc<tokio::sync::Mutex<super::gateway::GatewayRegistry>>,
+    gateway_id: &str,
+) -> bool {
+    *failures += 1;
+    if *failures >= MAX_CONSECUTIVE_FAILURES {
+        tracing::warn!(
+            target: "remote",
+            "giving up after {failures} failed attempts; unregistering {gateway_id}"
+        );
+        registry.lock().await.unregister(gateway_id);
+        return false;
+    }
+    tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+    *backoff_ms = (*backoff_ms * 2).min(15_000);
+    true
 }
 
 #[cfg(test)]

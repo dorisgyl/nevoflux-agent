@@ -31,6 +31,9 @@ pub struct PortalGateway {
     /// Only chat for this session is projected — the M2 tap fans *every* chat
     /// `DaemonEnvelope` to every gateway.
     session_id: String,
+    /// Unique per channel (`portal:<channel_id>`) so the registry can drop this
+    /// gateway specifically; several may exist if the user opens more than one.
+    id: String,
 }
 
 impl PortalGateway {
@@ -41,11 +44,13 @@ impl PortalGateway {
         sink: Arc<dyn WireSink>,
         session_id: impl Into<String>,
         mode: Option<String>,
+        channel_id: &str,
     ) -> Self {
         Self {
             session: Mutex::new(PortalSession::new(key, mode)),
             sink,
             session_id: session_id.into(),
+            id: format!("portal:{channel_id}"),
         }
     }
 
@@ -77,7 +82,7 @@ impl PortalGateway {
 #[async_trait]
 impl RemoteGateway for PortalGateway {
     fn id(&self) -> &str {
-        "portal"
+        &self.id
     }
 
     fn capability(&self) -> Capability {
@@ -86,15 +91,18 @@ impl RemoteGateway for PortalGateway {
 
     async fn project(&self, ev: &OutboundEvent) {
         if let OutboundEvent::Chat(env) = ev {
-            // NOTE (temporary): no session filter. The daemon's chat downlink
-            // carries no session identifier at all — not in the payload
-            // (`{"type":"stream_chunk","payload":{"content",…}}`) and not on
-            // `DaemonEnvelope` — so there is nothing to filter on. Everything
-            // this daemon says is relayed to the portal, which means switching
-            // sessions locally also streams that session to the remote peer.
-            // Proper scoping needs a session id added to the daemon's chat emit
-            // sites; `self.session_id` is kept for when that lands.
-            let _ = &self.session_id;
+            // Scope to this gateway's session: the M2 tap fans *every* chat
+            // envelope to every gateway, and `server.rs` stamps `session_id`
+            // into each chat payload for exactly this purpose. Anything without
+            // one is dropped rather than leaked to the remote peer.
+            let sid = env
+                .payload
+                .get("payload")
+                .and_then(|p| p.get("session_id"))
+                .and_then(|s| s.as_str());
+            if sid != Some(self.session_id.as_str()) {
+                return;
+            }
             tracing::info!(
                 target: "remote",
                 "gateway.project: type={:?}",
@@ -125,46 +133,74 @@ mod tests {
         }
     }
 
-    /// A chat envelope carrying the real daemon payload shape.
-    fn chat_env(content: &str, done: bool) -> DaemonEnvelope {
+    /// A chat envelope carrying the real daemon payload shape, including the
+    /// `session_id` that `server.rs` now stamps for gateway scoping.
+    fn chat_env_for(session: &str, content: &str, done: bool) -> DaemonEnvelope {
         DaemonEnvelope::new(
             "proxy",
             Channel::Chat,
             serde_json::json!({
                 "type": "stream_chunk",
-                "payload": { "content": content, "done": done }
+                "payload": { "content": content, "done": done, "session_id": session }
             }),
         )
+    }
+
+    fn chat_env(content: &str, done: bool) -> DaemonEnvelope {
+        chat_env_for("sess", content, done)
     }
 
     #[tokio::test]
     async fn project_chat_sends_sequenced_wires_to_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None);
-        assert_eq!(gw.id(), "portal");
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        assert_eq!(gw.id(), "portal:chan");
         assert_eq!(gw.capability(), Capability::FullParity);
         gw.project(&OutboundEvent::Chat(chat_env("hi", false)))
             .await;
         assert_eq!(sink.sent.lock().await.len(), 2); // stream_start + stream_delta
     }
 
-    /// TEMPORARY semantics: the daemon's chat downlink carries no session id, so
-    /// the gateway cannot scope to one and relays everything. This test pins the
-    /// current behaviour so that adding real scoping is a deliberate change.
     #[tokio::test]
-    async fn project_relays_chat_regardless_of_gateway_session() {
+    async fn project_skips_other_sessions_chat() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "some-other-session", None);
-        gw.project(&OutboundEvent::Chat(chat_env("hi", false)))
+        let gw = PortalGateway::new(None, sink.clone(), "other-session", None, "chan");
+        gw.project(&OutboundEvent::Chat(chat_env_for("sess", "hi", false)))
             .await;
-        assert!(!sink.sent.lock().await.is_empty());
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "must not leak another session to the remote peer"
+        );
+    }
+
+    /// A payload with no session id belongs to no gateway; dropping it is safer
+    /// than relaying whatever it happens to contain.
+    #[tokio::test]
+    async fn project_drops_chat_without_a_session_id() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
+        let env = DaemonEnvelope::new(
+            "proxy",
+            Channel::Chat,
+            serde_json::json!({ "type": "stream_chunk", "payload": { "content": "x" } }),
+        );
+        gw.project(&OutboundEvent::Chat(env)).await;
+        assert!(sink.sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn id_is_unique_per_channel_so_the_registry_can_drop_one() {
+        let a = PortalGateway::new(None, Arc::new(CollectSink::default()), "s", None, "chan-a");
+        let b = PortalGateway::new(None, Arc::new(CollectSink::default()), "s", None, "chan-b");
+        assert_eq!(a.id(), "portal:chan-a");
+        assert_ne!(a.id(), b.id());
     }
 
     #[tokio::test]
     async fn project_ignores_non_chat_events() {
         use super::super::gateway::NotificationEvent;
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None);
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
         gw.project(&OutboundEvent::Notification(NotificationEvent {
             title: None,
             body: "hi".into(),
@@ -177,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None);
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1
         sink.sent.lock().await.clear();
         gw.resume(1).await;
@@ -204,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_wire_in_user_message_injects_uplink() {
-        let gw = PortalGateway::new(None, Arc::new(CollectSink::default()), "sess", None);
+        let gw = PortalGateway::new(None, Arc::new(CollectSink::default()), "sess", None, "chan");
         let inj = CollectInjector::default();
         gw.on_wire_in(
             frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
@@ -220,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn on_wire_in_resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None);
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, "chan");
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1 buffered
         sink.sent.lock().await.clear();
         let resume = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 1 }).unwrap());

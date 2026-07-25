@@ -97,6 +97,14 @@ impl GatewayRegistry {
         self.gateways.push(gateway);
     }
 
+    /// Remove a gateway by id. Gateways whose transport has died must be taken
+    /// out, or the M2 tap keeps fanning every chat frame into a dead socket.
+    pub fn unregister(&mut self, id: &str) -> bool {
+        let before = self.gateways.len();
+        self.gateways.retain(|g| g.id() != id);
+        before != self.gateways.len()
+    }
+
     /// Number of registered gateways.
     pub fn len(&self) -> usize {
         self.gateways.len()
@@ -232,6 +240,28 @@ mod tests {
         // capability (design §9.1 — orthogonal to capability()).
         assert_eq!(portal_seen.lock().unwrap().as_slice(), &[notif()]);
         assert_eq!(slack_seen.lock().unwrap().as_slice(), &[notif()]);
+    }
+
+    #[tokio::test]
+    async fn unregister_removes_only_the_named_gateway() {
+        let (portal, portal_seen) = mock("portal:chan-a", Capability::FullParity);
+        let (other, other_seen) = mock("portal:chan-b", Capability::FullParity);
+        let mut reg = GatewayRegistry::new();
+        reg.register(portal);
+        reg.register(other);
+
+        assert!(reg.unregister("portal:chan-a"));
+        assert!(
+            !reg.unregister("portal:chan-a"),
+            "second removal is a no-op"
+        );
+        assert_eq!(reg.ids(), vec!["portal:chan-b"]);
+
+        // A dead gateway must stop receiving; that leak is what made every chat
+        // frame log `dropped a wire` after a channel died.
+        reg.fan_out(&notif()).await;
+        assert!(portal_seen.lock().unwrap().is_empty());
+        assert_eq!(other_seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

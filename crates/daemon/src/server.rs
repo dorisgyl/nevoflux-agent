@@ -5801,6 +5801,8 @@ async fn handle_chat_message_streaming(
     let stream_request_id = request_id.clone();
     let stream_identity = identity.clone();
     let stream_response_tx = response_tx.clone();
+    // Remote gateways scope by session; the forwarder needs its own clone.
+    let stream_session_id = session_id.clone();
     let stream_title = generated_title.clone();
     let forwarder_cancellation = cancellation_token.clone();
 
@@ -5822,6 +5824,7 @@ async fn handle_chat_message_streaming(
                 let mut chunk_payload = serde_json::json!({
                     "type": "stream_chunk",
                     "payload": {
+                        "session_id": stream_session_id.as_str(),
                         "content": $text,
                         "done": $done
                     }
@@ -6143,6 +6146,8 @@ async fn handle_chat_message_streaming(
                         let rerun_identity = identity.clone();
                         let rerun_response_tx = response_tx.clone();
 
+                        // Remote gateways scope by session; this task needs its own clone.
+                        let rerun_session_id = session_id.clone();
                         let rerun_forwarder = tokio::spawn(async move {
                             let mut rerun_accumulated = String::new();
                             let mut buffer = String::new();
@@ -6163,6 +6168,7 @@ async fn handle_chat_message_streaming(
                                             let chunk_payload = serde_json::json!({
                                                 "type": "stream_chunk",
                                                 "payload": {
+                                                    "session_id": rerun_session_id.as_str(),
                                                     "content": text,
                                                     "done": false
                                                 }
@@ -6194,6 +6200,7 @@ async fn handle_chat_message_streaming(
                                                         let flush_payload = serde_json::json!({
                                                             "type": "stream_chunk",
                                                             "payload": {
+                                                                "session_id": rerun_session_id.as_str(),
                                                                 "content": text,
                                                                 "done": false
                                                             }
@@ -6216,6 +6223,7 @@ async fn handle_chat_message_streaming(
                                                     let mut chunk_payload = serde_json::json!({
                                                         "type": "stream_chunk",
                                                         "payload": {
+                                                            "session_id": rerun_session_id.as_str(),
                                                             "content": chunk.text,
                                                             "done": chunk.done
                                                         }
@@ -6255,6 +6263,7 @@ async fn handle_chat_message_streaming(
                                                     let chunk_payload = serde_json::json!({
                                                         "type": "stream_chunk",
                                                         "payload": {
+                                                            "session_id": rerun_session_id.as_str(),
                                                             "content": final_text,
                                                             "done": true
                                                         }
@@ -6284,6 +6293,7 @@ async fn handle_chat_message_streaming(
                                                     let chunk_payload = serde_json::json!({
                                                         "type": "stream_chunk",
                                                         "payload": {
+                                                            "session_id": rerun_session_id.as_str(),
                                                             "content": text,
                                                             "done": false
                                                         }
@@ -6347,6 +6357,7 @@ async fn handle_chat_message_streaming(
                                 let final_payload = serde_json::json!({
                                     "type": "stream_chunk",
                                     "payload": {
+                                        "session_id": session_id.as_str(),
                                         "content": "",
                                         "tool_calls": output.tool_calls,
                                         "done": true
@@ -6398,6 +6409,7 @@ async fn handle_chat_message_streaming(
                         let cancel_payload = serde_json::json!({
                             "type": "stream_chunk",
                             "payload": {
+                                "session_id": session_id.as_str(),
                                 "content": "Plan cancelled by user.",
                                 "done": true
                             }
@@ -6416,6 +6428,7 @@ async fn handle_chat_message_streaming(
                         let cancel_payload = serde_json::json!({
                             "type": "stream_chunk",
                             "payload": {
+                                "session_id": session_id.as_str(),
                                 "content": "Plan cancelled (connection lost).",
                                 "done": true
                             }
@@ -6635,6 +6648,7 @@ async fn handle_chat_message_streaming(
             let mut final_payload = serde_json::json!({
                 "type": "stream_chunk",
                 "payload": {
+                    "session_id": session_id.as_str(),
                     "content": "",
                     "tool_calls": all_tool_calls,
                     "done": true
@@ -6713,6 +6727,7 @@ async fn handle_chat_message_streaming(
             let done_payload = serde_json::json!({
                 "type": "stream_chunk",
                 "payload": {
+                    "session_id": session_id.as_str(),
                     "content": format!("\n\nAgent error: {}", e),
                     "tool_calls": [],
                     "done": true
@@ -6743,6 +6758,7 @@ async fn handle_chat_message_streaming(
             let done_payload = serde_json::json!({
                 "type": "stream_chunk",
                 "payload": {
+                    "session_id": session_id.as_str(),
                     "content": format!("\n\nAgent task failed: {}", e),
                     "tool_calls": [],
                     "done": true
@@ -7354,6 +7370,7 @@ async fn handle_chat_message(
                     let mut response = serde_json::json!({
                         "type": "stream_chunk",
                         "payload": {
+                            "session_id": session_id.as_str(),
                             "content": final_text,
                             "tool_calls": output.tool_calls,
                             "done": true
@@ -7860,6 +7877,7 @@ async fn handle_chat_message(
                         sink.clone(),
                         session_id.clone(),
                         mode,
+                        &channel_id,
                     ));
                     match (&services.remote_registry, &services.remote_msg_tx) {
                         (Some(registry), Some(msg_tx)) => {
@@ -7870,11 +7888,16 @@ async fn handle_chat_message(
                                     _proxy_id.clone(),
                                 ));
                             let relay = "wss://portal-relay.gansamuel03.workers.dev".to_string();
-                            let (ch, jwt2, sid) =
-                                (channel_id.clone(), jwt.clone(), session_id.clone());
+                            // The JWT is re-minted per connect attempt inside the
+                            // loop, so hand it the account credentials, not a
+                            // token that expires in 15 minutes.
+                            let (ch, sid) = (channel_id.clone(), session_id.clone());
+                            let (acct_base, acct_token) = (base.clone(), account_token.clone());
+                            let reg = registry.clone();
                             tokio::spawn(async move {
                                 crate::remote::ws::run_gateway(
-                                    &relay, &ch, &jwt2, sid, injector, sink, gateway,
+                                    &relay, &ch, acct_base, acct_token, sid, injector, sink,
+                                    gateway, reg,
                                 )
                                 .await;
                             });
