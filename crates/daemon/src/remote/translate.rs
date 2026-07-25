@@ -138,7 +138,9 @@ pub fn uplink(
     message_id: &str,
     mode: Option<&str>,
 ) -> Option<nevoflux_protocol::chat::SidebarMessage> {
-    use nevoflux_protocol::chat::{ChatMessage, PermissionResponse, PlanResponse, SidebarMessage};
+    use nevoflux_protocol::chat::{
+        ChatMessage, PermissionResponse, PlanResponse, SidebarMessage, StopGeneration,
+    };
     match frame.get("kind")?.as_str()? {
         "user_message" => Some(SidebarMessage::ChatMessage(ChatMessage {
             session_id: session_id.to_string(),
@@ -161,6 +163,16 @@ pub fn uplink(
                 scope: None,
             }))
         }
+        // The portal's stop button. It maps onto the same kill switches the
+        // local sidebar's stop uses — the message loop's `stop_generation`
+        // arm sets this session's interrupt flag and cancels its stream
+        // forwarder — so a remote stop is a local stop, not a second
+        // mechanism that could disagree with it. The session id comes from
+        // the gateway, never from the frame: a portal must not be able to
+        // halt a session it was not granted.
+        "cancel" => Some(SidebarMessage::StopGeneration(StopGeneration {
+            session_id: session_id.to_string(),
+        })),
         "plan_response" => Some(SidebarMessage::PlanResponse(
             if frame.get("approved")?.as_bool()? {
                 PlanResponse::Confirmed
@@ -442,6 +454,43 @@ mod tests {
             no,
             Some(SidebarMessage::PlanResponse(PlanResponse::Cancelled))
         ));
+    }
+
+    #[test]
+    fn uplink_cancel_becomes_stop_generation_for_the_gateway_session() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
+        assert!(matches!(
+            &msg,
+            SidebarMessage::StopGeneration(s) if s.session_id == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn uplink_cancel_ignores_any_session_the_frame_tries_to_name() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        // The session comes from the gateway. A portal that could name one
+        // would be able to halt a session it was never granted.
+        let msg = uplink(
+            &json!({ "kind": "cancel", "session_id": "someone-elses" }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            &msg,
+            SidebarMessage::StopGeneration(s) if s.session_id == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn uplink_cancel_serializes_to_the_shape_the_message_loop_reads() {
+        // server.rs reads payload.payload.session_id off the raw envelope.
+        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(wire["type"], "stop_generation");
+        assert_eq!(wire["payload"]["session_id"], "sess-1");
     }
 
     #[test]
