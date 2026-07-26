@@ -875,6 +875,19 @@ pub async fn start_server(
     // Create interrupt registry for signalling agents to stop
     let interrupt_registry: InterruptRegistry = Arc::new(Mutex::new(HashMap::new()));
 
+    // Last browser tab context seen for a session, keyed by session_id.
+    //
+    // The sidebar attaches `tab_id`/`tab_ids` to every chat message it sends,
+    // because it is the thing that can see the browser. A remote-control
+    // portal cannot: it is a phone. Without this, a portal turn in browser
+    // mode arrives with no tabs at all, the first tool call (a snapshot of
+    // "the active tab") fails, and the turn dies before it says anything.
+    // Remembering what the local sidebar last reported lets a remote turn act
+    // on the same tabs the local user is looking at — which is what taking
+    // over this machine is supposed to mean.
+    let tab_context_registry: Arc<Mutex<HashMap<String, (Option<i64>, serde_json::Value)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // Create plan request registry for pending plan proposals
     let plan_registry: PlanRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
 
@@ -2273,6 +2286,7 @@ pub async fn start_server(
     let process_browser_registry = browser_registry.clone();
     let process_cancellation_registry = cancellation_registry.clone();
     let process_interrupt_registry = interrupt_registry.clone();
+    let process_tab_context_registry = tab_context_registry.clone();
     let process_plan_registry = plan_registry.clone();
     let process_tool_auth_registry = tool_auth_registry.clone();
     let process_extraction_registry = extraction_registry.clone();
@@ -2298,10 +2312,51 @@ pub async fn start_server(
         // replace/keep prompt exactly once for this daemon lifetime.
         let skills_update_pending = nevoflux_skills::skills_update_available();
         let mut skills_prompt_sent = false;
-        while let Some((identity, envelope)) = msg_rx.recv().await {
+        while let Some((identity, mut envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
             let request_id = envelope.request_id.clone();
             let channel = envelope.channel;
+
+            // Carry the session's browser tab context onto turns that arrive
+            // without it. The sidebar attaches its tabs to every message; a
+            // remote-control portal has none to attach, so a browser-mode turn
+            // from a phone would otherwise have nothing to act on and die at
+            // its first tool call. Done here, before dispatch, so the rest of
+            // the pipeline sees an ordinary message either way.
+            if envelope.payload.get("type").and_then(|v| v.as_str()) == Some("chat_message") {
+                if let Some(p) = envelope.payload.get("payload") {
+                    let sid = p
+                        .get("session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let has_tabs = p
+                        .get("tab_ids")
+                        .and_then(|t| t.as_array())
+                        .is_some_and(|a| !a.is_empty());
+                    if !sid.is_empty() {
+                        if has_tabs {
+                            let seen = (
+                                p.get("tab_id").and_then(|t| t.as_i64()),
+                                p.get("tab_ids").cloned().unwrap_or(serde_json::Value::Null),
+                            );
+                            process_tab_context_registry.lock().await.insert(sid, seen);
+                        } else if let Some((tab_id, tab_ids)) =
+                            process_tab_context_registry.lock().await.get(&sid).cloned()
+                        {
+                            if let Some(p) =
+                                envelope.payload.get_mut("payload").and_then(|p| p.as_object_mut())
+                            {
+                                if let Some(t) = tab_id {
+                                    p.insert("tab_id".into(), serde_json::json!(t));
+                                }
+                                p.insert("tab_ids".into(), tab_ids);
+                                info!("Applied the session's last known tab context to a turn that carried none");
+                            }
+                        }
+                    }
+                }
+            }
 
             // Log all incoming messages
             let msg_type = envelope
