@@ -48,10 +48,14 @@ impl Translator {
             }
             // A stopped turn ends here and nowhere else. `stop_generation`
             // cancels the stream forwarder, so the `done:true` chunk that
-            // normally closes a turn is never sent — deliberately. Without
-            // this the portal keeps the turn open forever: the caret blinks
-            // on, and the composer's stop button stays in its "stopping"
-            // state waiting for an end that cannot arrive.
+            // normally closes a turn is never sent — deliberately.
+            //
+            // Sent unconditionally, not only when a stream is open. Stop is
+            // most often pressed while the head is thinking or running a tool,
+            // before a single token has arrived; there is no stream to close
+            // then, and an earlier version of this said nothing at all — so
+            // the portal, which starts waiting the moment you send, waited for
+            // good and the stop button never came back.
             Some("agent_state")
                 if payload
                     .get("payload")
@@ -59,10 +63,8 @@ impl Translator {
                     .and_then(Value::as_str)
                     == Some("idle") =>
             {
-                match self.current_stream.take() {
-                    Some(id) => vec![json!({ "kind": "stream_end", "streamId": id })],
-                    None => Vec::new(),
-                }
+                self.current_stream = None;
+                vec![json!({ "kind": "turn_end" })]
             }
             // The reply to something the portal asked for — the skill list, the
             // souls, the open tabs. The gateway only lets through replies to
@@ -678,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn downlink_idle_closes_an_open_turn() {
+    fn downlink_idle_ends_the_turn() {
         // What a stop actually looks like on the wire: chunks, then no
         // `done:true` at all, because the forwarder was cancelled.
         let mut t = Translator::new();
@@ -687,20 +689,19 @@ mod tests {
             "type": "agent_state",
             "payload": { "state": "idle", "message": "Generation stopped", "done": true }
         }));
-        assert_eq!(
-            frames,
-            vec![json!({ "kind": "stream_end", "streamId": "s0" })]
-        );
+        assert_eq!(frames, vec![json!({ "kind": "turn_end" })]);
     }
 
     #[test]
-    fn downlink_idle_with_no_open_turn_says_nothing() {
-        // "No active generation" — closing a turn that was never open would
-        // end an unrelated one.
+    fn downlink_idle_ends_a_turn_that_never_produced_anything() {
+        // The common case: stop pressed while the head is thinking or running
+        // a tool, before a single token. There is no stream to close, and
+        // saying nothing here is what left the portal waiting for good.
         let mut t = Translator::new();
-        assert!(t
-            .downlink(&json!({ "type": "agent_state", "payload": { "state": "idle" } }))
-            .is_empty());
+        assert_eq!(
+            t.downlink(&json!({ "type": "agent_state", "payload": { "state": "idle" } })),
+            vec![json!({ "kind": "turn_end" })]
+        );
     }
 
     #[test]
