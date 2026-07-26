@@ -1251,6 +1251,19 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             let llm_kws = Self::extract_keywords_from_text(&response.text);
 
             for tool_call in &tool_calls {
+                // Stop before starting anything new.
+                //
+                // The interrupt was only checked *after* each tool ran, so a
+                // model that asked for several in one turn kept working through
+                // the rest of the batch after the user pressed stop — one
+                // browser action at a time, each one looking like the stop had
+                // been ignored. This cannot preempt a call already in flight
+                // (the host call is synchronous), but nothing further begins
+                // once you have said stop.
+                if self.host.is_interrupted()? {
+                    break;
+                }
+
                 // Update keywords from pre-extracted LLM keywords + tool args
                 self.update_keywords_from_tool_context(&llm_kws, tool_call);
 
