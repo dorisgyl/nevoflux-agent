@@ -29,8 +29,12 @@ pub enum Wire {
 /// A decoded inbound message routed for the gateway to act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
-    /// A portal→daemon frame translated to a `SidebarMessage` to inject.
-    Uplink(SidebarMessage),
+    /// A portal→daemon frame translated to the sidebar payload to inject,
+    /// as JSON. Not a `SidebarMessage`: some fields the daemon reads off a
+    /// chat message — `soul_mention`, notably — exist only on the wire and
+    /// have no home on the protocol struct, so the typed value is built and
+    /// then serialized here rather than at the injection point.
+    Uplink(serde_json::Value),
     /// The portal asks the daemon to resend from this seq.
     Resume(u64),
     /// Nothing to do (unknown frame, decode failure, or a downlink-only variant).
@@ -113,7 +117,7 @@ impl PortalSession {
         match self.decode(w) {
             Some(WireMessage::Frame { frame, .. }) => {
                 match translate::uplink(&frame, session_id, message_id, self.mode.as_deref()) {
-                    Some(sm) => Inbound::Uplink(sm),
+                    Some(v) => Inbound::Uplink(v),
                     None => Inbound::Ignore,
                 }
             }
@@ -237,11 +241,13 @@ mod tests {
             .unwrap(),
         );
         match s.inbound(&wire, "sess", "m1") {
-            Inbound::Uplink(SidebarMessage::ChatMessage(c)) => {
-                assert_eq!(c.text, "hi");
-                assert_eq!(c.session_id, "sess");
+            Inbound::Uplink(v) => {
+                assert_eq!(v["type"], "chat_message");
+                // `content`, not `text`: the wire name the daemon parses.
+                assert_eq!(v["payload"]["content"], "hi");
+                assert_eq!(v["payload"]["session_id"], "sess");
             }
-            other => panic!("expected Uplink ChatMessage, got {other:?}"),
+            other => panic!("expected Uplink chat_message, got {other:?}"),
         }
     }
 

@@ -91,16 +91,19 @@ impl PortalGateway {
             .await
             .inbound(&wire, session_id, &message_id);
         match routed {
-            Inbound::Uplink(sm) => {
+            Inbound::Uplink(payload) => {
                 // Remember what we asked, so the reply can be recognised as
                 // ours when it comes back without a session id.
-                if let nevoflux_protocol::chat::SidebarMessage::SystemCommand(c) = &sm {
-                    self.pending_queries
-                        .lock()
-                        .await
-                        .insert(c.request_id.clone());
+                if payload.get("type").and_then(|v| v.as_str()) == Some("system_command") {
+                    if let Some(id) = payload
+                        .get("payload")
+                        .and_then(|p| p.get("request_id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.pending_queries.lock().await.insert(id.to_string());
+                    }
                 }
-                injector.inject(sm).await
+                injector.inject(payload).await
             }
             Inbound::Resume(from) => self.resume(from).await,
             Inbound::Ignore => {}
@@ -328,12 +331,12 @@ mod tests {
 
     #[derive(Default)]
     struct CollectInjector {
-        injected: Mutex<Vec<SidebarMessage>>,
+        injected: Mutex<Vec<serde_json::Value>>,
     }
     #[async_trait]
     impl Injector for CollectInjector {
-        async fn inject(&self, msg: SidebarMessage) {
-            self.injected.lock().await.push(msg);
+        async fn inject(&self, payload: serde_json::Value) {
+            self.injected.lock().await.push(payload);
         }
     }
 
@@ -360,7 +363,7 @@ mod tests {
         .await;
         let injected = inj.injected.lock().await;
         assert_eq!(injected.len(), 1);
-        assert!(matches!(injected[0], SidebarMessage::ChatMessage(_)));
+        assert_eq!(injected[0]["type"], "chat_message");
     }
 
     #[tokio::test]

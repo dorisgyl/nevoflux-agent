@@ -14,7 +14,7 @@ use nevoflux_protocol::{Channel, ProxyEnvelope};
 /// Injects a portal-originated message into the daemon as the local head.
 #[async_trait]
 pub trait Injector: Send + Sync {
-    async fn inject(&self, msg: SidebarMessage);
+    async fn inject(&self, payload: serde_json::Value);
 }
 
 /// The live injector: forwards into the daemon's message channel using the
@@ -38,11 +38,7 @@ impl ChannelInjector {
 
 #[async_trait]
 impl Injector for ChannelInjector {
-    async fn inject(&self, msg: SidebarMessage) {
-        let payload = match serde_json::to_value(&msg) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+    async fn inject(&self, payload: serde_json::Value) {
         let envelope = ProxyEnvelope::new(
             self.proxy_id.clone(),
             uuid::Uuid::new_v4().to_string(),
@@ -65,7 +61,7 @@ mod tests {
     async fn injects_with_local_proxy_id_and_sidebar_payload() {
         let (tx, mut rx) = mpsc::channel(8);
         let inj = ChannelInjector::new(tx, "local-proxy");
-        inj.inject(SidebarMessage::ChatMessage(ChatMessage {
+        let payload = serde_json::to_value(SidebarMessage::ChatMessage(ChatMessage {
             session_id: "s".into(),
             message_id: "m".into(),
             text: "hi".into(),
@@ -74,7 +70,8 @@ mod tests {
             tab_id: None,
             tab_ids: Vec::new(),
         }))
-        .await;
+        .unwrap();
+        inj.inject(payload).await;
 
         let (identity, env) = rx.recv().await.unwrap();
         assert_eq!(identity, b"local-proxy"); // stamped as the local head

@@ -204,6 +204,12 @@ fn tool_frame(stream_id: &str, ev: &Value) -> Option<Value> {
     Some(json!({ "kind": "tool", "streamId": stream_id, "tool": tool }))
 }
 
+/// Serialize a typed sidebar message for injection. `None` on the (impossible)
+/// serialization failure, which the caller treats as an unroutable frame.
+fn to_value(msg: nevoflux_protocol::chat::SidebarMessage) -> Option<Value> {
+    serde_json::to_value(&msg).ok()
+}
+
 /// What a portal is allowed to ask for.
 ///
 /// An allow-list, not a filter on obviously-dangerous names: `system_command`
@@ -225,25 +231,53 @@ pub fn uplink(
     session_id: &str,
     message_id: &str,
     mode: Option<&str>,
-) -> Option<nevoflux_protocol::chat::SidebarMessage> {
+) -> Option<Value> {
+    // Returns the serialized `{type, payload}` rather than a `SidebarMessage`,
+    // because two of the things the daemon reads off a chat message live only
+    // on the wire: `soul_mention` (which `parse_soul_mention` reads straight
+    // from raw JSON) has no field on the protocol struct at all. Building the
+    // typed value and then attaching those keeps the shared protocol crate —
+    // and the sidebar that mirrors it — untouched.
     use nevoflux_protocol::chat::{
         BrowserToolResponse, ChatMessage, PlanResponse, SidebarMessage, StopGeneration,
         SystemCommand,
     };
     match frame.get("kind")?.as_str()? {
-        "user_message" => Some(SidebarMessage::ChatMessage(ChatMessage {
-            session_id: session_id.to_string(),
-            message_id: message_id.to_string(),
-            text: frame.get("text")?.as_str()?.to_string(),
-            // Mirror the local sidebar's mode — never choose one here. Omitting
-            // it would silently downgrade a remote turn to `chat` (no tools);
-            // hardcoding `agent` would silently upgrade one the user had left
-            // in `chat`.
-            mode: mode.map(str::to_string),
-            attachments: Vec::new(),
-            tab_id: None,
-            tab_ids: Vec::new(),
-        })),
+        "user_message" => {
+            let msg = SidebarMessage::ChatMessage(ChatMessage {
+                session_id: session_id.to_string(),
+                message_id: message_id.to_string(),
+                text: frame.get("text")?.as_str()?.to_string(),
+                // Mirror the local sidebar's mode — never choose one here.
+                // Omitting it would silently downgrade a remote turn to `chat`
+                // (no tools); hardcoding `agent` would silently upgrade one the
+                // user had left in `chat`.
+                mode: mode.map(str::to_string),
+                attachments: Vec::new(),
+                // `#` picks a tab to act on. Left as None the daemon falls back
+                // to the session's last known tabs.
+                tab_id: frame.get("tabId").and_then(Value::as_i64),
+                tab_ids: Vec::new(),
+            });
+            let mut v = serde_json::to_value(&msg).ok()?;
+            // `@` picks a soul for this turn. The daemon reads
+            // `payload.soul_mention.slug`, and a present-but-null value means
+            // "clear it" — so the key is only attached when the portal said
+            // something about it.
+            if let Some(soul) = frame.get("soul") {
+                if let Some(p) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    p.insert(
+                        "soul_mention".into(),
+                        if soul.is_null() {
+                            Value::Null
+                        } else {
+                            json!({ "slug": soul.as_str()? })
+                        },
+                    );
+                }
+            }
+            Some(v)
+        }
         // The permission dialog is a `browser_tool_request`/`browser_tool_response`
         // round-trip, so the answer has to go back the same way — that is the
         // path that resolves the pending oneshot in `BrowserRequestRegistry`
@@ -251,7 +285,7 @@ pub fn uplink(
         // type and is a dead end: no `permission_response` handler exists, so
         // answering from the portal used to land in UNKNOWN_MESSAGE_TYPE and
         // the turn stayed blocked until its 24h timeout.
-        "gate_response" => Some(SidebarMessage::BrowserToolResponse(BrowserToolResponse {
+        "gate_response" => to_value(SidebarMessage::BrowserToolResponse(BrowserToolResponse {
             request_id: frame.get("id")?.as_str()?.to_string(),
             session_id: session_id.to_string(),
             success: true,
@@ -268,7 +302,7 @@ pub fn uplink(
         // mechanism that could disagree with it. The session id comes from
         // the gateway, never from the frame: a portal must not be able to
         // halt a session it was not granted.
-        "cancel" => Some(SidebarMessage::StopGeneration(StopGeneration {
+        "cancel" => to_value(SidebarMessage::StopGeneration(StopGeneration {
             session_id: session_id.to_string(),
         })),
         // The portal asking the daemon something it needs to offer a choice:
@@ -291,13 +325,13 @@ pub fn uplink(
                 .cloned()
                 .unwrap_or_default();
             params.insert("session_id".into(), json!(session_id));
-            Some(SidebarMessage::SystemCommand(SystemCommand {
+            to_value(SidebarMessage::SystemCommand(SystemCommand {
                 request_id: frame.get("id")?.as_str()?.to_string(),
                 command: command.to_string(),
                 params: Some(Value::Object(params)),
             }))
         }
-        "plan_response" => Some(SidebarMessage::PlanResponse(
+        "plan_response" => to_value(SidebarMessage::PlanResponse(
             if frame.get("approved")?.as_bool()? {
                 PlanResponse::Confirmed
             } else {
@@ -491,12 +525,12 @@ mod tests {
             "m1",
             Some("agent"),
         );
-        match msg {
-            Some(SidebarMessage::ChatMessage(c)) => {
-                assert_eq!(c.text, "hi");
-                assert_eq!(c.session_id, "sess");
-                assert_eq!(c.message_id, "m1");
-                assert_eq!(c.mode.as_deref(), Some("agent"));
+        match msg.as_ref().map(|v| &v["payload"]) {
+            Some(c) => {
+                assert_eq!(c["content"], "hi");
+                assert_eq!(c["session_id"], "sess");
+                assert_eq!(c["message_id"], "m1");
+                assert_eq!(c["mode"], "agent");
             }
             other => panic!("expected ChatMessage, got {other:?}"),
         }
@@ -542,24 +576,16 @@ mod tests {
             "m",
             None,
         );
-        assert!(matches!(
-            yes,
-            Some(SidebarMessage::PlanResponse(PlanResponse::Confirmed))
-        ));
-        assert!(matches!(
-            no,
-            Some(SidebarMessage::PlanResponse(PlanResponse::Cancelled))
-        ));
+        assert_eq!(yes.unwrap()["payload"], "confirmed");
+        assert_eq!(no.unwrap()["payload"], "cancelled");
     }
 
     #[test]
     fn uplink_cancel_becomes_stop_generation_for_the_gateway_session() {
         use nevoflux_protocol::chat::SidebarMessage;
         let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
-        assert!(matches!(
-            &msg,
-            SidebarMessage::StopGeneration(s) if s.session_id == "sess-1"
-        ));
+        assert_eq!(msg["type"], "stop_generation");
+        assert_eq!(msg["payload"]["session_id"], "sess-1");
     }
 
     #[test]
@@ -574,17 +600,15 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(matches!(
-            &msg,
-            SidebarMessage::StopGeneration(s) if s.session_id == "sess-1"
-        ));
+        assert_eq!(msg["type"], "stop_generation");
+        assert_eq!(msg["payload"]["session_id"], "sess-1");
     }
 
     #[test]
     fn uplink_cancel_serializes_to_the_shape_the_message_loop_reads() {
         // server.rs reads payload.payload.session_id off the raw envelope.
         let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
-        let wire = serde_json::to_value(&msg).unwrap();
+        let wire = msg.clone();
         assert_eq!(wire["type"], "stop_generation");
         assert_eq!(wire["payload"]["session_id"], "sess-1");
     }
@@ -733,8 +757,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(matches!(&msg, SidebarMessage::BrowserToolResponse(_)));
-        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(msg["type"], "browser_tool_response");
+        let wire = msg.clone();
         assert_eq!(wire["type"], "browser_tool_response");
         assert_eq!(wire["payload"]["request_id"], "req-1");
         assert_eq!(wire["payload"]["success"], true);
@@ -752,11 +776,52 @@ mod tests {
             None,
         )
         .unwrap();
-        let wire = serde_json::to_value(&msg).unwrap();
+        let wire = msg.clone();
         assert_eq!(wire["payload"]["result"]["answer"], "Deny");
         // Still a successful round-trip: the dialog was answered. "Deny" is
         // the answer, not a failure to obtain one.
         assert_eq!(wire["payload"]["success"], true);
+    }
+
+    #[test]
+    fn uplink_user_message_carries_a_soul_mention_and_a_tab() {
+        // `@` and `#`. soul_mention has no field on the protocol struct — the
+        // daemon reads it off raw JSON — which is why uplink emits JSON.
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi", "soul": "writer", "tabId": 42 }),
+            "sess-1",
+            "m",
+            Some("agent"),
+        )
+        .unwrap();
+        assert_eq!(msg["payload"]["soul_mention"]["slug"], "writer");
+        assert_eq!(msg["payload"]["tab_id"], 42);
+    }
+
+    #[test]
+    fn uplink_user_message_says_nothing_about_a_soul_it_was_not_told_about() {
+        // A present-but-null soul_mention means "clear it" to the daemon, so
+        // the key must be absent unless the portal spoke.
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi" }),
+            "s",
+            "m",
+            None,
+        )
+        .unwrap();
+        assert!(msg["payload"].get("soul_mention").is_none());
+    }
+
+    #[test]
+    fn uplink_user_message_clears_the_soul_when_asked() {
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi", "soul": null }),
+            "s",
+            "m",
+            None,
+        )
+        .unwrap();
+        assert!(msg["payload"]["soul_mention"].is_null());
     }
 
     #[test]
@@ -769,14 +834,10 @@ mod tests {
             None,
         )
         .unwrap();
-        match msg {
-            SidebarMessage::SystemCommand(c) => {
-                assert_eq!(c.request_id, "q1");
-                assert_eq!(c.command, "skill.list");
-                assert_eq!(c.params.unwrap()["session_id"], "sess-1");
-            }
-            other => panic!("expected SystemCommand, got {other:?}"),
-        }
+        assert_eq!(msg["type"], "system_command");
+        assert_eq!(msg["payload"]["request_id"], "q1");
+        assert_eq!(msg["payload"]["command"], "skill.list");
+        assert_eq!(msg["payload"]["params"]["session_id"], "sess-1");
     }
 
     #[test]
@@ -791,7 +852,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let wire = serde_json::to_value(&msg).unwrap();
+        let wire = msg.clone();
         // Otherwise a portal could read another session's tabs.
         assert_eq!(wire["payload"]["params"]["session_id"], "sess-1");
     }
