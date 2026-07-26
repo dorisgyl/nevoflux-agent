@@ -88,7 +88,7 @@ pub async fn run_permission_handler(
         ];
 
         // Use browser_ask_user to show dialog in sidebar
-        let response = execute_ask_user(&question, &options, &browser_ctx).await;
+        let response = execute_ask_user(&question, &description, &options, &browser_ctx).await;
 
         let decision = match response.as_deref() {
             Some("Allow") => PermissionResponse::AllowOnce,
@@ -247,6 +247,7 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
 /// Show a question dialog in the sidebar via browser_ask_user action.
 async fn execute_ask_user(
     question: &str,
+    description: &str,
     options: &[String],
     browser_ctx: &BrowserContext,
 ) -> Option<String> {
@@ -256,11 +257,18 @@ async fn execute_ask_user(
 
     let request = BrowserRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
-        session_id: String::new(),
+        // Scoped, so the gateway for this session projects it to the portal.
+        // The ACP/MCP bridge raises the same dialog as `check_tool_permission`
+        // and was the path still sending a blank session — a phone saw the
+        // dialog for one and not the other, with nothing to distinguish them.
+        session_id: browser_ctx.session_id.clone(),
         tab_id: None,
         action: BrowserToolAction::AskUser,
         params: serde_json::json!({
             "question": question,
+            // The action alone, so a client can render the question without
+            // parsing the prose around it. Mirrors agent_host.
+            "description": description,
             "options": options,
             "allow_custom": false,
             "timeout_ms": 86400000

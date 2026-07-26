@@ -3939,6 +3939,7 @@ async fn stream_acp_completion(
                         sender: browser_sender,
                         client_identity: Vec::new(),
                         proxy_id: String::new(),
+                        session_id: services.session_id.clone(),
                         asset_server: services.asset_server.clone(),
                         recording_collector: services.recording_collector.clone(),
                         recordings_dir: services.recordings_dir.clone(),

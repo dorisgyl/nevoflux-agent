@@ -97,6 +97,13 @@ pub struct BrowserContext {
     pub proxy_id: String,
     /// Client identity bytes for routing responses.
     pub client_identity: Vec<u8>,
+    /// Session this context belongs to.
+    ///
+    /// Carried so a dialog raised from here can be scoped like any other chat
+    /// envelope. Without it the permission prompt goes out with an empty
+    /// session and every remote gateway drops it — the prompt then only ever
+    /// appears on the local machine, which is the opposite of the point.
+    pub session_id: String,
     /// Asset & Stream Plane HTTP server, copied from `HostServices`.
     /// `Some` once the daemon has bound a port; tools that need to hand
     /// the browser actor a `http://127.0.0.1:.../file/<token>` URL look
@@ -485,6 +492,7 @@ impl HostServices {
             sender,
             proxy_id: self.proxy_id.clone(),
             client_identity: self.client_identity.clone(),
+            session_id: self.session_id.clone(),
             asset_server: self.asset_server.clone(),
             recording_collector: self.recording_collector.clone(),
             recordings_dir: self.recordings_dir.clone(),
