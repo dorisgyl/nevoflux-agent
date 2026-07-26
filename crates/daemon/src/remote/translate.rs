@@ -46,6 +46,24 @@ impl Translator {
                     .unwrap_or("Request failed");
                 vec![json!({ "kind": "error", "message": message })]
             }
+            // A stopped turn ends here and nowhere else. `stop_generation`
+            // cancels the stream forwarder, so the `done:true` chunk that
+            // normally closes a turn is never sent — deliberately. Without
+            // this the portal keeps the turn open forever: the caret blinks
+            // on, and the composer's stop button stays in its "stopping"
+            // state waiting for an end that cannot arrive.
+            Some("agent_state")
+                if payload
+                    .get("payload")
+                    .and_then(|p| p.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("idle") =>
+            {
+                match self.current_stream.take() {
+                    Some(id) => vec![json!({ "kind": "stream_end", "streamId": id })],
+                    None => Vec::new(),
+                }
+            }
             Some("browser_tool_request") => Self::ask_user(payload.get("payload")),
             Some("browser_tool_resolved") => {
                 let id = payload
@@ -534,6 +552,56 @@ mod tests {
                 },
             }
         })
+    }
+
+    #[test]
+    fn downlink_idle_closes_an_open_turn() {
+        // What a stop actually looks like on the wire: chunks, then no
+        // `done:true` at all, because the forwarder was cancelled.
+        let mut t = Translator::new();
+        t.downlink(&chunk("half an ans", false));
+        let frames = t.downlink(&json!({
+            "type": "agent_state",
+            "payload": { "state": "idle", "message": "Generation stopped", "done": true }
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({ "kind": "stream_end", "streamId": "s0" })]
+        );
+    }
+
+    #[test]
+    fn downlink_idle_with_no_open_turn_says_nothing() {
+        // "No active generation" — closing a turn that was never open would
+        // end an unrelated one.
+        let mut t = Translator::new();
+        assert!(t
+            .downlink(&json!({ "type": "agent_state", "payload": { "state": "idle" } }))
+            .is_empty());
+    }
+
+    #[test]
+    fn downlink_ignores_non_idle_agent_state() {
+        let mut t = Translator::new();
+        t.downlink(&chunk("working", false));
+        assert!(t
+            .downlink(&json!({ "type": "agent_state", "payload": { "state": "thinking" } }))
+            .is_empty());
+    }
+
+    #[test]
+    fn downlink_after_a_stop_opens_a_fresh_turn() {
+        let mut t = Translator::new();
+        t.downlink(&chunk("a", false));
+        t.downlink(&json!({ "type": "agent_state", "payload": { "state": "idle" } }));
+        let frames = t.downlink(&chunk("b", false));
+        assert_eq!(
+            frames,
+            vec![
+                json!({ "kind": "stream_start", "streamId": "s1" }),
+                json!({ "kind": "stream_delta", "streamId": "s1", "delta": "b" }),
+            ]
+        );
     }
 
     #[test]
