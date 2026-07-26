@@ -4832,8 +4832,18 @@ async fn resolve_active_soul(
 ) -> Option<AgentRoleDefinition> {
     use crate::agent::soul_resolver::{self, OverrideAction};
 
-    let registry = services.role_registry()?;
-    let bindings = services.space_soul_bindings.as_ref()?;
+    // Each early return here means "no soul at all", and they look identical
+    // from outside — the reply simply comes back in the default voice. Say
+    // which one it was; a mention that parsed correctly and then resolved to
+    // nothing is otherwise indistinguishable from one that never arrived.
+    let Some(registry) = services.role_registry() else {
+        info!(target: "remote", "no soul: this session has no role registry");
+        return None;
+    };
+    let Some(bindings) = services.space_soul_bindings.as_ref() else {
+        info!(target: "remote", "no soul: no space-soul bindings are loaded");
+        return None;
+    };
 
     let session = session_manager.get_session(session_id).await.ok().flatten();
     let stored = session
@@ -4867,11 +4877,20 @@ async fn resolve_active_soul(
         }
     }
 
-    let slug = resolution.slug?;
+    let Some(slug) = resolution.slug else {
+        info!(
+            target: "remote",
+            "no soul: resolver chose none for container {container:?}"
+        );
+        return None;
+    };
     match registry.get(&slug) {
         Ok(def) => {
-            debug!(
-                "Active soul for session {} in {}: {} ({})",
+            // Promoted from debug: this is the answer to "did the @ mention
+            // actually take?", and it is the only place that knows.
+            info!(
+                target: "remote",
+                "active soul for session {} in {}: {} ({})",
                 session_id, container, def.name, def.slug
             );
             announce_active_soul(services, &def).await;
