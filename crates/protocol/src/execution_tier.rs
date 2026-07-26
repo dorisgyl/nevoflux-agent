@@ -117,6 +117,16 @@ const R_TOOLS: &[&str] = &[
     "skill_load",
     "think",
     "create_plan",
+    // Telling the user something. It changes nothing, touches no page, file or
+    // network, and is addressed *to* the person who would be asked — gating it
+    // means asking permission to be told something.
+    //
+    // Unclassified it fell to bucket X, which nothing below full-auto
+    // approves. On the ACP path that meant every notify_user waited on a
+    // decision that never came: no dialog was raised, nothing was logged, the
+    // model retried once and gave up. Scheduled reminders fired and then died
+    // there in silence — on the sidebar as well as the phone.
+    "notify_user",
 ];
 
 /// B1 bucket — browser interactions that change page/site state.
@@ -169,6 +179,26 @@ pub fn tier_auto_approves(tool_name: &str, tier: ExecutionTier) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_user_needs_no_permission_at_any_tier() {
+        // It tells the person something. Asking them to approve being told is
+        // the wrong shape, and while it was unclassified the ACP gate waited
+        // on a decision nobody was there to make.
+        for tier in [
+            ExecutionTier::ReadOnly,
+            ExecutionTier::BrowserAuto,
+            ExecutionTier::BrowserAutoLocalRead,
+            ExecutionTier::FullAuto,
+        ] {
+            assert!(tier_auto_approves("notify_user", tier), "{tier:?}");
+        }
+        // Including the ACP-wrapped name, which arrives prefixed.
+        assert!(tier_auto_approves(
+            "mcp__nevoflux__notify_user",
+            ExecutionTier::ReadOnly
+        ));
+    }
 
     #[test]
     fn from_setting_parses_all_tiers() {

@@ -37,6 +37,15 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "skill_load",
     "think",
     "create_plan",
+    // Telling the user something. It changes nothing, touches no page, file or
+    // network, and is addressed *to* the person who would be asked — gating it
+    // means asking permission to be told something.
+    //
+    // It was gated, and on the ACP path the permission request went
+    // unanswered: no dialog was raised and nothing was logged, so the call
+    // simply hung. Every scheduled reminder died there — the model retried
+    // once, gave up, and no notification was ever published.
+    "notify_user",
 ];
 
 /// True if `name` is a known read-only tool. Strips an MCP wrapper prefix
