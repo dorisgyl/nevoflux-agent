@@ -5482,6 +5482,14 @@ async fn handle_chat_message_streaming(
     // the daemon never scans message text for mentions, so an address in a
     // sentence is not a request to switch persona.
     let soul_mention = parse_soul_mention(&payload);
+    // Logged because this is otherwise invisible: a mention that never arrives
+    // and a mention that arrives but resolves to nothing look identical from
+    // the outside — the reply just comes back in the wrong voice.
+    info!(
+        target: "remote",
+        "soul mention on this turn: {:?} (session {})",
+        soul_mention, session_id
+    );
     // Raw mode string, mirrored verbatim into any goal-continuation turn this
     // turn spawns so the continuation runs in the same mode. Absent ⇒ "chat"
     // (round-trips through `parse_agent_mode` back to `AgentMode::Chat`).
