@@ -2425,6 +2425,12 @@ pub async fn start_server(
                 let response_payload = serde_json::json!({
                     "type": "agent_state",
                     "payload": {
+                        // Stamped so a remote gateway can tell this is its
+                        // session. Without it the envelope was fanned out by
+                        // the M2 tap and then dropped by the session filter —
+                        // which is why the portal's stop button, waiting on
+                        // exactly this message, never came back.
+                        "session_id": session_id,
                         "state": "idle",
                         "message": if cancelled { "Generation stopped" } else { "No active generation" },
                         "done": true
@@ -2573,7 +2579,28 @@ pub async fn start_server(
                     if let Some(response) = response {
                         info!("Plan response: {:?} for session: {}", response, session_id);
                         if let Some(tx) = process_plan_registry.lock().await.remove(&session_id) {
-                            let _ = tx.send(response);
+                            let _ = tx.send(response.clone());
+
+                            // Announce the plan is settled, for the same reason
+                            // `browser_tool_resolved` is announced: the panel is
+                            // up on every surface watching this session, and the
+                            // one that did not answer is now showing buttons
+                            // that decide nothing. Only on the branch that took
+                            // the oneshot — a second answer settles nothing and
+                            // must not take anyone's panel down.
+                            let resolved = serde_json::json!({
+                                "type": "plan_resolved",
+                                "payload": {
+                                    "session_id": session_id,
+                                    "response": response,
+                                }
+                            });
+                            let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
+                            if let Err(e) =
+                                process_response_tx.send((identity.clone(), env)).await
+                            {
+                                warn!("Failed to announce plan_resolved: {}", e);
+                            }
                         } else {
                             warn!("No pending plan request for session: {}", session_id);
                         }
@@ -6212,7 +6239,15 @@ async fn handle_chat_message_streaming(
 
                 // Send proposal to frontend
                 let msg = AgentMessage::PlanProposal(proposal.clone());
-                let payload = serde_json::to_value(&msg).unwrap();
+                let mut payload = serde_json::to_value(&msg).unwrap();
+                // `PlanProposal` carries no session of its own, and an
+                // unscoped chat envelope is dropped by a remote gateway's
+                // session filter — which is why the plan panel only ever
+                // showed up in the sidebar. It is also the id the answer has
+                // to come back with: `plan_registry` is keyed by session.
+                if let Some(p) = payload.get_mut("payload").and_then(|v| v.as_object_mut()) {
+                    p.insert("session_id".into(), serde_json::json!(session_id));
+                }
                 let envelope =
                     DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 if let Err(e) = response_tx.send((identity.clone(), envelope)).await {

@@ -93,6 +93,13 @@ impl Translator {
             // keeps its place in time.
             Some("events_delivery") => Self::notification(payload.get("payload")),
             Some("browser_tool_request") => Self::ask_user(payload.get("payload")),
+            // A plan the head wants confirmed before it runs. The turn is
+            // blocked on the answer, so whoever is driving the session has to
+            // be able to give it — including from a phone.
+            Some("plan_proposal") => Self::plan(payload.get("payload")),
+            // Someone answered — here or at the other end. Either way the
+            // panel is decided and has no business still being on screen.
+            Some("plan_resolved") => vec![json!({ "kind": "plan_cleared" })],
             Some("browser_tool_resolved") => {
                 let id = payload
                     .get("payload")
@@ -170,12 +177,56 @@ impl Translator {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        if options.is_empty() {
-            return Vec::new(); // a question with no answers is not a question
-        }
+        // The permission dialog always offers choices. The agent's own
+        // `ask_user` usually does not — `options` is optional in its schema,
+        // and a question like "which folder?" has no menu. Dropping those was
+        // dropping most of them; the portal takes a typed answer instead.
+        let allow_custom = options.is_empty()
+            || params
+                .and_then(|q| q.get("allow_custom"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         vec![json!({
             "kind": "gate",
-            "gate": { "id": id, "prompt": prompt, "options": options },
+            "gate": {
+                "id": id,
+                "prompt": prompt,
+                "options": options,
+                "allowCustom": allow_custom,
+            },
+        })]
+    }
+
+    /// A plan awaiting confirmation, as the portal's `plan` frame.
+    ///
+    /// The two shapes already agree — a summary and ordered steps, each with a
+    /// description and an optional model — so this reads the fields rather than
+    /// forwarding the payload whole: the session id stamped on it upstream is
+    /// routing, not something to show.
+    fn plan(p: Option<&Value>) -> Vec<Value> {
+        let Some(p) = p else { return Vec::new() };
+        let Some(summary) = p.get("summary").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let steps: Vec<Value> = p
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| {
+                        let d = s.get("description").and_then(Value::as_str)?;
+                        let mut step = json!({ "description": d });
+                        if let Some(m) = s.get("model").and_then(Value::as_str) {
+                            step["model"] = json!(m);
+                        }
+                        Some(step)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        vec![json!({
+            "kind": "plan",
+            "plan": { "summary": summary, "steps": steps },
         })]
     }
 
@@ -380,13 +431,25 @@ pub fn uplink(
                 params: Some(Value::Object(params)),
             }))
         }
-        "plan_response" => to_value(SidebarMessage::PlanResponse(
-            if frame.get("approved")?.as_bool()? {
+        // Built by hand rather than from `SidebarMessage::PlanResponse`, which
+        // serializes to a bare `"confirmed"` string. The daemon's handler reads
+        // `payload.session_id` and `payload.response` — it is keyed by session,
+        // because that is where the blocked turn's oneshot is parked — so the
+        // enum's own shape answers nobody and the plan would hang.
+        "plan_response" => {
+            let response = if frame.get("approved")?.as_bool()? {
                 PlanResponse::Confirmed
             } else {
                 PlanResponse::Cancelled
-            },
-        )),
+            };
+            Some(json!({
+                "type": "plan_response",
+                "payload": {
+                    "session_id": session_id,
+                    "response": serde_json::to_value(response).ok()?,
+                },
+            }))
+        }
         _ => None,
     }
 }
@@ -612,7 +675,6 @@ mod tests {
 
     #[test]
     fn uplink_plan_response_maps_approved() {
-        use nevoflux_protocol::chat::{PlanResponse, SidebarMessage};
         let yes = uplink(
             &json!({ "kind": "plan_response", "approved": true }),
             "s",
@@ -625,8 +687,8 @@ mod tests {
             "m",
             None,
         );
-        assert_eq!(yes.unwrap()["payload"], "confirmed");
-        assert_eq!(no.unwrap()["payload"], "cancelled");
+        assert_eq!(yes.unwrap()["payload"]["response"], "confirmed");
+        assert_eq!(no.unwrap()["payload"]["response"], "cancelled");
     }
 
     #[test]
@@ -810,6 +872,9 @@ mod tests {
                     // already supplies around it.
                     "prompt": "Run `rm -rf /tmp/x`",
                     "options": ["Allow", "Always allow this type of action", "Deny"],
+                    // A permission gate is answered from its menu; there is no
+                    // third thing to say to it.
+                    "allowCustom": false,
                 }
             })]
         );
@@ -841,10 +906,71 @@ mod tests {
     }
 
     #[test]
-    fn downlink_drops_a_question_with_no_answers() {
+    fn downlink_takes_a_question_with_no_menu_as_one_to_type_into() {
+        // The agent's own `ask_user`: `options` is optional in its schema and
+        // most questions it asks have no menu. These used to be dropped, which
+        // is most of them — the sidebar asked and the phone showed nothing.
         let mut payload = ask_user("req-1");
         payload["payload"]["params"]["options"] = json!([]);
-        assert!(Translator::new().downlink(&payload).is_empty());
+        let frames = Translator::new().downlink(&payload);
+        assert_eq!(frames[0]["gate"]["allowCustom"], json!(true));
+        assert_eq!(frames[0]["gate"]["options"], json!([]));
+    }
+
+    #[test]
+    fn downlink_plan_proposal_becomes_a_plan() {
+        let mut t = Translator::new();
+        let frames = t.downlink(&json!({
+            "type": "plan_proposal",
+            "payload": {
+                "session_id": "sess-1",
+                "summary": "Rename the files",
+                "steps": [
+                    { "description": "List them" },
+                    { "description": "Rename each", "model": "haiku" },
+                ],
+            }
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({
+                "kind": "plan",
+                "plan": {
+                    "summary": "Rename the files",
+                    "steps": [
+                        { "description": "List them" },
+                        { "description": "Rename each", "model": "haiku" },
+                    ],
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn downlink_plan_resolved_clears_the_panel() {
+        let mut t = Translator::new();
+        let frames = t.downlink(&json!({
+            "type": "plan_resolved",
+            "payload": { "session_id": "sess-1", "response": "confirmed" }
+        }));
+        assert_eq!(frames, vec![json!({ "kind": "plan_cleared" })]);
+    }
+
+    #[test]
+    fn uplink_plan_response_is_addressed_to_the_session() {
+        // The registry holding the blocked turn's oneshot is keyed by session,
+        // and the handler reads it off the payload. A bare `"confirmed"` — what
+        // `SidebarMessage::PlanResponse` serializes to — answers nobody.
+        let msg = uplink(
+            &json!({ "kind": "plan_response", "approved": true }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg["type"], "plan_response");
+        assert_eq!(msg["payload"]["session_id"], "sess-1");
+        assert_eq!(msg["payload"]["response"], "confirmed");
     }
 
     #[test]

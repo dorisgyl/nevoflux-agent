@@ -881,7 +881,12 @@ async fn execute_browser_tool(
 
     let request = BrowserRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
-        session_id: String::new(),
+        // Every browser request belongs to the session that asked for it.
+        // Blank here meant `ask_user` — the agent's own question, which comes
+        // through this generic path rather than `execute_ask_user` — was
+        // fanned out to the remote gateway and then dropped by its session
+        // filter: the sidebar raised the dialog, the phone saw nothing.
+        session_id: browser_ctx.session_id.clone(),
         tab_id,
         action,
         params,
