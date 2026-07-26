@@ -128,6 +128,26 @@ impl PortalGateway {
     }
 }
 
+/// A notification meant for the person, not for a session.
+///
+/// `notify_user` is addressed to whoever is at the machine, and carries no
+/// session id — so the session filter would drop it, which is why a remote
+/// head never saw one. Letting exactly `ui:notification:*` through is narrow
+/// on purpose: the same delivery carries loop progress and schedule ticks,
+/// and relaxing the filter to all EventBus traffic would hand a portal every
+/// internal event the daemon publishes.
+fn is_user_notification(env: &nevoflux_protocol::DaemonEnvelope) -> bool {
+    if env.payload.get("type").and_then(|v| v.as_str()) != Some("events_delivery") {
+        return false;
+    }
+    env.payload
+        .get("payload")
+        .and_then(|p| p.get("event"))
+        .and_then(|e| e.get("topic"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.starts_with("ui:notification:"))
+}
+
 #[async_trait]
 impl RemoteGateway for PortalGateway {
     fn id(&self) -> &str {
@@ -149,7 +169,10 @@ impl RemoteGateway for PortalGateway {
                 .get("payload")
                 .and_then(|p| p.get("session_id"))
                 .and_then(|s| s.as_str());
-            if sid != Some(self.session_id.as_str()) && !self.is_our_reply(env).await {
+            if sid != Some(self.session_id.as_str())
+                && !self.is_our_reply(env).await
+                && !is_user_notification(env)
+            {
                 return;
             }
             tracing::info!(

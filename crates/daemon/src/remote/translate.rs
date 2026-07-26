@@ -81,6 +81,15 @@ impl Translator {
                     None => Vec::new(),
                 }
             }
+            // A notification the head raised on its own — `notify_user`, and
+            // anything else on `ui:notification:*`.
+            //
+            // The sidebar renders these as a toast that fades. A phone is the
+            // wrong place for that: the point of a notification is that it is
+            // still there when you look, and the screen may well have been off
+            // when it arrived. It goes into the transcript instead, where it
+            // keeps its place in time.
+            Some("events_delivery") => Self::notification(payload.get("payload")),
             Some("browser_tool_request") => Self::ask_user(payload.get("payload")),
             Some("browser_tool_resolved") => {
                 let id = payload
@@ -94,6 +103,44 @@ impl Translator {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// A user-facing notification, as the portal's `notice` frame.
+    ///
+    /// Only `ui:notification:*`. The EventBus carries plenty else on this
+    /// delivery — loop progress, schedule ticks — and none of it was written
+    /// for a person to read; forwarding it all would turn the transcript into
+    /// a log.
+    fn notification(p: Option<&Value>) -> Vec<Value> {
+        let Some(ev) = p.and_then(|p| p.get("event")) else {
+            return Vec::new();
+        };
+        let topic = ev.get("topic").and_then(Value::as_str).unwrap_or("");
+        if !topic.starts_with("ui:notification:") {
+            return Vec::new();
+        }
+        let body = ev
+            .get("payload")
+            .and_then(|p| p.get("body"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if body.trim().is_empty() {
+            return Vec::new(); // nothing to show is not a notification
+        }
+        let mut out = json!({
+            "kind": "notice",
+            "id": ev.get("event_id").and_then(Value::as_str).unwrap_or(""),
+            "body": body,
+        });
+        // The title is optional upstream; the portal falls back to its own.
+        if let Some(t) = ev
+            .get("payload")
+            .and_then(|p| p.get("title"))
+            .and_then(Value::as_str)
+        {
+            out["title"] = json!(t);
+        }
+        vec![out]
     }
 
     /// The permission dialog, as the portal's `gate` frame.
@@ -678,6 +725,74 @@ mod tests {
                 json!({ "kind": "stream_delta", "streamId": "s1", "delta": "b" }),
             ]
         );
+    }
+
+    fn notif(topic: &str, body: &str, title: Option<&str>) -> Value {
+        json!({
+            "type": "events_delivery",
+            "payload": {
+                "subscription_id": "sub-1",
+                "event": {
+                    "event_id": "evt-1",
+                    "topic": topic,
+                    "payload": { "title": title, "body": body, "source": "notify_user" },
+                    "delivery": "ephemeral",
+                    "publisher": "internal",
+                    "timestamp_ms": 1
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn downlink_notify_user_becomes_a_notice() {
+        let mut t = Translator::new();
+        assert_eq!(
+            t.downlink(&notif(
+                "ui:notification:agent",
+                "the export finished",
+                Some("Done")
+            )),
+            vec![json!({
+                "kind": "notice",
+                "id": "evt-1",
+                "body": "the export finished",
+                "title": "Done"
+            })]
+        );
+    }
+
+    #[test]
+    fn downlink_notice_without_a_title_leaves_it_to_the_portal() {
+        let mut t = Translator::new();
+        let f = t.downlink(&notif("ui:notification:agent", "hello", None));
+        assert!(f[0].get("title").is_none());
+    }
+
+    #[test]
+    fn downlink_ignores_event_bus_traffic_that_is_not_for_a_person() {
+        // Loop progress and schedule ticks ride the same delivery and were
+        // never written to be read; forwarding them would make the transcript
+        // a log.
+        let mut t = Translator::new();
+        for topic in [
+            "system:loop:progress",
+            "system:schedule:fired",
+            "task:status",
+        ] {
+            assert!(
+                t.downlink(&notif(topic, "internal", None)).is_empty(),
+                "{topic}"
+            );
+        }
+    }
+
+    #[test]
+    fn downlink_drops_an_empty_notification() {
+        let mut t = Translator::new();
+        assert!(t
+            .downlink(&notif("ui:notification:agent", "   ", None))
+            .is_empty());
     }
 
     #[test]
