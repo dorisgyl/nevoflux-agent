@@ -551,17 +551,31 @@ impl DaemonHostFunctions {
         // browser_ask_user via block_in_place
         let sender = browser_ctx.sender.clone();
         let runtime = self.runtime.clone();
+        let permission_session_id = self
+            .services
+            .as_ref()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_default();
         let result: Result<String, String> = tokio::task::block_in_place(|| {
             runtime.block_on(async {
                 use tokio::sync::oneshot;
                 let (response_tx, response_rx) = oneshot::channel();
                 let request = crate::wasm::services::BrowserRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
-                    session_id: String::new(),
+                    // Stamped, not blank. Every chat envelope is scoped by
+                    // session id — `PortalGateway::project` drops anything
+                    // that does not match its own — so a blank one meant the
+                    // permission dialog never reached a remote head at all.
+                    // It is the local user's question either way; whoever is
+                    // driving this session should be the one asked.
+                    session_id: permission_session_id,
                     tab_id: None,
                     action: nevoflux_protocol::BrowserToolAction::AskUser,
                     params: serde_json::json!({
                         "question": question,
+                        // The action on its own, so a client can render the
+                        // question without parsing the prose around it.
+                        "description": description,
                         "options": options,
                         "allow_custom": false,
                         "timeout_ms": 86400000

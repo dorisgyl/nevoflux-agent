@@ -2404,6 +2404,7 @@ pub async fn start_server(
                         };
 
                         if let Some(sender) = sender {
+                            let session_id = response.session_id.clone();
                             let browser_response = BrowserResponse {
                                 request_id: response.request_id,
                                 success: response.success,
@@ -2414,6 +2415,30 @@ pub async fn start_server(
                                 warn!("Failed to send browser response - receiver dropped");
                             } else {
                                 info!("Browser response forwarded to agent");
+                            }
+
+                            // Announce that this request is settled.
+                            //
+                            // The pending entry is a single-consumer oneshot, so
+                            // whoever answered first took it, and every other
+                            // surface showing the same dialog is now asking a
+                            // question that has no answer left to give. That is
+                            // the point of answering from a phone: the prompt on
+                            // the desktop has to go away too. Broadcast, because
+                            // neither end knows who else is watching.
+                            let resolved = serde_json::json!({
+                                "type": "browser_tool_resolved",
+                                "payload": {
+                                    "request_id": request_id.clone(),
+                                    "session_id": session_id,
+                                }
+                            });
+                            let env =
+                                DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
+                            if let Err(e) =
+                                process_response_tx.send((identity.clone(), env)).await
+                            {
+                                warn!("Failed to announce browser_tool_resolved: {}", e);
                             }
                         } else {
                             warn!("No pending request for browser response: {}", request_id);

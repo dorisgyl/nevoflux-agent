@@ -46,8 +46,53 @@ impl Translator {
                     .unwrap_or("Request failed");
                 vec![json!({ "kind": "error", "message": message })]
             }
+            Some("browser_tool_request") => Self::ask_user(payload.get("payload")),
+            Some("browser_tool_resolved") => {
+                let id = payload
+                    .get("payload")
+                    .and_then(|p| p.get("request_id"))
+                    .and_then(Value::as_str);
+                match id {
+                    Some(id) => vec![json!({ "kind": "gate_resolved", "id": id })],
+                    None => Vec::new(),
+                }
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// The permission dialog, as the portal's `gate` frame.
+    ///
+    /// Only `ask_user` — every other browser action is the agent driving the
+    /// local browser, which is the local machine's business and carries no
+    /// question for the person holding the phone.
+    fn ask_user(p: Option<&Value>) -> Vec<Value> {
+        let Some(p) = p else { return Vec::new() };
+        if p.get("action").and_then(Value::as_str) != Some("ask_user") {
+            return Vec::new();
+        }
+        let Some(id) = p.get("request_id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let params = p.get("params");
+        // `description` is the action on its own; `question` wraps it in prose
+        // the portal's own dialog already says. Prefer the bare one.
+        let prompt = params
+            .and_then(|q| q.get("description").or_else(|| q.get("question")))
+            .and_then(Value::as_str)
+            .unwrap_or("Allow this action?");
+        let options: Vec<&str> = params
+            .and_then(|q| q.get("options"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if options.is_empty() {
+            return Vec::new(); // a question with no answers is not a question
+        }
+        vec![json!({
+            "kind": "gate",
+            "gate": { "id": id, "prompt": prompt, "options": options },
+        })]
     }
 
     /// A turn is the run of `stream_chunk`s up to `done:true`. The daemon sends
@@ -139,7 +184,7 @@ pub fn uplink(
     mode: Option<&str>,
 ) -> Option<nevoflux_protocol::chat::SidebarMessage> {
     use nevoflux_protocol::chat::{
-        ChatMessage, PermissionResponse, PlanResponse, SidebarMessage, StopGeneration,
+        BrowserToolResponse, ChatMessage, PlanResponse, SidebarMessage, StopGeneration,
     };
     match frame.get("kind")?.as_str()? {
         "user_message" => Some(SidebarMessage::ChatMessage(ChatMessage {
@@ -155,14 +200,23 @@ pub fn uplink(
             tab_id: None,
             tab_ids: Vec::new(),
         })),
-        "gate_response" => {
-            let choice = frame.get("choice")?.as_str()?;
-            Some(SidebarMessage::PermissionResponse(PermissionResponse {
-                request_id: frame.get("id")?.as_str()?.to_string(),
-                granted: choice != "Deny",
-                scope: None,
-            }))
-        }
+        // The permission dialog is a `browser_tool_request`/`browser_tool_response`
+        // round-trip, so the answer has to go back the same way — that is the
+        // path that resolves the pending oneshot in `BrowserRequestRegistry`
+        // and unblocks the agent. `PermissionResponse` looks like the right
+        // type and is a dead end: no `permission_response` handler exists, so
+        // answering from the portal used to land in UNKNOWN_MESSAGE_TYPE and
+        // the turn stayed blocked until its 24h timeout.
+        "gate_response" => Some(SidebarMessage::BrowserToolResponse(BrowserToolResponse {
+            request_id: frame.get("id")?.as_str()?.to_string(),
+            session_id: session_id.to_string(),
+            success: true,
+            // The daemon reads `result.answer` and compares it to the option
+            // strings it offered, so the choice is passed through verbatim
+            // rather than reduced to a boolean here.
+            result: Some(json!({ "answer": frame.get("choice")?.as_str()? })),
+            error: None,
+        })),
         // The portal's stop button. It maps onto the same kill switches the
         // local sidebar's stop uses — the message loop's `stop_generation`
         // arm sets this session's interrupt flag and cancels its stream
@@ -404,34 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn uplink_gate_response_maps_choice_to_granted() {
-        use nevoflux_protocol::chat::SidebarMessage;
-        let allow = uplink(
-            &json!({ "kind": "gate_response", "id": "g1", "choice": "Allow" }),
-            "s",
-            "m",
-            None,
-        );
-        let deny = uplink(
-            &json!({ "kind": "gate_response", "id": "g1", "choice": "Deny" }),
-            "s",
-            "m",
-            None,
-        );
-        match allow {
-            Some(SidebarMessage::PermissionResponse(r)) => {
-                assert_eq!(r.request_id, "g1");
-                assert!(r.granted);
-            }
-            other => panic!("expected PermissionResponse, got {other:?}"),
-        }
-        match deny {
-            Some(SidebarMessage::PermissionResponse(r)) => assert!(!r.granted),
-            other => panic!("expected PermissionResponse, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn uplink_plan_response_maps_approved() {
         use nevoflux_protocol::chat::{PlanResponse, SidebarMessage};
         let yes = uplink(
@@ -491,6 +517,126 @@ mod tests {
         let wire = serde_json::to_value(&msg).unwrap();
         assert_eq!(wire["type"], "stop_generation");
         assert_eq!(wire["payload"]["session_id"], "sess-1");
+    }
+
+    /// The permission dialog, verbatim as `agent_host` builds it.
+    fn ask_user(request_id: &str) -> Value {
+        json!({
+            "type": "browser_tool_request",
+            "payload": {
+                "request_id": request_id,
+                "session_id": "sess-1",
+                "action": "ask_user",
+                "params": {
+                    "question": "AI wants to perform an action:\n\nRun `rm -rf /tmp/x`\n\nDo you want to allow this?",
+                    "description": "Run `rm -rf /tmp/x`",
+                    "options": ["Allow", "Always allow this type of action", "Deny"],
+                },
+            }
+        })
+    }
+
+    #[test]
+    fn downlink_ask_user_becomes_a_gate() {
+        let mut t = Translator::new();
+        let frames = t.downlink(&ask_user("req-1"));
+        assert_eq!(
+            frames,
+            vec![json!({
+                "kind": "gate",
+                "gate": {
+                    "id": "req-1",
+                    // The bare action, not the prose the portal's own dialog
+                    // already supplies around it.
+                    "prompt": "Run `rm -rf /tmp/x`",
+                    "options": ["Allow", "Always allow this type of action", "Deny"],
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn downlink_ask_user_falls_back_to_the_question() {
+        // An older daemon build sends no `description`.
+        let mut payload = ask_user("req-1");
+        payload["payload"]["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("description");
+        let frames = Translator::new().downlink(&payload);
+        assert!(frames[0]["gate"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("wants to perform an action"));
+    }
+
+    #[test]
+    fn downlink_ignores_browser_actions_that_ask_nothing() {
+        // Everything except ask_user is the agent driving the local browser —
+        // the local machine's business, and no question for the remote reader.
+        let mut t = Translator::new();
+        let mut payload = ask_user("req-1");
+        payload["payload"]["action"] = json!("screenshot");
+        assert!(t.downlink(&payload).is_empty());
+    }
+
+    #[test]
+    fn downlink_drops_a_question_with_no_answers() {
+        let mut payload = ask_user("req-1");
+        payload["payload"]["params"]["options"] = json!([]);
+        assert!(Translator::new().downlink(&payload).is_empty());
+    }
+
+    #[test]
+    fn downlink_resolved_closes_the_gate() {
+        let mut t = Translator::new();
+        let frames = t.downlink(&json!({
+            "type": "browser_tool_resolved",
+            "payload": { "request_id": "req-1", "session_id": "sess-1" }
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({ "kind": "gate_resolved", "id": "req-1" })]
+        );
+    }
+
+    #[test]
+    fn uplink_gate_response_answers_on_the_path_that_resolves_the_request() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        // `PermissionResponse` has no handler in the daemon; the pending slot
+        // lives in the browser-request registry and only a
+        // `browser_tool_response` reaches it.
+        let msg = uplink(
+            &json!({ "kind": "gate_response", "id": "req-1", "choice": "Allow" }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(&msg, SidebarMessage::BrowserToolResponse(_)));
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(wire["type"], "browser_tool_response");
+        assert_eq!(wire["payload"]["request_id"], "req-1");
+        assert_eq!(wire["payload"]["success"], true);
+        // The daemon compares this against the option strings it offered, so
+        // it is passed through rather than reduced to a boolean.
+        assert_eq!(wire["payload"]["result"]["answer"], "Allow");
+    }
+
+    #[test]
+    fn uplink_gate_response_passes_deny_through_verbatim() {
+        let msg = uplink(
+            &json!({ "kind": "gate_response", "id": "req-1", "choice": "Deny" }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(wire["payload"]["result"]["answer"], "Deny");
+        // Still a successful round-trip: the dialog was answered. "Deny" is
+        // the answer, not a failure to obtain one.
+        assert_eq!(wire["payload"]["success"], true);
     }
 
     #[test]
