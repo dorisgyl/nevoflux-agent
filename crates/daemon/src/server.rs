@@ -2438,6 +2438,56 @@ pub async fn start_server(
                 continue;
             }
 
+            // `tabs.list` — what is open in the browser right now.
+            //
+            // Served from the context the sidebar reports rather than by asking
+            // the browser: the sidebar already pushes its tabs with every chat
+            // message, so the answer is on hand, and a remote peer asking what
+            // is open should not be able to make the local browser do work.
+            // Answered here because that cache lives in this loop's scope.
+            if msg_type == "system_command"
+                && envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| p.get("command"))
+                    .and_then(|c| c.as_str())
+                    == Some("tabs.list")
+            {
+                let p = envelope.payload.get("payload");
+                let req = p
+                    .and_then(|p| p.get("request_id"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let sid = p
+                    .and_then(|p| p.get("params"))
+                    .and_then(|p| p.get("session_id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let tabs = process_tab_context_registry
+                    .lock()
+                    .await
+                    .get(&sid)
+                    .map(|(_, tabs)| tabs.clone())
+                    .unwrap_or(serde_json::Value::Array(Vec::new()));
+                let response_payload = serde_json::json!({
+                    "type": "system_response",
+                    "payload": {
+                        "request_id": req,
+                        "command": "tabs.list",
+                        "success": true,
+                        "data": { "tabs": tabs },
+                    }
+                });
+                let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                    .with_request_id(&request_id);
+                if let Err(e) = process_response_tx.send((identity, response)).await {
+                    error!("Failed to send tabs.list response: {}", e);
+                }
+                continue;
+            }
+
             // Check for BrowserToolResponse messages
             if msg_type == "browser_tool_response" {
                 info!("Processing browser_tool_response message");

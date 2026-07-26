@@ -34,6 +34,14 @@ pub struct PortalGateway {
     /// Unique per channel (`portal:<channel_id>`) so the registry can drop this
     /// gateway specifically; several may exist if the user opens more than one.
     id: String,
+    /// `request_id`s of system commands this gateway sent on the portal's
+    /// behalf, awaiting their reply.
+    ///
+    /// System responses carry no session id, so the session filter cannot pass
+    /// them and must not simply be relaxed — that would hand this portal every
+    /// other session's replies. Matching the id means a portal sees exactly the
+    /// answers to questions it asked.
+    pending_queries: Mutex<std::collections::HashSet<String>>,
 }
 
 impl PortalGateway {
@@ -52,6 +60,7 @@ impl PortalGateway {
             sink,
             session_id: session_id.into(),
             id: format!("portal:{channel_id}"),
+            pending_queries: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -82,10 +91,37 @@ impl PortalGateway {
             .await
             .inbound(&wire, session_id, &message_id);
         match routed {
-            Inbound::Uplink(sm) => injector.inject(sm).await,
+            Inbound::Uplink(sm) => {
+                // Remember what we asked, so the reply can be recognised as
+                // ours when it comes back without a session id.
+                if let nevoflux_protocol::chat::SidebarMessage::SystemCommand(c) = &sm {
+                    self.pending_queries
+                        .lock()
+                        .await
+                        .insert(c.request_id.clone());
+                }
+                injector.inject(sm).await
+            }
             Inbound::Resume(from) => self.resume(from).await,
             Inbound::Ignore => {}
         }
+    }
+
+    /// True if this envelope is the reply to a system command this gateway
+    /// sent. Consumes the pending id — a reply arrives once.
+    async fn is_our_reply(&self, env: &nevoflux_protocol::DaemonEnvelope) -> bool {
+        if env.payload.get("type").and_then(|v| v.as_str()) != Some("system_response") {
+            return false;
+        }
+        let Some(id) = env
+            .payload
+            .get("payload")
+            .and_then(|p| p.get("request_id"))
+            .and_then(|v| v.as_str())
+        else {
+            return false;
+        };
+        self.pending_queries.lock().await.remove(id)
     }
 }
 
@@ -110,7 +146,7 @@ impl RemoteGateway for PortalGateway {
                 .get("payload")
                 .and_then(|p| p.get("session_id"))
                 .and_then(|s| s.as_str());
-            if sid != Some(self.session_id.as_str()) {
+            if sid != Some(self.session_id.as_str()) && !self.is_our_reply(env).await {
                 return;
             }
             tracing::info!(

@@ -64,6 +64,23 @@ impl Translator {
                     None => Vec::new(),
                 }
             }
+            // The reply to something the portal asked for — the skill list, the
+            // souls, the open tabs. The gateway only lets through replies to
+            // its own requests, so this does not need to re-check ownership.
+            Some("system_response") => {
+                let p = payload.get("payload");
+                let id = p.and_then(|p| p.get("request_id")).and_then(Value::as_str);
+                match id {
+                    Some(id) => vec![json!({
+                        "kind": "query_result",
+                        "id": id,
+                        "command": p.and_then(|p| p.get("command")).and_then(Value::as_str).unwrap_or(""),
+                        "ok": p.and_then(|p| p.get("success")).and_then(Value::as_bool).unwrap_or(false),
+                        "data": p.and_then(|p| p.get("data")).cloned().unwrap_or(Value::Null),
+                    })],
+                    None => Vec::new(),
+                }
+            }
             Some("browser_tool_request") => Self::ask_user(payload.get("payload")),
             Some("browser_tool_resolved") => {
                 let id = payload
@@ -187,6 +204,14 @@ fn tool_frame(stream_id: &str, ev: &Value) -> Option<Value> {
     Some(json!({ "kind": "tool", "streamId": stream_id, "tool": tool }))
 }
 
+/// What a portal is allowed to ask for.
+///
+/// An allow-list, not a filter on obviously-dangerous names: `system_command`
+/// reaches everything from `pack.install` to `brain.put`, and a remote peer
+/// gets the three read-only lookups it needs to offer `/`, `@` and `#` — and
+/// nothing else. Anything absent here is not translated at all.
+const PORTAL_QUERIES: &[&str] = &["skill.list", "soul.list", "tabs.list"];
+
 /// Translate a portal `OutboundFrame` (JSON) into a daemon `SidebarMessage` for
 /// injection. `session_id` + `message_id` come from the gateway's session state
 /// (the portal frame doesn't carry them; the gateway generates `message_id`).
@@ -203,6 +228,7 @@ pub fn uplink(
 ) -> Option<nevoflux_protocol::chat::SidebarMessage> {
     use nevoflux_protocol::chat::{
         BrowserToolResponse, ChatMessage, PlanResponse, SidebarMessage, StopGeneration,
+        SystemCommand,
     };
     match frame.get("kind")?.as_str()? {
         "user_message" => Some(SidebarMessage::ChatMessage(ChatMessage {
@@ -245,6 +271,32 @@ pub fn uplink(
         "cancel" => Some(SidebarMessage::StopGeneration(StopGeneration {
             session_id: session_id.to_string(),
         })),
+        // The portal asking the daemon something it needs to offer a choice:
+        // which skills exist, which souls, which tabs are open. Read-only by
+        // construction — the allow-list below is what a portal may ask, so a
+        // remote peer cannot reach commands that change anything.
+        "query" => {
+            let command = frame.get("name")?.as_str()?;
+            if !PORTAL_QUERIES.contains(&command) {
+                return None;
+            }
+            // The session is stamped here, not sent by the portal: the portal
+            // does not know the daemon's session id, and if it could name one
+            // it could read another session's tabs.
+            let mut params = frame
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            params.insert("session_id".into(), json!(session_id));
+            Some(SidebarMessage::SystemCommand(SystemCommand {
+                request_id: frame.get("id")?.as_str()?.to_string(),
+                command: command.to_string(),
+                params: Some(Value::Object(params)),
+            }))
+        }
         "plan_response" => Some(SidebarMessage::PlanResponse(
             if frame.get("approved")?.as_bool()? {
                 PlanResponse::Confirmed
@@ -705,6 +757,99 @@ mod tests {
         // Still a successful round-trip: the dialog was answered. "Deny" is
         // the answer, not a failure to obtain one.
         assert_eq!(wire["payload"]["success"], true);
+    }
+
+    #[test]
+    fn uplink_query_becomes_a_system_command_with_the_session_stamped() {
+        use nevoflux_protocol::chat::SidebarMessage;
+        let msg = uplink(
+            &json!({ "kind": "query", "id": "q1", "name": "skill.list" }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        match msg {
+            SidebarMessage::SystemCommand(c) => {
+                assert_eq!(c.request_id, "q1");
+                assert_eq!(c.command, "skill.list");
+                assert_eq!(c.params.unwrap()["session_id"], "sess-1");
+            }
+            other => panic!("expected SystemCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uplink_query_will_not_carry_a_session_the_portal_names() {
+        let msg = uplink(
+            &json!({
+                "kind": "query", "id": "q1", "name": "tabs.list",
+                "params": { "session_id": "someone-elses" }
+            }),
+            "sess-1",
+            "m",
+            None,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&msg).unwrap();
+        // Otherwise a portal could read another session's tabs.
+        assert_eq!(wire["payload"]["params"]["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn uplink_query_refuses_anything_off_the_allow_list() {
+        // system_command reaches pack.install, brain.put, config.file.write…
+        // A portal gets three read-only lookups and nothing else.
+        for name in [
+            "pack.install",
+            "brain.put",
+            "config.file.write",
+            "remote.start",
+        ] {
+            assert!(
+                uplink(
+                    &json!({ "kind": "query", "id": "q", "name": name }),
+                    "s",
+                    "m",
+                    None
+                )
+                .is_none(),
+                "{name} must not be reachable from a portal"
+            );
+        }
+        for name in PORTAL_QUERIES {
+            assert!(uplink(
+                &json!({ "kind": "query", "id": "q", "name": name }),
+                "s",
+                "m",
+                None
+            )
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn downlink_system_response_becomes_a_query_result() {
+        let mut t = Translator::new();
+        let frames = t.downlink(&json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": "q1",
+                "command": "skill.list",
+                "success": true,
+                "data": { "skills": [{ "name": "tdd" }] }
+            }
+        }));
+        assert_eq!(
+            frames,
+            vec![json!({
+                "kind": "query_result",
+                "id": "q1",
+                "command": "skill.list",
+                "ok": true,
+                "data": { "skills": [{ "name": "tdd" }] }
+            })]
+        );
     }
 
     #[test]
