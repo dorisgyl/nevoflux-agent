@@ -8,6 +8,7 @@
 pub mod account;
 pub mod connect_block;
 pub mod control_config;
+pub mod control_service;
 pub mod crypto;
 pub mod gateway;
 pub mod identity;
