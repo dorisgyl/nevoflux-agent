@@ -55,8 +55,20 @@ pub struct ServiceDeps {
 /// Returns `Err` on any startup failure. On success it does not return while
 /// the head is alive — it runs the browser supervisor.
 pub async fn run(deps: ServiceDeps) -> Result<(), String> {
-    // 1. Identity, before anything expensive, so a bad data volume fails now
-    //    rather than after a browser has been launched.
+    // 1. The account token. Checked first because a missing one is the most
+    //    likely misconfiguration and the cheapest to detect: without this the
+    //    failure would land after a whole browser had been launched, and the
+    //    operator would read the browser's own startup noise looking for it.
+    if super::start::stored_account_token().is_none() {
+        return Err(format!(
+            "no nevoflux account token at {}. Sign in on a desktop NevoFlux and mount that \
+             file there (read-only is fine).",
+            super::start::account_token_path().display()
+        ));
+    }
+
+    // 2. Identity, before anything expensive, so a bad data volume also fails
+    //    before a browser is launched.
     let id_path = deps.data_dir.join("remote-control.json");
     let (identity, fresh) =
         super::identity::load_or_generate(&id_path).map_err(|e| e.to_string())?;
@@ -67,7 +79,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         "remote-control identity ready"
     );
 
-    // 2. What this head is set to. Snapshotted here; the phone cannot move it.
+    // 3. What this head is set to. Snapshotted here; the phone cannot move it.
     let cfg = crate::config::AgentConfig::load()
         .map_err(|e| format!("could not read config.toml: {e}"))?;
     let resolved = super::control_config::resolve(&cfg.remote_control, &|k| std::env::var(k).ok());
@@ -77,7 +89,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         "remote-control settings"
     );
 
-    // 3. The session, and its execution tier. `resolve_execution_tier` reads
+    // 4. The session, and its execution tier. `resolve_execution_tier` reads
     //    this exact key on every permission check, so writing it is all it
     //    takes for the gate to obey the container's configuration — there is
     //    no second resolution path to keep in step.
@@ -95,7 +107,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         )
         .map_err(|e| format!("could not pin the execution tier: {e}"))?;
 
-    // 4. The browser. Its profile lives on the data volume rather than in a
+    // 5. The browser. Its profile lives on the data volume rather than in a
     //    work dir, so a site stays signed in across container restarts, and it
     //    is deliberately outside the task runner's work dir — that path is
     //    swept by `kill_profile_processes` between tasks, which would take
@@ -120,7 +132,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
     tracing::info!(browser = %entry.proxy_id, "remote-control browser bound");
     deps.bindings.bind(&session.id, entry);
 
-    // 5. The channel.
+    // 6. The channel.
     let req = super::start::ChannelRequest {
         channel_id: identity.channel_id.clone(),
         pairing_code: identity.pairing_code.clone(),
@@ -133,7 +145,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    // 6. The one thing a person needs. stdout, not the log: this is the
+    // 7. The one thing a person needs. stdout, not the log: this is the
     //    product of having started the container.
     println!(
         "{}",

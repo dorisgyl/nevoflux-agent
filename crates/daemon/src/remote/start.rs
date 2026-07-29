@@ -41,23 +41,33 @@ pub enum OpenError {
     JwtMint(String),
 }
 
+/// Where the daemon keeps the account token.
+pub fn account_token_path() -> std::path::PathBuf {
+    crate::paths::resolve_from_daemon()
+        .data_dir
+        .join("account-token")
+}
+
+/// The stored account token, if there is a usable one.
+///
+/// Exposed so a caller can find out it will fail *before* doing something
+/// expensive — the headless service checks this before launching a browser,
+/// rather than discovering it after.
+pub fn stored_account_token() -> Option<String> {
+    use super::account::TokenStore;
+    match super::account::FileTokenStore::new(account_token_path()).load() {
+        Ok(Some(t)) => Some(t),
+        _ => None,
+    }
+}
+
 /// Open a channel using the account token stored in the daemon's data dir.
 pub async fn open_channel(
     req: ChannelRequest,
     registry: &Arc<Mutex<GatewayRegistry>>,
     msg_tx: &mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
 ) -> Result<Arc<PortalGateway>, OpenError> {
-    use super::account::TokenStore;
-    let store = super::account::FileTokenStore::new(
-        crate::paths::resolve_from_daemon()
-            .data_dir
-            .join("account-token"),
-    );
-    let token = match store.load() {
-        Ok(Some(t)) => Some(t),
-        _ => None,
-    };
-    open_channel_with_token(req, token, registry, msg_tx).await
+    open_channel_with_token(req, stored_account_token(), registry, msg_tx).await
 }
 
 /// The sequence itself, with the account token passed in so it is testable.

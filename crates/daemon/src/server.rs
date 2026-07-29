@@ -349,12 +349,33 @@ pub struct Server {
     /// `knowledge_base.enabled = false`, the embedding subsystem is
     /// disabled, or no stale chunks were found at startup.
     reindex_progress: ReindexProgressSlot,
+    /// The remote-gateway registry and the daemon's message sender, for a
+    /// caller that opens a channel outside the system-command path — today,
+    /// the `--remote-control` service. Not reachable through
+    /// `automation::CURRENT_SERVICES_TEMPLATE`: that snapshot is taken before
+    /// `with_remote_gateway` runs, so both fields are still `None` in it.
+    remote_wiring: Option<(
+        Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
+        mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
+    )>,
 }
 
 impl Server {
     /// Get the bound port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The remote-gateway registry + daemon message sender, so a caller
+    /// outside the system-command path can open a portal channel. `None` when
+    /// remote access is not wired for this daemon instance.
+    pub fn remote_wiring(
+        &self,
+    ) -> Option<(
+        Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
+        mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
+    )> {
+        self.remote_wiring.clone()
     }
 
     /// Clone-safe snapshot of the in-process llm-gateway, or `None` if
@@ -1842,6 +1863,10 @@ pub async fn start_server(
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
+    // Kept for the returned `Server`: `msg_tx` itself is moved into the accept
+    // loop further down, and `--remote-control` needs a sender of its own to
+    // build an injector with.
+    let remote_msg_tx = msg_tx.clone();
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
     // Portal remote-gateway registry (§2.D M2 tap target). The `remote.start`
@@ -4442,6 +4467,7 @@ pub async fn start_server(
         gateway_snapshot,
         brain_slot,
         reindex_progress: reindex_progress_slot,
+        remote_wiring: Some((remote_registry.clone(), remote_msg_tx)),
     })
 }
 
