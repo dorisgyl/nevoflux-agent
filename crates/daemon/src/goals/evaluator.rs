@@ -52,24 +52,6 @@ condition asks for. Respond with STRICT JSON only, no prose, no code fences:
 
 /// Provider names (all aliases) that cannot act as an evaluator: ACP agents
 /// only support streaming, so `execute_llm_chat` rejects them.
-// Providers that ONLY support streaming via the ACP registry (stream_acp_completion
-// + acp_providers()), so they cannot use the direct-API `evaluate` path and must
-// judge via `evaluate_via_acp`. NOTE: kimi-agent is deliberately NOT here — it is
-// an ACP worker but supports non-streaming chat (execute_kimi_agent_chat), so it
-// judges through the normal direct-API `evaluate` path.
-const ACP_PROVIDERS: &[&str] = &[
-    "claude-code",
-    "claude_code",
-    "gemini-cli",
-    "gemini_cli",
-    "openclaw",
-    "open_claw",
-    "open-claw",
-    "antigravity",
-    "antigravity-cli",
-    "antigravity_cli",
-];
-
 /// Tail sizing: the last N messages, then clipped to a byte budget (oldest
 /// dropped first). 24 KiB keeps the evaluator prompt cheap and bounded.
 pub const TRANSCRIPT_MAX_MESSAGES: usize = 30;
@@ -142,7 +124,7 @@ pub fn resolve_evaluator(
     let provider_norm = provider_str.to_lowercase();
 
     // Reject ACP providers up-front (they only support streaming).
-    if ACP_PROVIDERS.contains(&provider_norm.as_str()) {
+    if crate::config::is_acp_provider(&provider_norm) {
         return Err(format!(
             "provider '{provider_str}' is an ACP agent and cannot act as a goal evaluator. \
              Ask the user to select a direct-API provider (e.g. anthropic, openai, gemini) for goal evaluation."
@@ -216,7 +198,7 @@ pub fn resolve_evaluator_for_goal(
         .map(|p| p.to_string())
         .or_else(|| config.llm.active_provider().map(|s| s.to_string()));
     if let Some(p) = &provider_str {
-        if ACP_PROVIDERS.contains(&p.to_lowercase().as_str()) {
+        if crate::config::is_acp_provider(p) {
             return Ok(EvaluatorChoice {
                 provider: p.to_lowercase(),
                 model: model.unwrap_or_default().to_string(),
