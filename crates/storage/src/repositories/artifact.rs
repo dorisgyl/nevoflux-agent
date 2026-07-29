@@ -287,6 +287,25 @@ impl<'a> ArtifactRepository<'a> {
     ///
     /// Use [`delete_non_persistent_by_session`] for session cleanup after migration 014.
     /// Persistent artifacts now survive session deletion via the FK `ON DELETE SET NULL`
+    /// Detach a session's persistent artifacts without deleting them.
+    ///
+    /// Migration 014's `ON DELETE SET NULL` does this on its own when the
+    /// session row goes. Clearing a session's *contents* keeps the row, so the
+    /// FK never fires and the detach has to be explicit — otherwise a
+    /// persistent artifact stays pointed at a conversation that no longer has
+    /// any of the messages that produced it.
+    ///
+    /// Returns the number of artifacts detached.
+    pub fn detach_session(&self, session_id: &str) -> Result<u32> {
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE artifacts SET session_id = NULL WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            Ok(rows_affected as u32)
+        })
+    }
+
     /// rule; calling this method would incorrectly remove them.
     /// The method is kept for the existing `test_delete_by_session` test and any callers
     /// that have not yet been migrated.  It will be removed when Task 11 lands.
