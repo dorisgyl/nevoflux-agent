@@ -5414,6 +5414,23 @@ fn spawn_goal_continuation(
     });
 }
 
+/// Is this message `/clear`?
+///
+/// Only a bare `clear` counts — `/clearance`, `/clear-cache` and the like are
+/// ordinary messages. Hanging an irreversible delete off a prefix match gets
+/// something deleted that nobody asked for, eventually.
+///
+/// Slash tolerance comes from [`crate::wasm::llm::strip_skill_slash`]: a
+/// full-width `／` is what a Chinese keyboard produces, and treating that as
+/// plain text would silently forward `/clear` to the model as a question.
+pub(crate) fn is_clear_command(message: &str) -> bool {
+    let Some(rest) = crate::wasm::llm::strip_skill_slash(message) else {
+        return false;
+    };
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest[..name_end].eq_ignore_ascii_case("clear")
+}
+
 /// Handle chat channel messages with streaming support.
 ///
 /// This function processes chat messages and streams the response back to the sidebar
@@ -5639,6 +5656,77 @@ async fn handle_chat_message_streaming(
     // The container this turn happens in: the key for the soul binding, for the
     // memory it may write, and for the cookie jar the browser already isolates.
     let container = current_container(tab_id, &tab_ids);
+
+    // `/clear` ends the turn here, before the model is involved.
+    //
+    // Not a skill, deliberately: a skill is guidance folded into the prompt and
+    // acted on at the model's discretion, and an irreversible delete should not
+    // turn on whether this turn was understood. The ordering is the more
+    // practical objection — the model's context holds the conversation it is
+    // about to delete, and this exchange would then be written into the session
+    // it just emptied. So it runs here, and this message is never stored.
+    if is_clear_command(message_content) {
+        // A turn already in flight would write its answer into the session we
+        // are about to empty. Stop it the same way the stop button does: raise
+        // the interrupt flag the agent polls, and cancel the stream forwarder.
+        {
+            let mut registry = interrupt_registry.lock().await;
+            if let Some(flag) = registry.remove(&session_id) {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        {
+            let mut registry = cancellation_registry.lock().await;
+            if let Some(token) = registry.remove(&session_id) {
+                token.cancel();
+            }
+        }
+
+        let payload = match crate::session::clear::clear_session_contents(
+            session_manager,
+            &session_id,
+        )
+        .await
+        {
+            Ok(out) => {
+                // `session_id` is what `PortalGateway::project` filters on. Without
+                // it the M2 tap fans this out and the session filter drops it, and
+                // the phone never hears that its transcript is gone.
+                serde_json::json!({
+                    "type": "session_cleared",
+                    "payload": {
+                        "session_id": session_id,
+                        "messages": out.messages,
+                        "artifacts": out.artifacts,
+                    }
+                })
+            }
+            Err(e) => {
+                // No `session_cleared` on failure. Three surfaces consistently
+                // holding the old contents is recoverable; a cleared screen over
+                // a full database is not visible to anyone until something the
+                // user thought was deleted turns up in a later answer.
+                error!(
+                    "clear failed for session {}: {}",
+                    session_id, e
+                );
+                serde_json::json!({
+                    "type": "error",
+                    "payload": {
+                        "code": "CLEAR_FAILED",
+                        "message": e.to_string(),
+                        "recoverable": true
+                    }
+                })
+            }
+        };
+        let response =
+            DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
+        if let Err(e) = response_tx.send((identity, response)).await {
+            error!("Failed to queue clear response: {}", e);
+        }
+        return;
+    }
 
     // Detect and process /skillname commands (same logic as non-streaming path).
     // Tolerates a leading full-width `／` and leading whitespace via the shared
@@ -12654,6 +12742,32 @@ mod tests {
         assert!(!crate::config::is_acp_provider("openai"));
         // An ACP worker that handles attachments on its own path.
         assert!(!crate::config::is_acp_provider("kimi-agent"));
+    }
+
+    #[test]
+    fn recognises_clear_with_the_slashes_people_actually_type() {
+        assert!(is_clear_command("/clear"));
+        assert!(is_clear_command("  /clear  "));
+        assert!(is_clear_command("/clear "));
+        // A Chinese keyboard emits the full-width solidus; treating that as
+        // plain text would forward `/clear` to the model as a question.
+        assert!(is_clear_command("／clear"));
+        assert!(is_clear_command("/CLEAR"));
+        assert!(is_clear_command("/Clear"));
+    }
+
+    #[test]
+    fn leaves_ordinary_messages_alone() {
+        assert!(!is_clear_command("clear"));
+        // Prefix matches are how an irreversible delete eats something nobody
+        // asked it to.
+        assert!(!is_clear_command("/clearance 是什么意思"));
+        assert!(!is_clear_command("/clear-cache"));
+        assert!(!is_clear_command("/clearly"));
+        assert!(!is_clear_command("请帮我 /clear"));
+        assert!(!is_clear_command("/"));
+        assert!(!is_clear_command(""));
+        assert!(!is_clear_command("   "));
     }
 
     #[test]
