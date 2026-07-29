@@ -2344,8 +2344,10 @@ pub async fn start_server(
                         } else if let Some((tab_id, tab_ids)) =
                             process_tab_context_registry.lock().await.get(&sid).cloned()
                         {
-                            if let Some(p) =
-                                envelope.payload.get_mut("payload").and_then(|p| p.as_object_mut())
+                            if let Some(p) = envelope
+                                .payload
+                                .get_mut("payload")
+                                .and_then(|p| p.as_object_mut())
                             {
                                 if let Some(t) = tab_id {
                                     p.insert("tab_id".into(), serde_json::json!(t));
@@ -2544,10 +2546,8 @@ pub async fn start_server(
                                     "session_id": session_id,
                                 }
                             });
-                            let env =
-                                DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
-                            if let Err(e) =
-                                process_response_tx.send((identity.clone(), env)).await
+                            let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
+                            if let Err(e) = process_response_tx.send((identity.clone(), env)).await
                             {
                                 warn!("Failed to announce browser_tool_resolved: {}", e);
                             }
@@ -2596,8 +2596,7 @@ pub async fn start_server(
                                 }
                             });
                             let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
-                            if let Err(e) =
-                                process_response_tx.send((identity.clone(), env)).await
+                            if let Err(e) = process_response_tx.send((identity.clone(), env)).await
                             {
                                 warn!("Failed to announce plan_resolved: {}", e);
                             }
@@ -11660,12 +11659,19 @@ fn promote_image_local_files_to_attachments(
     use base64::{engine::general_purpose::STANDARD, Engine};
 
     const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
-    const LLM_STAGE_MAX: u32 = 1024;
-    // Hard ceiling on the post-resize payload sent to the LLM. Anthropic
-    // direct caps individual images at 5 MB; third-party proxies often
-    // smaller. After resizing to 1024 px JPEG q=85 we should be well
-    // under this — guard rejects pathological cases.
-    const MAX_LLM_BYTES: usize = 5 * 1024 * 1024;
+    // Long-edge targets, best first. 2576 px is the vision models'
+    // high-resolution tier (Claude 4.7 and later, 4784 visual tokens); the
+    // server downsamples anything larger itself, so sending more only costs
+    // bandwidth. Shrinking further — this used to go straight to 1024, on the
+    // since-outdated belief that vision normalises to a 1024 box — throws away
+    // detail the model can genuinely use. 1568 is the standard tier and 1024
+    // the last resort, for images too dense to fit the cap at full size.
+    const LLM_STAGE_LADDER: [u32; 3] = [2576, 1568, 1024];
+    // Per-image ceiling, measured on the **base64-encoded** payload: that is
+    // the unit the providers cap. Claude API direct allows 10 MB, Amazon
+    // Bedrock and Google Cloud 5 MB. Take the smaller so every route is safe.
+    // This used to compare raw bytes against a base64 limit — off by 4/3.
+    const MAX_LLM_B64_BYTES: usize = 5 * 1024 * 1024;
 
     let mut promoted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -11707,41 +11713,57 @@ fn promote_image_local_files_to_attachments(
             continue;
         }
 
-        // Resize to LLM-friendly dimensions. The 1024×1024 box is what
-        // Claude vision tools internally normalise to anyway; sending
-        // anything bigger spends bandwidth without improving recognition.
-        let (resized_bytes, outcome) = maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
-        let (final_bytes, final_mime): (Vec<u8>, String) = match &outcome {
-            ResizeOutcome::Resized { format, .. } => {
-                let new_mime = match format {
-                    image::ImageFormat::Jpeg => "image/jpeg",
-                    image::ImageFormat::Png => "image/png",
-                    image::ImageFormat::Gif => "image/gif",
-                    _ => "application/octet-stream",
-                };
-                (resized_bytes, new_mime.to_string())
+        // Aim for the high-resolution tier first, then step down. A
+        // high-entropy image can still exceed the provider's per-image cap at
+        // 2576 px, and giving up there would mean the model sees nothing at
+        // all — when a smaller version would have been perfectly usable.
+        let mut chosen: Option<(String, String)> = None; // (mime, base64)
+        for stage in LLM_STAGE_LADDER {
+            let (resized_bytes, outcome) = maybe_resize_bytes(&raw_bytes, stage, stage);
+            let (bytes, mime): (&[u8], &str) = match &outcome {
+                ResizeOutcome::Resized { format, .. } => (
+                    &resized_bytes,
+                    match format {
+                        image::ImageFormat::Jpeg => "image/jpeg",
+                        image::ImageFormat::Png => "image/png",
+                        image::ImageFormat::Gif => "image/gif",
+                        _ => "application/octet-stream",
+                    },
+                ),
+                // No resize / not-an-image / failure → the original bytes with
+                // the original mime. Tiny images are still promoted; they just
+                // had nothing to gain from a resize.
+                _ => (&raw_bytes, original_mime),
+            };
+            let data = STANDARD.encode(bytes);
+            if data.len() <= MAX_LLM_B64_BYTES {
+                chosen = Some((mime.to_string(), data));
+                break;
             }
-            // No resize / not-an-image / failure → fall back to original
-            // bytes with the original mime. We still promote (don't drop
-            // tiny images just because they didn't get resized).
-            _ => (raw_bytes, original_mime.to_string()),
-        };
+            if !matches!(outcome, ResizeOutcome::Resized { .. }) {
+                // The original bytes came back untouched; asking for a smaller
+                // stage will return them again. Stop rather than spin.
+                break;
+            }
+        }
 
-        if final_bytes.len() > MAX_LLM_BYTES {
+        let Some((final_mime, data)) = chosen else {
             tracing::warn!(
                 path = %f.path,
-                final_bytes = final_bytes.len(),
-                "post-resize image still > {} MB; skipping promotion (LLM proxy will likely reject)",
-                MAX_LLM_BYTES / (1024 * 1024)
+                "image is over the {} MB base64 cap even at the smallest stage; \
+                 skipping promotion (the provider would reject it). The \
+                 local_files entry is kept, so the agent can still open the \
+                 original with a tool.",
+                MAX_LLM_B64_BYTES / (1024 * 1024)
             );
             continue;
-        }
+        };
 
         let name = std::path::Path::new(&f.path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| f.path.clone());
-        let data = STANDARD.encode(&final_bytes);
+        let llm_bytes = data.len();
         attachments.push(Attachment {
             name,
             mime_type: final_mime.clone(),
@@ -11752,8 +11774,7 @@ fn promote_image_local_files_to_attachments(
             path = %f.path,
             mime = %final_mime,
             original_bytes = original_bytes,
-            llm_bytes = final_bytes.len(),
-            outcome = ?outcome,
+            llm_b64_bytes = llm_bytes,
             "promoted image local_file to attachment (with resize); local_files entry preserved so agent can call canvas_attach_asset(local_path=...)"
         );
     }
@@ -12446,6 +12467,48 @@ mod tests {
     }
 
     #[test]
+    fn promoted_image_is_not_crushed_below_the_vision_tier() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use image::{ImageBuffer, Rgb};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        // 3000 px on the long edge: above 2576, so it gets scaled down, and it
+        // must land on 2576 rather than the old 1024. High-entropy pixels on
+        // purpose — a smooth gradient re-encodes to a *larger* JPEG than its
+        // source PNG, and `maybe_resize_bytes` then keeps the original rather
+        // than making the payload worse, which would test nothing here.
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(3000, 800, |x, y| {
+            Rgb([
+                x.wrapping_mul(2654435761).wrapping_add(y) as u8,
+                y.wrapping_mul(2246822519).wrapping_add(x) as u8,
+                (x ^ y).wrapping_mul(1597334677) as u8,
+            ])
+        });
+        img.save(&path).unwrap();
+
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: path.to_string_lossy().to_string(),
+            is_directory: false,
+            size: Some(std::fs::metadata(&path).unwrap().len()),
+            modified: None,
+        }];
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+
+        assert_eq!(attachments.len(), 1);
+        let bytes = STANDARD.decode(&attachments[0].data).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(
+            decoded.width().max(decoded.height()),
+            2576,
+            "the long edge should land on the high-resolution vision tier"
+        );
+        // The path stays: the agent needs it to reach the original with a tool.
+        assert_eq!(local_files.len(), 1);
+    }
+
+    #[test]
     fn promote_image_local_files_reads_bytes_and_keeps_entry() {
         // Write a real PNG to a tempfile and verify the helper reads it,
         // base64-encodes it into attachments, and drops the local_files
@@ -12625,13 +12688,24 @@ mod tests {
             "promoted entry preserved for canvas_attach_asset(local_path)"
         );
 
-        // Decode the output and verify it's much smaller AND inside the
-        // LLM cap. Opaque photo PNG → JPEG q=85 path.
+        // Decode the output and verify it is much smaller than the source AND
+        // inside the provider's cap. Opaque photo PNG → JPEG q=85 path.
+        //
+        // The bound is the cap itself, not a fixed megabyte: the stage ladder
+        // now aims at the 2576 px high-resolution tier and only steps down when
+        // the payload would not fit, so a dense image legitimately lands larger
+        // than it did when everything was crushed to 1024 px.
         let llm_bytes = STANDARD.decode(&attachments[0].data).unwrap();
         assert!(
-            llm_bytes.len() < 1 * 1024 * 1024,
-            "LLM payload {} bytes; should be < 1 MB after resize",
-            llm_bytes.len()
+            attachments[0].data.len() <= 5 * 1024 * 1024,
+            "LLM payload {} base64 bytes; must fit the provider cap",
+            attachments[0].data.len()
+        );
+        assert!(
+            llm_bytes.len() < original_size / 2,
+            "LLM payload {} bytes vs {} original; the resize should have bitten",
+            llm_bytes.len(),
+            original_size
         );
         assert_eq!(
             attachments[0].mime_type, "image/jpeg",
