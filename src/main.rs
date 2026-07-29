@@ -638,6 +638,7 @@ async fn run_daemon(
     port: Option<u16>,
     managed: bool,
     headless: bool,
+    remote_control: bool,
     http_addr: Option<std::net::SocketAddr>,
     openai_addr: Option<std::net::SocketAddr>,
     mcp_addr: Option<std::net::SocketAddr>,
@@ -716,6 +717,10 @@ async fn run_daemon(
             .expect("Failed to create session manager"),
     );
 
+    // `start_server` takes ownership; the remote-control service needs the
+    // same manager for its long-lived session and the config store.
+    let remote_session_manager = session_manager.clone();
+
     // Remember whether we're in zero-file mode before `port` gets shadowed
     // by `server.port()`.
     let zero_file_mode = managed && port.is_some();
@@ -744,18 +749,22 @@ async fn run_daemon(
     // session-runner leaf) is the browser-gated piece — until it lands, submitted
     // tasks report not-yet-wired. The daemon still routes browser_* tools to a
     // registered browser via the P2 binding once the leaf runs them.
-    if headless {
-        // E2E bug #2 fix: the browser we spawn launches a native-messaging proxy
-        // that, in prod mode, discovers a daemon via `daemon-managed.port`. Write
-        // it with THIS daemon's port so the proxy connects BACK to us instead of
-        // spawning its own managed daemon (which would hold the browser in a
-        // different daemon than the one running the task).
+    // E2E bug #2 fix: a browser we spawn launches a native-messaging proxy
+    // that, in prod mode, discovers a daemon via `daemon-managed.port`. Write
+    // it with THIS daemon's port so the proxy connects BACK to us instead of
+    // spawning its own managed daemon (which would hold the browser in a
+    // different daemon than the one that launched it). Both browser-spawning
+    // modes need this, so it sits outside either one.
+    if headless || remote_control {
         let managed_port_file = data_dir.join("daemon-managed.port");
         if let Err(e) = std::fs::write(&managed_port_file, port.to_string()) {
-            tracing::warn!("headless: failed to write daemon-managed.port: {}", e);
+            tracing::warn!("failed to write daemon-managed.port: {}", e);
         } else {
-            tracing::info!("headless: wrote daemon-managed.port={} for proxy connect-back", port);
+            tracing::info!("wrote daemon-managed.port={} for proxy connect-back", port);
         }
+    }
+
+    if headless {
         if http_addr.is_some() || openai_addr.is_some() || mcp_addr.is_some() || acp_addr.is_some()
         {
             use nevoflux_daemon::http;
@@ -827,11 +836,62 @@ async fn run_daemon(
                     }
                 });
             }
-        } else {
+        } else if !remote_control {
+            // The warning was right when serving an interface was the only
+            // reason to run headless. With --remote-control the absence of one
+            // is the design, not an oversight.
             tracing::warn!(
                 "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr: no API served"
             );
         }
+    }
+
+    // Remote-control service: a head with nobody in front of it. Started after
+    // the server is up (it needs the gateway registry and the message sender),
+    // and fatal on any startup failure — a container that half-starts reads as
+    // healthy to an orchestrator and is useless to whoever holds the phone.
+    if remote_control {
+        let Some(browser_bin) = std::env::var_os("NEVOFLUX_BROWSER_BIN").map(PathBuf::from) else {
+            eprintln!(
+                "--remote-control requires NEVOFLUX_BROWSER_BIN (the path to the browser binary)"
+            );
+            std::process::exit(2);
+        };
+        let Some((registry, msg_tx)) = server.remote_wiring() else {
+            eprintln!("--remote-control: this daemon exposed no remote-gateway wiring");
+            std::process::exit(2);
+        };
+        let Some(browsers) = nevoflux_daemon::registry::CURRENT_BROWSER_REGISTRY.get().cloned()
+        else {
+            eprintln!("--remote-control: the browser registry was not initialised");
+            std::process::exit(2);
+        };
+
+        // The chat path reads these bindings through the same global, which is
+        // why it stays unset — and the lookup skipped — on the desktop.
+        let bindings = std::sync::Arc::new(nevoflux_daemon::registry::SessionBrowserBindings::new());
+        let _ = nevoflux_daemon::registry::CURRENT_SESSION_BINDINGS.set(bindings.clone());
+
+        let deps = nevoflux_daemon::remote::control_service::ServiceDeps {
+            data_dir: data_dir.clone(),
+            browser_bin,
+            display: std::env::var("DISPLAY").ok(),
+            portal_base: std::env::var("NEVOFLUX_PORTAL_URL")
+                .unwrap_or_else(|_| "https://portal.nevoflux.app".to_string()),
+            registry,
+            msg_tx,
+            browsers,
+            bindings,
+            session_manager: remote_session_manager,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = nevoflux_daemon::remote::control_service::run(deps).await {
+                eprintln!("remote-control: {e}");
+                // This service is the point of the process; if it cannot run,
+                // neither can the container.
+                std::process::exit(1);
+            }
+        });
     }
 
     // Wait for a shutdown signal: Ctrl+C, or the server terminating on its
@@ -1314,6 +1374,7 @@ async fn main() {
             cli.port,
             cli.managed,
             cli.headless,
+            cli.remote_control,
             cli.http_addr,
             cli.openai_addr,
             cli.mcp_addr,

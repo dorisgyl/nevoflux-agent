@@ -201,6 +201,71 @@ curl -X POST localhost:8080/session/close        # → {"closed":true|false}
 - If the shared browser crashes mid-flow, the next task relaunches it against the
   same clone (cookies persist on disk, so login survives).
 
+## Remote control from a phone
+
+One container, one browser, one long conversation, driven from your phone
+through [nevoflux.app](https://nevoflux.app). Unlike every mode above there is
+no interface to call: `--remote-control` serves no HTTP at all, so there is
+nothing to publish and no port to guard. The relay socket is the whole
+outward face.
+
+```bash
+# 1. Put a nevoflux account token where the container can read it. Sign in on a
+#    desktop NevoFlux, then copy `account-token` out of its data dir.
+cp ~/.local/share/nevoflux/account-token ./account-token
+
+# 2. Start it.
+docker compose --profile remote up remote
+
+# 3. Read the connect block it printed and paste the WHOLE thing into the
+#    portal on your phone — it finds the link and the code for you.
+docker compose --profile remote logs remote | head -40
+```
+
+**The pairing code is the only secret.** The channel id is unguessable but not
+confidential: someone who has it can attach to the relay and receive
+ciphertext, and without the code they can neither read it nor inject anything
+(a forged frame fails AES-GCM and is dropped). Someone who has the *code*
+drives this container.
+
+**`remote-data` must be a real volume, never a tmpfs.** It holds
+`remote-control.json` — the channel and its pairing code — plus the browser
+profile and the conversation. On a tmpfs the identity dies with the container
+and the paired phone can only report that it stopped connecting. This is why
+the `remote` service in `docker-compose.yml` does *not* list
+`/var/nevoflux/data` under `tmpfs`, while the task services do.
+
+**Mode and execution tier are fixed at startup**, resolved from
+`NEVOFLUX_REMOTE_MODE` / `NEVOFLUX_REMOTE_EXECUTION_TIER`, else
+`[remote_control]` in `config.toml`, else `agent` / `read-only`. Each resolves
+on its own, so setting one does not reset the other. The phone shows both and
+can change neither: a container has no local user standing by to take a grant
+back, so a phone that could raise `chat` to `agent` would make the setting a
+suggestion.
+
+```toml
+# ~/.config/nevoflux/config.toml
+[remote_control]
+mode = "agent"                    # chat | browser | agent
+execution_tier = "browser-auto"   # read-only | browser-auto |
+                                  # browser-auto-local-read | full-auto
+```
+
+**Startup is all-or-nothing.** A missing account token, an unreachable account
+service, an unwritable data dir, or a browser that will not come up each exit
+non-zero with the reason — a container that half-starts reads as healthy to an
+orchestrator and is useless to the person holding the phone.
+
+**A corrupt `remote-control.json` refuses to start** rather than generating a
+new identity. Regenerating would strand the paired phone, which would show up
+only as "it will not connect any more". Delete the file deliberately if you
+mean to re-pair.
+
+**If the browser dies it is relaunched** and rebound to the same conversation,
+and the phone gets a notice saying so — open pages are gone, signed-in sites
+are not. Three consecutive failures to bring it back exit the container so the
+orchestrator recreates it.
+
 ## Alternative interfaces: OpenAI / MCP / ACP
 
 Three thin front-ends map a prompt to a task (all reduce to the same runner).
@@ -378,6 +443,7 @@ Concurrency/warm capacity is the platform's job (the product runs one browser).
 
 ## Files
 - `Dockerfile` — hardened image (non-root, tini, Xvfb, Gecko libs).
-- `docker-compose.yml` — `headless` (service) + `oneshot` (per-task) services, pre-hardened.
+- `docker-compose.yml` — `headless` (service) + `oneshot` (per-task) + `remote`
+  (phone-driven, no HTTP) services, pre-hardened.
 - `entrypoint.sh` — dbus → Xvfb → (optional VNC) → daemon.
 - `native-host/com.nevoflux.agent.json` — native-messaging manifest (verify path via `about:support`).

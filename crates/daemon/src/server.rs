@@ -349,12 +349,33 @@ pub struct Server {
     /// `knowledge_base.enabled = false`, the embedding subsystem is
     /// disabled, or no stale chunks were found at startup.
     reindex_progress: ReindexProgressSlot,
+    /// The remote-gateway registry and the daemon's message sender, for a
+    /// caller that opens a channel outside the system-command path — today,
+    /// the `--remote-control` service. Not reachable through
+    /// `automation::CURRENT_SERVICES_TEMPLATE`: that snapshot is taken before
+    /// `with_remote_gateway` runs, so both fields are still `None` in it.
+    remote_wiring: Option<(
+        Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
+        mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
+    )>,
 }
 
 impl Server {
     /// Get the bound port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The remote-gateway registry + daemon message sender, so a caller
+    /// outside the system-command path can open a portal channel. `None` when
+    /// remote access is not wired for this daemon instance.
+    pub fn remote_wiring(
+        &self,
+    ) -> Option<(
+        Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
+        mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
+    )> {
+        self.remote_wiring.clone()
     }
 
     /// Clone-safe snapshot of the in-process llm-gateway, or `None` if
@@ -1842,6 +1863,10 @@ pub async fn start_server(
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
+    // Kept for the returned `Server`: `msg_tx` itself is moved into the accept
+    // loop further down, and `--remote-control` needs a sender of its own to
+    // build an injector with.
+    let remote_msg_tx = msg_tx.clone();
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
     // Portal remote-gateway registry (§2.D M2 tap target). The `remote.start`
@@ -4442,6 +4467,7 @@ pub async fn start_server(
         gateway_snapshot,
         brain_slot,
         reindex_progress: reindex_progress_slot,
+        remote_wiring: Some((remote_registry.clone(), remote_msg_tx)),
     })
 }
 
@@ -5959,6 +5985,26 @@ async fn handle_chat_message_streaming(
         .clone()
         .with_client_context(identity.clone(), proxy_id.clone())
         .with_session_id(session_id.clone());
+
+    // A session with a browser of its own routes `browser_*` there rather than
+    // back at whoever sent the message. On the desktop the sender IS the
+    // browser and this table is empty; for a headless head the sender is a
+    // synthetic proxy with no writer behind it, so without this every
+    // `browser_*` call would be dropped at the writer lookup.
+    //
+    // Only tool dispatch moves. `stream_identity` below was captured from this
+    // function's own `identity`, so the turn's chat frames still leave under
+    // the sender and reach a portal through the M2 tap.
+    if let Some(bindings) = crate::registry::CURRENT_SESSION_BINDINGS.get() {
+        if let Some(entry) = bindings.get(&session_id) {
+            info!(
+                session_id = %session_id,
+                bound_browser = %entry.proxy_id,
+                "chat turn routed to the session's bound browser"
+            );
+            services_with_context = services_with_context.with_bound_browser(&entry);
+        }
+    }
 
     // Create a per-session interrupt flag and register it so stop_generation can find it
     let session_interrupt_flag = Arc::new(AtomicBool::new(false));
@@ -8130,54 +8176,12 @@ async fn handle_chat_message(
                         .get("mode")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    // Load the account token (daemon-held); refuse if not logged in.
-                    let account_token = {
-                        use crate::remote::account::TokenStore;
-                        let store = crate::remote::account::FileTokenStore::new(
-                            crate::paths::resolve_from_daemon()
-                                .data_dir
-                                .join("account-token"),
-                        );
-                        match store.load() {
-                            Ok(Some(t)) => t,
-                            _ => {
-                                return serde_json::json!({
-                                    "type": "system_response",
-                                    "payload": {
-                                        "request_id": request_id,
-                                        "command": "remote.start",
-                                        "success": false,
-                                        "error": { "code": "NOT_LOGGED_IN", "message": "log in first" }
-                                    }
-                                });
-                            }
-                        }
-                    };
-                    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-                        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-                    let jwt = match crate::remote::account::mint_do_jwt(&base, &account_token).await
-                    {
-                        Ok(j) => j,
-                        Err(e) => {
-                            return serde_json::json!({
-                                "type": "system_response",
-                                "payload": {
-                                    "request_id": request_id,
-                                    "command": "remote.start",
-                                    "success": false,
-                                    "error": { "code": "JWT_MINT_ERROR", "message": e.to_string() }
-                                }
-                            });
-                        }
-                    };
-                    // Channel id + human-speakable pairing code + derived E2E key.
+                    // Channel id + human-speakable pairing code. The sequence
+                    // that turns them into a live channel is shared with the
+                    // headless `--remote-control` service — see
+                    // `remote::start`, which exists so the two cannot drift.
                     let channel_id = uuid::Uuid::new_v4().to_string();
                     let pairing = crate::share::password::generate_password();
-                    let key = crate::remote::crypto::derive_channel_key(&pairing, &channel_id).ok();
-
-                    // Build the gateway over a swappable WS sink, register it so
-                    // the M2 tap can fan_out to it, then spawn the transport.
-                    let sink = Arc::new(crate::remote::ws::WsSink::new());
                     // Snapshot the Agent-execution tier for this session so the
                     // portal can show what the remote head would actually run.
                     // `resolve_execution_tier` keys off `services.session_id`,
@@ -8187,61 +8191,48 @@ async fn handle_chat_message(
                     )
                     .as_setting()
                     .to_string();
-                    let gateway = Arc::new(crate::remote::portal_gateway::PortalGateway::new(
-                        key,
-                        sink.clone(),
-                        session_id.clone(),
-                        mode,
-                        Some(execution_tier),
-                        &channel_id,
-                    ));
-                    match (&services.remote_registry, &services.remote_msg_tx) {
-                        (Some(registry), Some(msg_tx)) => {
-                            registry.lock().await.register(gateway.clone());
-                            let injector: Arc<dyn crate::remote::inject::Injector> =
-                                Arc::new(crate::remote::inject::ChannelInjector::new(
-                                    msg_tx.clone(),
-                                    _proxy_id.clone(),
-                                ));
-                            // The product's own zone, not `*.workers.dev`: that
-                            // host is firewall-blocked on some networks, and the
-                            // block is invisible from the portal side (the token
-                            // fetch dies before the socket is opened, so nothing
-                            // is ever attempted and nothing is logged).
-                            let relay = std::env::var("NEVOFLUX_RELAY_URL")
-                                .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
-                            // The JWT is re-minted per connect attempt inside the
-                            // loop, so hand it the account credentials, not a
-                            // token that expires in 15 minutes.
-                            let (ch, sid) = (channel_id.clone(), session_id.clone());
-                            let (acct_base, acct_token) = (base.clone(), account_token.clone());
-                            let reg = registry.clone();
-                            tokio::spawn(async move {
-                                crate::remote::ws::run_gateway(
-                                    &relay, &ch, acct_base, acct_token, sid, injector, sink,
-                                    gateway, reg,
-                                )
-                                .await;
-                            });
-                            serde_json::json!({
-                                "type": "system_response",
-                                "payload": {
-                                    "request_id": request_id,
-                                    "command": "remote.start",
-                                    "success": true,
-                                    "data": { "channel_id": channel_id, "pairing_code": pairing }
-                                }
-                            })
-                        }
-                        _ => serde_json::json!({
+
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
                             "type": "system_response",
                             "payload": {
                                 "request_id": request_id,
                                 "command": "remote.start",
                                 "success": false,
-                                "error": { "code": "REMOTE_NOT_WIRED", "message": "remote gateway not configured" }
+                                "error": { "code": code, "message": message }
                             }
-                        }),
+                        })
+                    };
+
+                    match (&services.remote_registry, &services.remote_msg_tx) {
+                        (Some(registry), Some(msg_tx)) => {
+                            let req = crate::remote::start::ChannelRequest {
+                                channel_id: channel_id.clone(),
+                                pairing_code: pairing.clone(),
+                                session_id,
+                                mode,
+                                execution_tier: Some(execution_tier),
+                                injector_proxy_id: _proxy_id.clone(),
+                            };
+                            match crate::remote::start::open_channel(req, registry, msg_tx).await {
+                                Ok(_gateway) => serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "remote.start",
+                                        "success": true,
+                                        "data": { "channel_id": channel_id, "pairing_code": pairing }
+                                    }
+                                }),
+                                Err(e @ crate::remote::start::OpenError::NotLoggedIn) => {
+                                    fail("NOT_LOGGED_IN", e.to_string())
+                                }
+                                Err(e @ crate::remote::start::OpenError::JwtMint(_)) => {
+                                    fail("JWT_MINT_ERROR", e.to_string())
+                                }
+                            }
+                        }
+                        _ => fail("REMOTE_NOT_WIRED", "remote gateway not configured".into()),
                     }
                 }
                 "content_store.delete" => {

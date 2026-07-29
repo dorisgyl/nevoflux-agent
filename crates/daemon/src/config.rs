@@ -69,6 +69,35 @@ pub struct AgentConfig {
     /// TTS subsystem configuration (umbrella spec §7).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// Headless remote-control service (`--remote-control`).
+    #[serde(default)]
+    pub remote_control: RemoteControlConfig,
+}
+
+/// `[remote_control]` — what the headless remote-control head is set to.
+///
+/// Both are snapshotted at startup and are deliberately **not** changeable
+/// from the phone: a container has no local user standing by to take a grant
+/// back, so letting the remote end raise `chat` to `agent` would turn this
+/// section into a suggestion. Either may be overridden at launch by
+/// `NEVOFLUX_REMOTE_MODE` / `NEVOFLUX_REMOTE_EXECUTION_TIER`.
+///
+/// ```toml
+/// [remote_control]
+/// mode = "agent"                    # chat | browser | agent
+/// execution_tier = "browser-auto"   # read-only | browser-auto |
+///                                   # browser-auto-local-read | full-auto
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteControlConfig {
+    /// Chat mode every remote turn runs in. Default `agent`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Agent-execution tier pinned onto this head's session. Default is the
+    /// safest tier.
+    #[serde(default)]
+    pub execution_tier: Option<String>,
 }
 
 /// TTS subsystem config — backends keyed by provider name.

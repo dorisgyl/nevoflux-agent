@@ -282,6 +282,56 @@ impl BrowserRegistry {
 pub static CURRENT_BROWSER_REGISTRY: std::sync::OnceLock<std::sync::Arc<BrowserRegistry>> =
     std::sync::OnceLock::new();
 
+/// Sessions that have a browser of their own.
+///
+/// `agent_exec` already states the priority for unattended runs: an explicit
+/// binding beats borrowing the session's most recent sidebar, and without
+/// either the run has `proxy_id=""` and its `browser_*` requests are dropped
+/// at the writer lookup. The chat path had only the second rule, because a
+/// chat turn has always had a sender worth routing back to. A headless head
+/// does not — its sender is a synthetic proxy with nothing behind it — so it
+/// registers here and the chat path follows the same order.
+///
+/// Empty on the desktop, where the sender already *is* the browser.
+#[derive(Default)]
+pub struct SessionBrowserBindings {
+    bindings: RwLock<HashMap<String, BrowserEntry>>,
+}
+
+impl SessionBrowserBindings {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Point `session_id` at `entry`, replacing any previous binding — which
+    /// is exactly what a restarted browser needs.
+    pub fn bind(&self, session_id: &str, entry: BrowserEntry) {
+        if let Ok(mut m) = self.bindings.write() {
+            m.insert(session_id.to_string(), entry);
+        }
+    }
+
+    /// The browser bound to `session_id`, if any.
+    pub fn get(&self, session_id: &str) -> Option<BrowserEntry> {
+        self.bindings.read().ok()?.get(session_id).cloned()
+    }
+
+    /// Forget `session_id`'s binding.
+    pub fn unbind(&self, session_id: &str) {
+        if let Ok(mut m) = self.bindings.write() {
+            m.remove(session_id);
+        }
+    }
+}
+
+/// Process-global session→browser bindings, set once at startup by whoever
+/// creates them. Mirrors [`CURRENT_BROWSER_REGISTRY`]. Unset on the desktop,
+/// where the chat path then skips the lookup entirely.
+pub static CURRENT_SESSION_BINDINGS: std::sync::OnceLock<
+    std::sync::Arc<SessionBrowserBindings>,
+> = std::sync::OnceLock::new();
+
 /// Role a connecting proxy declares in its registration frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterRole {
@@ -768,5 +818,59 @@ mod tests {
             parse_register_frame(br#"{"type":"hello","proxy_id":"p3"}"#),
             None
         );
+    }
+
+    fn browser_entry(id: &str) -> BrowserEntry {
+        BrowserEntry {
+            proxy_id: id.to_string(),
+            client_identity: id.as_bytes().to_vec(),
+            registered_at: Instant::now(),
+            last_heartbeat: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_bound_session_resolves_to_its_browser() {
+        let b = SessionBrowserBindings::new();
+        b.bind("sess-1", browser_entry("browser-a"));
+        assert_eq!(b.get("sess-1").unwrap().proxy_id, "browser-a");
+    }
+
+    #[test]
+    fn an_unbound_session_resolves_to_nothing() {
+        // This is the desktop case and it must stay the desktop case: an empty
+        // table means the chat path behaves exactly as it did before.
+        let b = SessionBrowserBindings::new();
+        b.bind("sess-1", browser_entry("browser-a"));
+        assert!(b.get("sess-2").is_none());
+        assert!(SessionBrowserBindings::new().get("sess-1").is_none());
+    }
+
+    #[test]
+    fn rebinding_replaces_rather_than_accumulates() {
+        // The headless service rebinds after it restarts a crashed browser;
+        // routing to the dead one would be worse than not routing at all.
+        let b = SessionBrowserBindings::new();
+        b.bind("sess-1", browser_entry("browser-a"));
+        b.bind("sess-1", browser_entry("browser-b"));
+        assert_eq!(b.get("sess-1").unwrap().proxy_id, "browser-b");
+    }
+
+    #[test]
+    fn unbinding_leaves_nothing_behind() {
+        let b = SessionBrowserBindings::new();
+        b.bind("sess-1", browser_entry("browser-a"));
+        b.unbind("sess-1");
+        assert!(b.get("sess-1").is_none());
+    }
+
+    #[test]
+    fn the_binding_carries_the_routing_identity_too() {
+        // `with_bound_browser` sets both fields from this entry; a binding that
+        // carried only the proxy_id would route to a writer that is never found.
+        let b = SessionBrowserBindings::new();
+        b.bind("sess-1", browser_entry("browser-a"));
+        let got = b.get("sess-1").unwrap();
+        assert_eq!(got.client_identity, b"browser-a".to_vec());
     }
 }

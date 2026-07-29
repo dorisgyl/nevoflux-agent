@@ -70,6 +70,13 @@ pub struct Cli {
     #[arg(long)]
     pub headless: bool,
 
+    /// Run the remote-control service: keep one browser and one conversation
+    /// alive and drive them from a phone through nevoflux.app. Prints a connect
+    /// block (link + pairing code) on startup and serves no HTTP at all — the
+    /// relay socket is the only outward face. Requires --daemon.
+    #[arg(long)]
+    pub remote_control: bool,
+
     /// HTTP bind address for the task API in headless mode (e.g. 0.0.0.0:8080).
     /// Also serves the OpenAI-compatible /v1/chat/completions on this port.
     #[arg(long)]

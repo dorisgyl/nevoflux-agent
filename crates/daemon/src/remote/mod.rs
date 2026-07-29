@@ -6,12 +6,17 @@
 //! trait + registry + WS transport + account wiring land in later phases.
 
 pub mod account;
+pub mod connect_block;
+pub mod control_config;
+pub mod control_service;
 pub mod crypto;
 pub mod gateway;
+pub mod identity;
 pub mod inject;
 pub mod portal_gateway;
 pub mod relay_protocol;
 pub mod session;
+pub mod start;
 pub mod translate;
 pub mod upload;
 pub mod ws;
