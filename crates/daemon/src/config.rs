@@ -487,12 +487,47 @@ pub struct ProviderConfig {
     pub use_streaming: Option<bool>,
 }
 
+/// Providers that delegate the turn to an external agent over ACP, so their
+/// prompt is assembled by `wasm::llm::build_acp_content*`.
+///
+/// Two consequences follow from that, and both callers depend on this exact
+/// membership: those builders emit only text blocks — no images, and the ACP
+/// schema has no image type to emit — and they stream, so such a provider
+/// cannot serve as a direct-API goal evaluator.
+///
+/// `kimi-agent` is deliberately absent. It is an ACP worker, but it also
+/// supports non-streaming chat and handles attachments on its own path, so
+/// neither consequence applies to it.
+pub const ACP_PROVIDERS: &[&str] = &[
+    "claude-code",
+    "claude_code",
+    "gemini-cli",
+    "gemini_cli",
+    "openclaw",
+    "open_claw",
+    "open-claw",
+    "antigravity",
+    "antigravity-cli",
+    "antigravity_cli",
+];
+
+/// Whether `provider` delegates over ACP (see [`ACP_PROVIDERS`]).
+pub fn is_acp_provider(provider: &str) -> bool {
+    ACP_PROVIDERS.contains(&provider.to_lowercase().as_str())
+}
+
 impl LlmConfig {
     /// Get the active provider name.
     pub fn active_provider(&self) -> Option<&str> {
         self.provider
             .as_deref()
             .or(self.default_provider.as_deref())
+    }
+
+    /// Whether the active provider delegates over ACP, and therefore cannot
+    /// carry an image in its prompt.
+    pub fn active_provider_is_acp(&self) -> bool {
+        self.active_provider().is_some_and(is_acp_provider)
     }
 
     /// Returns `true` if at least one LLM provider is usable.

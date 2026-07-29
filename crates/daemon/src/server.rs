@@ -5759,12 +5759,31 @@ async fn handle_chat_message_streaming(
         (message_content.to_string(), None)
     };
 
+    // Anything already here came off the wire; `promote` appends after it.
+    // Keeping the boundary lets the spill below tell the two apart.
+    let from_the_wire = attachments.len();
+
     // Promote image-typed local_files into real attachments so the LLM can
     // actually SEE the picture instead of being told "use the read tool".
     // Without this, the agent runs read() on a binary PNG, gets a UTF-8
     // decode error, and silently gives up — observed in
     // /tmp/nevoflux-debug.log: round 2 produces 0 text and 0 tool calls.
     promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+
+    // The mirror image of that, for providers whose prompt cannot carry a
+    // picture at all. An ACP turn is assembled by `build_acp_content*`, which
+    // emits text blocks and nothing else — and the ACP schema has no image
+    // type to emit even if it wanted to. A pasted or phone-sent picture
+    // therefore reaches the agent as no picture at all.
+    //
+    // Writing it to disk and naming the path gives the agent something it can
+    // act on: claude-code and its peers have their own file tools, and reading
+    // an image off disk is how they see one. Verified end-to-end from a phone:
+    // this is exactly the route the original-image channel already takes, and
+    // it is the only route by which a picture reaches an ACP model.
+    if config.llm.active_provider_is_acp() {
+        spill_attachments_to_local_files(&attachments[..from_the_wire], &mut local_files);
+    }
 
     info!(
         "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}, skill={:?}",
@@ -11659,6 +11678,77 @@ async fn gather_available_tools(services: &HostServices) -> Vec<String> {
 /// - Cap: skip files > 20 MB advertised; refuse promotion if even the
 ///   resized output exceeds 5 MB raw (the Anthropic-direct cap and a
 ///   reasonable upper bound for any proxy).
+/// Write wire-borne image attachments to disk and name them in `local_files`.
+///
+/// The counterpart to [`promote_image_local_files_to_attachments`], for
+/// providers whose prompt carries no image blocks. Only attachments that
+/// arrived on the wire are considered — the ones `promote` appended already
+/// have a `local_files` entry, and spilling those would write the same picture
+/// twice.
+///
+/// Failures are non-fatal and deliberately quiet at warn level: the attachment
+/// itself is untouched, so a provider that *can* read it still does. The spill
+/// only ever adds a way to reach the picture; it never takes one away.
+fn spill_attachments_to_local_files(
+    attachments: &[Attachment],
+    local_files: &mut Vec<nevoflux_protocol::FileInfo>,
+) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let already: std::collections::HashSet<&str> =
+        local_files.iter().map(|f| f.path.as_str()).collect();
+    let mut spilled: Vec<nevoflux_protocol::FileInfo> = Vec::new();
+
+    for att in attachments {
+        if !att.mime_type.starts_with("image/") {
+            continue;
+        }
+        let Ok(bytes) = STANDARD.decode(&att.data) else {
+            tracing::warn!(name = %att.name, "attachment was not valid base64; not spilling");
+            continue;
+        };
+        // The extension comes from the actual bytes, never from the declared
+        // name or mime — the same rule the upload path applies, for the same
+        // reason.
+        let Ok(fmt) = image::guess_format(&bytes) else {
+            tracing::warn!(name = %att.name, "attachment is not a recognisable image; not spilling");
+            continue;
+        };
+        let ext = fmt.extensions_str().first().copied().unwrap_or("bin");
+
+        let dir = crate::remote::upload::UploadStore::uploads_base().join("spill");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, "could not create the attachment spill directory");
+            return;
+        }
+        // Generated name. The caller-supplied one is a display string and has
+        // no business shaping a path.
+        let path = dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext));
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            tracing::warn!(error = %e, path = %path.display(), "could not spill an attachment");
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        if already.contains(path_str.as_str()) {
+            continue;
+        }
+        tracing::info!(
+            name = %att.name,
+            bytes = bytes.len(),
+            path = %path_str,
+            "spilled an attachment to disk so an ACP agent can read it"
+        );
+        spilled.push(nevoflux_protocol::FileInfo {
+            path: path_str,
+            is_directory: false,
+            size: Some(bytes.len() as u64),
+            modified: None,
+        });
+    }
+
+    local_files.extend(spilled);
+}
+
 fn promote_image_local_files_to_attachments(
     attachments: &mut Vec<Attachment>,
     local_files: &mut Vec<nevoflux_protocol::FileInfo>,
@@ -12472,6 +12562,98 @@ mod tests {
             "must shut down once idle and disarmed"
         );
         handle.abort();
+    }
+
+    /// A tiny real PNG, base64'd the way an attachment carries it.
+    fn png_attachment(name: &str) -> Attachment {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use image::{ImageBuffer, Rgb};
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(2, 2, Rgb([4, 5, 6]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        Attachment {
+            name: name.to_string(),
+            mime_type: "image/png".into(),
+            data: STANDARD.encode(out.into_inner()),
+        }
+    }
+
+    #[test]
+    fn spill_writes_the_picture_and_names_it_in_local_files() {
+        let att = png_attachment("shot.png");
+        let mut local_files: Vec<nevoflux_protocol::FileInfo> = Vec::new();
+        spill_attachments_to_local_files(std::slice::from_ref(&att), &mut local_files);
+
+        assert_eq!(local_files.len(), 1, "the picture should be reachable now");
+        let p = std::path::PathBuf::from(&local_files[0].path);
+        assert!(p.exists(), "spilled file missing: {p:?}");
+        assert!(!local_files[0].is_directory);
+        // The extension comes from the bytes, not the declared name.
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn spill_names_the_file_itself_never_the_caller_s_string() {
+        let mut att = png_attachment("../../../etc/passwd");
+        att.mime_type = "image/png".into();
+        let mut local_files: Vec<nevoflux_protocol::FileInfo> = Vec::new();
+        spill_attachments_to_local_files(std::slice::from_ref(&att), &mut local_files);
+
+        assert_eq!(local_files.len(), 1);
+        let p = std::path::PathBuf::from(&local_files[0].path);
+        let base = crate::remote::upload::UploadStore::uploads_base().join("spill");
+        assert!(p.starts_with(&base), "{p:?} escaped {base:?}");
+        assert!(!local_files[0].path.contains(".."));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn spill_skips_what_is_not_an_image() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let att = Attachment {
+            name: "notes.png".into(),
+            // Claims PNG; the bytes disagree, and the bytes decide.
+            mime_type: "image/png".into(),
+            data: STANDARD.encode(b"plain text, not an image"),
+        };
+        let mut local_files: Vec<nevoflux_protocol::FileInfo> = Vec::new();
+        spill_attachments_to_local_files(&[att], &mut local_files);
+        assert!(local_files.is_empty());
+    }
+
+    #[test]
+    fn spill_ignores_non_image_attachments_and_bad_base64() {
+        let mut local_files: Vec<nevoflux_protocol::FileInfo> = Vec::new();
+        spill_attachments_to_local_files(
+            &[
+                Attachment {
+                    name: "a.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    data: "AAAA".into(),
+                },
+                Attachment {
+                    name: "b.png".into(),
+                    mime_type: "image/png".into(),
+                    data: "!!!not base64!!!".into(),
+                },
+            ],
+            &mut local_files,
+        );
+        assert!(local_files.is_empty());
+    }
+
+    #[test]
+    fn an_acp_provider_is_recognised_by_name() {
+        assert!(crate::config::is_acp_provider("claude-code"));
+        assert!(crate::config::is_acp_provider("Claude_Code"));
+        assert!(crate::config::is_acp_provider("antigravity"));
+        // Direct-API providers must not be spilled to — they carry the image
+        // in the prompt themselves.
+        assert!(!crate::config::is_acp_provider("anthropic"));
+        assert!(!crate::config::is_acp_provider("openai"));
+        // An ACP worker that handles attachments on its own path.
+        assert!(!crate::config::is_acp_provider("kimi-agent"));
     }
 
     #[test]
