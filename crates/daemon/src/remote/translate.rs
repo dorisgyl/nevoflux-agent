@@ -318,6 +318,71 @@ fn to_value(msg: nevoflux_protocol::chat::SidebarMessage) -> Option<Value> {
 /// nothing else. Anything absent here is not translated at all.
 const PORTAL_QUERIES: &[&str] = &["skill.list", "soul.list", "tabs.list"];
 
+/// Shrink a caller-supplied filename to a bare display name.
+///
+/// Keeps only the last segment and strips path separators and `..`. The value
+/// lands in `Attachment.name` and in upload logs — it *never* takes part in
+/// building a path — but it is treated as hostile anyway: a string from a
+/// remote peer should not get the chance to become a traversal in some later
+/// concatenation.
+pub fn sanitize_display_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "image".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Split a `data:` URL into `(mime, base64 payload)`.
+///
+/// Only base64 image/* data URLs are accepted. `data:text/plain,hello` is
+/// percent-encoded, and putting those bytes into `Attachment.data` — whose
+/// contract is base64 — hands the model a corrupt image. Dropping the entry
+/// is the honest outcome.
+fn split_image_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, body) = rest.split_once(',')?;
+    if !meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    let mime = meta.split(';').next()?;
+    if !mime.starts_with("image/") || body.is_empty() {
+        return None;
+    }
+    Some((mime, body))
+}
+
+/// The portal's `{id, name, dataUrl}` → the daemon's `{name, mime_type, data}`.
+///
+/// Per-entry `filter_map`: one malformed attachment must not poison the whole
+/// message, which is how `server::handle_chat_message_streaming` parses these
+/// too.
+fn portal_attachments(frame: &Value) -> Vec<nevoflux_protocol::Attachment> {
+    frame
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let (mime, data) = split_image_data_url(a.get("dataUrl")?.as_str()?)?;
+                    let name = a.get("name").and_then(Value::as_str).unwrap_or("image");
+                    Some(nevoflux_protocol::Attachment {
+                        name: sanitize_display_name(name),
+                        mime_type: mime.to_string(),
+                        data: data.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Translate a portal `OutboundFrame` (JSON) into a daemon `SidebarMessage` for
 /// injection. `session_id` + `message_id` come from the gateway's session state
 /// (the portal frame doesn't carry them; the gateway generates `message_id`).
@@ -331,6 +396,7 @@ pub fn uplink(
     session_id: &str,
     message_id: &str,
     mode: Option<&str>,
+    local_files: &[nevoflux_protocol::FileInfo],
 ) -> Option<Value> {
     // Returns the serialized `{type, payload}` rather than a `SidebarMessage`,
     // because two of the things the daemon reads off a chat message live only
@@ -353,13 +419,29 @@ pub fn uplink(
                 // (no tools); hardcoding `agent` would silently upgrade one the
                 // user had left in `chat`.
                 mode: mode.map(str::to_string),
-                attachments: Vec::new(),
+                // The portal sends `{id, name, dataUrl}`; the daemon reads
+                // `{name, mime_type, data}`. The translation belongs here
+                // rather than in a looser downstream parse — that parse is
+                // shared with the local sidebar, which already sends the
+                // right shape.
+                attachments: portal_attachments(frame),
                 // `#` picks a tab to act on. Left as None the daemon falls back
                 // to the session's last known tabs.
                 tab_id: frame.get("tabId").and_then(Value::as_i64),
                 tab_ids: Vec::new(),
             });
             let mut v = serde_json::to_value(&msg).ok()?;
+            // The original-image channel: the gateway has already turned
+            // `uploads[]` into on-disk paths. The key stays off when there are
+            // none — `server.rs` reads it with `and_then`, so absent is fine.
+            if !local_files.is_empty() {
+                if let Some(p) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    p.insert(
+                        "local_files".into(),
+                        serde_json::to_value(local_files).ok()?,
+                    );
+                }
+            }
             // `@` picks a soul for this turn. The daemon reads
             // `payload.soul_mention.slug`, and a present-but-null value means
             // "clear it" — so the key is only attached when the portal said
@@ -629,6 +711,125 @@ mod tests {
     }
 
     #[test]
+    fn uplink_user_message_carries_an_image_attachment() {
+        let msg = uplink(
+            &json!({
+                "kind": "user_message",
+                "text": "解释一下附件图片",
+                "attachments": [
+                    { "id": "i1", "name": "shot.png", "dataUrl": "data:image/png;base64,AAAA" }
+                ]
+            }),
+            "sess-1",
+            "m1",
+            Some("agent"),
+            &[],
+        )
+        .expect("user_message must translate");
+        let a = &msg["payload"]["attachments"][0];
+        assert_eq!(a["name"], "shot.png");
+        assert_eq!(a["mime_type"], "image/png");
+        // Pure base64, never the `data:` prefix — `server.rs`'s filter_map
+        // reads exactly this shape.
+        assert_eq!(a["data"], "AAAA");
+    }
+
+    #[test]
+    fn uplink_drops_a_non_base64_data_url_but_keeps_the_rest() {
+        let msg = uplink(
+            &json!({
+                "kind": "user_message",
+                "text": "hi",
+                "attachments": [
+                    { "name": "bad.txt", "dataUrl": "data:text/plain,hello" },
+                    { "name": "good.jpg", "dataUrl": "data:image/jpeg;base64,BBBB" }
+                ]
+            }),
+            "s",
+            "m",
+            None,
+            &[],
+        )
+        .unwrap();
+        let arr = msg["payload"]["attachments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the bad one is skipped, the good one arrives");
+        assert_eq!(arr[0]["name"], "good.jpg");
+    }
+
+    #[test]
+    fn uplink_handles_charset_params_in_the_data_url_header() {
+        let msg = uplink(
+            &json!({
+                "kind": "user_message", "text": "hi",
+                "attachments": [{ "name": "a.webp", "dataUrl": "data:image/webp;charset=utf-8;base64,CCCC" }]
+            }),
+            "s",
+            "m",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(msg["payload"]["attachments"][0]["mime_type"], "image/webp");
+        assert_eq!(msg["payload"]["attachments"][0]["data"], "CCCC");
+    }
+
+    #[test]
+    fn uplink_sanitizes_a_traversing_display_name() {
+        let msg = uplink(
+            &json!({
+                "kind": "user_message", "text": "hi",
+                "attachments": [{ "name": "../../etc/passwd", "dataUrl": "data:image/png;base64,DDDD" }]
+            }),
+            "s",
+            "m",
+            None,
+            &[],
+        )
+        .unwrap();
+        let name = msg["payload"]["attachments"][0]["name"].as_str().unwrap();
+        assert!(
+            !name.contains('/') && !name.contains('\\') && !name.contains(".."),
+            "got {name}"
+        );
+    }
+
+    #[test]
+    fn uplink_emits_local_files_when_given_some() {
+        let files = vec![nevoflux_protocol::FileInfo {
+            path: "/tmp/nevoflux/a.jpg".into(),
+            is_directory: false,
+            size: Some(1234),
+            modified: None,
+        }];
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi", "uploads": ["u1"] }),
+            "s",
+            "m",
+            None,
+            &files,
+        )
+        .unwrap();
+        assert_eq!(
+            msg["payload"]["local_files"][0]["path"],
+            "/tmp/nevoflux/a.jpg"
+        );
+        assert_eq!(msg["payload"]["local_files"][0]["is_directory"], false);
+    }
+
+    #[test]
+    fn uplink_omits_local_files_when_there_are_none() {
+        let msg = uplink(
+            &json!({ "kind": "user_message", "text": "hi" }),
+            "s",
+            "m",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(msg["payload"].get("local_files").is_none());
+    }
+
+    #[test]
     fn uplink_user_message_becomes_chat_message() {
         use nevoflux_protocol::chat::SidebarMessage;
         let msg = uplink(
@@ -636,6 +837,7 @@ mod tests {
             "sess",
             "m1",
             Some("agent"),
+            &[],
         );
         match msg.as_ref().map(|v| &v["payload"]) {
             Some(c) => {
@@ -659,6 +861,7 @@ mod tests {
             "sess-1",
             "m1",
             Some("agent"),
+            &[],
         )
         .expect("user_message must translate");
         let v = serde_json::to_value(&msg).unwrap();
@@ -680,12 +883,14 @@ mod tests {
             "s",
             "m",
             None,
+            &[],
         );
         let no = uplink(
             &json!({ "kind": "plan_response", "approved": false }),
             "s",
             "m",
             None,
+            &[],
         );
         assert_eq!(yes.unwrap()["payload"]["response"], "confirmed");
         assert_eq!(no.unwrap()["payload"]["response"], "cancelled");
@@ -694,7 +899,7 @@ mod tests {
     #[test]
     fn uplink_cancel_becomes_stop_generation_for_the_gateway_session() {
         use nevoflux_protocol::chat::SidebarMessage;
-        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
+        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None, &[]).unwrap();
         assert_eq!(msg["type"], "stop_generation");
         assert_eq!(msg["payload"]["session_id"], "sess-1");
     }
@@ -709,6 +914,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(msg["type"], "stop_generation");
@@ -718,7 +924,7 @@ mod tests {
     #[test]
     fn uplink_cancel_serializes_to_the_shape_the_message_loop_reads() {
         // server.rs reads payload.payload.session_id off the raw envelope.
-        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None).unwrap();
+        let msg = uplink(&json!({ "kind": "cancel" }), "sess-1", "m", None, &[]).unwrap();
         let wire = msg.clone();
         assert_eq!(wire["type"], "stop_generation");
         assert_eq!(wire["payload"]["session_id"], "sess-1");
@@ -966,6 +1172,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(msg["type"], "plan_response");
@@ -997,6 +1204,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(msg["type"], "browser_tool_response");
@@ -1016,6 +1224,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         let wire = msg.clone();
@@ -1034,6 +1243,7 @@ mod tests {
             "sess-1",
             "m",
             Some("agent"),
+            &[],
         )
         .unwrap();
         assert_eq!(msg["payload"]["soul_mention"]["slug"], "writer");
@@ -1049,6 +1259,7 @@ mod tests {
             "s",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert!(msg["payload"].get("soul_mention").is_none());
@@ -1061,6 +1272,7 @@ mod tests {
             "s",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert!(msg["payload"]["soul_mention"].is_null());
@@ -1074,6 +1286,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(msg["type"], "system_command");
@@ -1092,6 +1305,7 @@ mod tests {
             "sess-1",
             "m",
             None,
+            &[],
         )
         .unwrap();
         let wire = msg.clone();
@@ -1114,7 +1328,8 @@ mod tests {
                     &json!({ "kind": "query", "id": "q", "name": name }),
                     "s",
                     "m",
-                    None
+                    None,
+                    &[]
                 )
                 .is_none(),
                 "{name} must not be reachable from a portal"
@@ -1125,7 +1340,8 @@ mod tests {
                 &json!({ "kind": "query", "id": "q", "name": name }),
                 "s",
                 "m",
-                None
+                None,
+                &[]
             )
             .is_some());
         }
@@ -1157,8 +1373,8 @@ mod tests {
 
     #[test]
     fn uplink_unknown_kind_is_none() {
-        assert!(uplink(&json!({ "kind": "nope" }), "s", "m", None).is_none());
-        assert!(uplink(&json!({ "text": "no kind" }), "s", "m", None).is_none());
+        assert!(uplink(&json!({ "kind": "nope" }), "s", "m", None, &[]).is_none());
+        assert!(uplink(&json!({ "text": "no kind" }), "s", "m", None, &[]).is_none());
     }
 
     /// Artifacts are not part of the daemon's real chat downlink — `server.rs`
