@@ -116,7 +116,7 @@ impl PortalSession {
     pub fn inbound(&self, w: &Wire, session_id: &str, message_id: &str) -> Inbound {
         match self.decode(w) {
             Some(WireMessage::Frame { frame, .. }) => {
-                match translate::uplink(&frame, session_id, message_id, self.mode.as_deref()) {
+                match translate::uplink(&frame, session_id, message_id, self.mode.as_deref(), &[]) {
                     Some(v) => Inbound::Uplink(v),
                     None => Inbound::Ignore,
                 }
