@@ -721,6 +721,14 @@ pub async fn start_server(
     };
     let bind_addr = format!("{}:{}", config.bind_address, port);
 
+    // Clear what a previous run left in the remote-upload staging area. A
+    // crash skips the per-session cleanup, and nobody would ever go looking
+    // for these by hand.
+    crate::remote::upload::UploadStore::sweep_orphans(
+        &crate::remote::upload::UploadStore::uploads_base(),
+        std::time::Duration::from_secs(24 * 60 * 60),
+    );
+
     // Bind TCP listener immediately so the port is actually open before we
     // advertise it via the port file. This prevents the bridge from getting
     // "connection refused" while we do slow initialization.

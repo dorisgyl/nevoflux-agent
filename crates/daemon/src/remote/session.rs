@@ -4,12 +4,13 @@
 //! optional channel key) and turns daemon chat into portal wire frames and back,
 //! with no async / socket / injection concerns. The async `RemoteGateway` impl
 //! and the tokio-tungstenite loop wrap this: `project` → [`on_chat`], the read
-//! loop → [`inbound`] / [`on_resume`]. Wire bytes match the portal
-//! `RelayChatTransport`: one WS message = one JSON `WireMessage`, AES-256-GCM
+//! loop → [`decode_wire`] + [`route`] / [`on_resume`]. Wire bytes match the
+//! portal `RelayChatTransport`: one WS message = one JSON `WireMessage`, AES-256-GCM
 //! sealed (nonce ‖ ciphertext‖tag) in E2E mode.
 //!
 //! [`on_chat`]: PortalSession::on_chat
-//! [`inbound`]: PortalSession::inbound
+//! [`decode_wire`]: PortalSession::decode_wire
+//! [`route`]: PortalSession::route
 //! [`on_resume`]: PortalSession::on_resume
 
 use nevoflux_protocol::chat::SidebarMessage;
@@ -37,6 +38,10 @@ pub enum Inbound {
     Uplink(serde_json::Value),
     /// The portal asks the daemon to resend from this seq.
     Resume(u64),
+    /// An `upload_*` frame. File IO belongs to the gateway (which owns the
+    /// `UploadStore`); this layer only classifies, so the sans-IO property
+    /// documented at the top of this module still holds.
+    Upload(Value),
     /// Nothing to do (unknown frame, decode failure, or a downlink-only variant).
     Ignore,
 }
@@ -111,20 +116,53 @@ impl PortalSession {
         }
     }
 
-    /// Route one inbound WS message. `session_id` + `message_id` come from the
-    /// gateway's session state (used to build a `ChatMessage` for injection).
-    pub fn inbound(&self, w: &Wire, session_id: &str, message_id: &str) -> Inbound {
-        match self.decode(w) {
-            Some(WireMessage::Frame { frame, .. }) => {
-                match translate::uplink(&frame, session_id, message_id, self.mode.as_deref(), &[]) {
+    /// Open one inbound WS message.
+    ///
+    /// Split from [`route`](Self::route) rather than done in one pass because
+    /// the gateway has to read `uploads[]` off the frame before it can resolve
+    /// the turn's `local_files` — and decrypting is something only this side
+    /// can do.
+    pub fn decode_wire(&self, w: &Wire) -> Option<WireMessage> {
+        self.decode(w)
+    }
+
+    /// Route one decoded message. `session_id` + `message_id` come from the
+    /// gateway's session state (used to build a `ChatMessage` for injection);
+    /// `local_files` is what the gateway resolved from the frame's `uploads[]`.
+    pub fn route(
+        &self,
+        msg: WireMessage,
+        session_id: &str,
+        message_id: &str,
+        local_files: &[nevoflux_protocol::FileInfo],
+    ) -> Inbound {
+        match msg {
+            WireMessage::Frame { frame, .. } => match frame.get("kind").and_then(Value::as_str) {
+                Some("upload_begin" | "upload_chunk" | "upload_end") => Inbound::Upload(frame),
+                _ => match translate::uplink(
+                    &frame,
+                    session_id,
+                    message_id,
+                    self.mode.as_deref(),
+                    local_files,
+                ) {
                     Some(v) => Inbound::Uplink(v),
                     None => Inbound::Ignore,
-                }
-            }
-            Some(WireMessage::Resume { from }) => Inbound::Resume(from),
+                },
+            },
+            WireMessage::Resume { from } => Inbound::Resume(from),
             // `Resync` is downlink-only; ignore if a peer ever sends it upstream.
-            _ => Inbound::Ignore,
+            WireMessage::Resync => Inbound::Ignore,
         }
+    }
+
+    /// A downlink `error` frame. The portal's reducer already renders these as
+    /// an ErrorCard — a failed upload should not vanish the way a dropped
+    /// attachment used to.
+    pub fn error_frame(&mut self, message: &str) -> Wire {
+        let frame = serde_json::json!({ "kind": "error", "message": message });
+        let wire = self.sequencer.tag(frame);
+        self.encode(&wire)
     }
 
     fn encode(&self, wire: &WireMessage) -> Wire {
@@ -230,17 +268,17 @@ mod tests {
         assert_eq!(seqs, vec![1, 2]);
     }
 
+    /// Wrap a business frame the way the portal sends one upstream.
+    fn frame_wire(frame: Value) -> Wire {
+        Wire::Text(serde_json::to_string(&WireMessage::Frame { seq: None, frame }).unwrap())
+    }
+
     #[test]
-    fn inbound_user_message_routes_to_uplink() {
+    fn decode_then_route_user_message_to_uplink() {
         let s = PortalSession::new(None, None, None);
-        let wire = Wire::Text(
-            serde_json::to_string(&WireMessage::Frame {
-                seq: None,
-                frame: json!({ "kind": "user_message", "text": "hi" }),
-            })
-            .unwrap(),
-        );
-        match s.inbound(&wire, "sess", "m1") {
+        let wire = frame_wire(json!({ "kind": "user_message", "text": "hi" }));
+        let msg = s.decode_wire(&wire).unwrap();
+        match s.route(msg, "sess", "m1", &[]) {
             Inbound::Uplink(v) => {
                 assert_eq!(v["type"], "chat_message");
                 // `content`, not `text`: the wire name the daemon parses.
@@ -252,9 +290,65 @@ mod tests {
     }
 
     #[test]
-    fn inbound_resume_is_routed() {
+    fn upload_frames_route_to_the_gateway_not_the_injector() {
+        let s = PortalSession::new(None, None, None);
+        for kind in ["upload_begin", "upload_chunk", "upload_end"] {
+            let wire = frame_wire(json!({ "kind": kind, "id": "u1" }));
+            let msg = s.decode_wire(&wire).unwrap();
+            match s.route(msg, "sess", "m", &[]) {
+                Inbound::Upload(f) => assert_eq!(f["kind"], kind),
+                other => panic!("{kind} should route to Upload, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn route_passes_resolved_local_files_through_to_the_uplink() {
+        let s = PortalSession::new(None, None, None);
+        let files = vec![nevoflux_protocol::FileInfo {
+            path: "/tmp/nevoflux/a.jpg".into(),
+            is_directory: false,
+            size: Some(7),
+            modified: None,
+        }];
+        let wire = frame_wire(json!({ "kind": "user_message", "text": "hi", "uploads": ["u1"] }));
+        let msg = s.decode_wire(&wire).unwrap();
+        match s.route(msg, "sess", "m", &files) {
+            Inbound::Uplink(v) => {
+                assert_eq!(
+                    v["payload"]["local_files"][0]["path"],
+                    "/tmp/nevoflux/a.jpg"
+                )
+            }
+            other => panic!("expected Uplink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_then_route_resume() {
         let s = PortalSession::new(None, None, None);
         let wire = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 4 }).unwrap());
-        assert_eq!(s.inbound(&wire, "sess", "m1"), Inbound::Resume(4));
+        let msg = s.decode_wire(&wire).unwrap();
+        assert_eq!(s.route(msg, "sess", "m1", &[]), Inbound::Resume(4));
+    }
+
+    #[test]
+    fn error_frame_is_seq_tagged_and_carries_the_message() {
+        let mut s = PortalSession::new(None, None, None);
+        let w = s.error_frame("upload failed");
+        let m: WireMessage = match &w {
+            Wire::Text(t) => serde_json::from_str(t).unwrap(),
+            _ => panic!("plaintext"),
+        };
+        match m {
+            WireMessage::Frame {
+                seq: Some(_),
+                frame,
+            } => {
+                assert_eq!(frame["kind"], "error");
+                assert_eq!(frame["message"], "upload failed");
+            }
+            other => panic!("expected a seq-tagged error frame, got {other:?}"),
+        }
     }
 }

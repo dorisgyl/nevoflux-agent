@@ -4,7 +4,7 @@
 //! projection logic (translate → seq-tag → encode) is unit-tested here and the
 //! concrete tokio-tungstenite send lands later as a `WireSink` impl. The read
 //! loop drives [`resume`](PortalGateway::resume) and uplink injection off
-//! [`PortalSession::inbound`].
+//! [`PortalSession::route`].
 
 use std::sync::Arc;
 
@@ -42,6 +42,27 @@ pub struct PortalGateway {
     /// other session's replies. Matching the id means a portal sees exactly the
     /// answers to questions it asked.
     pending_queries: Mutex<std::collections::HashSet<String>>,
+    /// This channel's staging area for original images sent from the phone.
+    uploads: Mutex<super::upload::UploadStore>,
+}
+
+/// How much disk one remote session may occupy. With a 20 MB per-image cap
+/// this allows a handful of pictures without letting a connected phone fill
+/// the cache volume.
+const UPLOAD_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The upload ids a frame declares. A non-string entry is skipped rather than
+/// failing the whole message.
+fn upload_ids(frame: &serde_json::Value) -> Vec<String> {
+    frame
+        .get("uploads")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl PortalGateway {
@@ -61,6 +82,69 @@ impl PortalGateway {
             session_id: session_id.into(),
             id: format!("portal:{channel_id}"),
             pending_queries: Mutex::new(std::collections::HashSet::new()),
+            uploads: Mutex::new(super::upload::UploadStore::new(
+                super::upload::UploadStore::root_for(channel_id),
+                UPLOAD_QUOTA_BYTES,
+            )),
+        }
+    }
+
+    /// Point the staging area at a temporary directory (tests only).
+    #[cfg(test)]
+    pub fn with_upload_root(self, root: std::path::PathBuf) -> Self {
+        Self {
+            uploads: Mutex::new(super::upload::UploadStore::new(root, UPLOAD_QUOTA_BYTES)),
+            ..self
+        }
+    }
+
+    /// End of session: remove everything this channel put on disk.
+    pub async fn cleanup_uploads(&self) {
+        self.uploads.lock().await.cleanup();
+    }
+
+    /// Apply one `upload_*` frame. A rejection goes back as an `error` frame so
+    /// the phone hears about it instead of watching the picture disappear.
+    async fn apply_upload(&self, frame: &serde_json::Value) {
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let mut store = self.uploads.lock().await;
+        store.sweep(super::upload::PENDING_TTL);
+        let outcome = match frame.get("kind").and_then(|v| v.as_str()) {
+            Some("upload_begin") => store.begin(
+                id,
+                frame
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image"),
+                frame.get("mimeType").and_then(|v| v.as_str()).unwrap_or(""),
+                // A frame with no size is treated as impossibly large rather
+                // than unlimited: the ceiling check then refuses it.
+                frame
+                    .get("size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX),
+                frame.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            ),
+            Some("upload_chunk") => store.chunk(
+                id,
+                // Likewise: a missing seq can never equal the expected one.
+                frame
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX as u64) as u32,
+                frame.get("data").and_then(|v| v.as_str()).unwrap_or(""),
+            ),
+            Some("upload_end") => store.finish(
+                id,
+                frame.get("sha256").and_then(|v| v.as_str()).unwrap_or(""),
+            ),
+            _ => Ok(()),
+        };
+        drop(store);
+        if let Err(e) = outcome {
+            tracing::warn!(target: "remote", id, error = %e, "remote upload rejected");
+            let wire = self.session.lock().await.error_frame(&e.to_string());
+            self.sink.send(wire).await;
         }
     }
 
@@ -84,13 +168,30 @@ impl PortalGateway {
     /// Route one inbound WS message (the read loop's core): decode → inject an
     /// uplink `SidebarMessage` via `injector`, honor a `resume`, or ignore.
     pub async fn on_wire_in(&self, wire: Wire, session_id: &str, injector: &dyn Injector) {
+        let Some(msg) = self.session.lock().await.decode_wire(&wire) else {
+            return;
+        };
+        // Peek at the frame before routing: knowing whether it names any
+        // uploads is what decides if the turn needs `local_files`, and only
+        // the session can decrypt far enough to tell.
+        let ids = match &msg {
+            super::relay_protocol::WireMessage::Frame { frame, .. } => upload_ids(frame),
+            _ => Vec::new(),
+        };
+        let local_files = if ids.is_empty() {
+            Vec::new()
+        } else {
+            self.uploads.lock().await.resolve(&ids)
+        };
+
         let message_id = uuid::Uuid::new_v4().to_string();
         let routed = self
             .session
             .lock()
             .await
-            .inbound(&wire, session_id, &message_id);
+            .route(msg, session_id, &message_id, &local_files);
         match routed {
+            Inbound::Upload(frame) => self.apply_upload(&frame).await,
             Inbound::Uplink(payload) => {
                 // Remember what we asked, so the reply can be recognised as
                 // ours when it comes back without a session id.
@@ -220,6 +321,94 @@ mod tests {
 
     fn chat_env(content: &str, done: bool) -> DaemonEnvelope {
         chat_env_for("sess", content, done)
+    }
+
+    #[test]
+    fn upload_ids_are_read_off_the_frame() {
+        assert_eq!(
+            upload_ids(&serde_json::json!({ "uploads": ["a", "b"] })),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(upload_ids(&serde_json::json!({})).is_empty());
+        // A non-string entry is skipped rather than failing the message.
+        assert_eq!(
+            upload_ids(&serde_json::json!({ "uploads": ["a", 7] })),
+            vec!["a".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_upload_reaches_the_injector_as_a_local_file() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink, "sess", Some("agent".into()), None, "chan")
+            .with_upload_root(dir.path().to_path_buf());
+
+        let png = {
+            use image::{ImageBuffer, Rgb};
+            let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(1, 1, Rgb([9, 9, 9]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let inj = CollectInjector::default();
+
+        for frame in [
+            serde_json::json!({ "kind": "upload_begin", "id": "u1", "name": "p.png",
+                                "mimeType": "image/png", "size": png.len(), "chunks": 1 }),
+            serde_json::json!({ "kind": "upload_chunk", "id": "u1", "seq": 0,
+                                "data": STANDARD.encode(&png) }),
+            serde_json::json!({ "kind": "upload_end", "id": "u1",
+                                "sha256": hex::encode(Sha256::digest(&png)) }),
+            serde_json::json!({ "kind": "user_message", "text": "看这张", "uploads": ["u1"] }),
+        ] {
+            gw.on_wire_in(frame_wire(frame), "sess", &inj).await;
+        }
+
+        let got = inj.injected.lock().await.clone();
+        assert_eq!(got.len(), 1, "only the user_message should be injected");
+        let lf = &got[0]["payload"]["local_files"][0];
+        assert_eq!(lf["is_directory"], false);
+        assert!(std::path::Path::new(lf["path"].as_str().unwrap()).exists());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_tells_the_phone_instead_of_going_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan")
+            .with_upload_root(dir.path().to_path_buf());
+        let inj = CollectInjector::default();
+
+        // A chunk for an upload that never began.
+        gw.on_wire_in(
+            frame_wire(
+                serde_json::json!({ "kind": "upload_chunk", "id": "ghost", "seq": 0, "data": "AAAA" }),
+            ),
+            "sess",
+            &inj,
+        )
+        .await;
+
+        let sent = sink.sent.lock().await.clone();
+        let frames: Vec<serde_json::Value> = sent
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<serde_json::Value>(t).ok(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            frames.iter().any(|f| f["frame"]["kind"] == "error"),
+            "an error frame should have gone downlink, got {frames:?}"
+        );
+        assert!(
+            inj.injected.lock().await.is_empty(),
+            "nothing should be injected"
+        );
     }
 
     #[tokio::test]

@@ -120,14 +120,17 @@ pub async fn run_gateway(
     let mut backoff_ms = 500u64;
     let mut failures = 0u32;
 
-    loop {
+    // Uploads are cleaned up when this gateway gives up for good — never on a
+    // disconnect. A dropped socket is followed by a reconnect, and the pictures
+    // the phone already sent are still what the conversation is about.
+    'gateway: loop {
         // Re-mint per attempt; a cached JWT expires after 15 minutes.
         let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "remote", "mint relay JWT failed: {e}");
                 if !retry(&mut failures, &mut backoff_ms, &registry, &gateway_id).await {
-                    return;
+                    break 'gateway;
                 }
                 continue;
             }
@@ -164,11 +167,12 @@ pub async fn run_gateway(
             Err(e) => {
                 tracing::warn!(target: "remote", "relay connect failed: {e}");
                 if !retry(&mut failures, &mut backoff_ms, &registry, &gateway_id).await {
-                    return;
+                    break 'gateway;
                 }
             }
         }
     }
+    gateway.cleanup_uploads().await;
 }
 
 /// How many consecutive failed attempts before a gateway gives up and
