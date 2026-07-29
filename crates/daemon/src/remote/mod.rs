@@ -15,6 +15,7 @@ pub mod inject;
 pub mod portal_gateway;
 pub mod relay_protocol;
 pub mod session;
+pub mod start;
 pub mod translate;
 pub mod upload;
 pub mod ws;

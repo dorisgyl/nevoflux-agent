@@ -8130,54 +8130,12 @@ async fn handle_chat_message(
                         .get("mode")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    // Load the account token (daemon-held); refuse if not logged in.
-                    let account_token = {
-                        use crate::remote::account::TokenStore;
-                        let store = crate::remote::account::FileTokenStore::new(
-                            crate::paths::resolve_from_daemon()
-                                .data_dir
-                                .join("account-token"),
-                        );
-                        match store.load() {
-                            Ok(Some(t)) => t,
-                            _ => {
-                                return serde_json::json!({
-                                    "type": "system_response",
-                                    "payload": {
-                                        "request_id": request_id,
-                                        "command": "remote.start",
-                                        "success": false,
-                                        "error": { "code": "NOT_LOGGED_IN", "message": "log in first" }
-                                    }
-                                });
-                            }
-                        }
-                    };
-                    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-                        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-                    let jwt = match crate::remote::account::mint_do_jwt(&base, &account_token).await
-                    {
-                        Ok(j) => j,
-                        Err(e) => {
-                            return serde_json::json!({
-                                "type": "system_response",
-                                "payload": {
-                                    "request_id": request_id,
-                                    "command": "remote.start",
-                                    "success": false,
-                                    "error": { "code": "JWT_MINT_ERROR", "message": e.to_string() }
-                                }
-                            });
-                        }
-                    };
-                    // Channel id + human-speakable pairing code + derived E2E key.
+                    // Channel id + human-speakable pairing code. The sequence
+                    // that turns them into a live channel is shared with the
+                    // headless `--remote-control` service — see
+                    // `remote::start`, which exists so the two cannot drift.
                     let channel_id = uuid::Uuid::new_v4().to_string();
                     let pairing = crate::share::password::generate_password();
-                    let key = crate::remote::crypto::derive_channel_key(&pairing, &channel_id).ok();
-
-                    // Build the gateway over a swappable WS sink, register it so
-                    // the M2 tap can fan_out to it, then spawn the transport.
-                    let sink = Arc::new(crate::remote::ws::WsSink::new());
                     // Snapshot the Agent-execution tier for this session so the
                     // portal can show what the remote head would actually run.
                     // `resolve_execution_tier` keys off `services.session_id`,
@@ -8187,61 +8145,48 @@ async fn handle_chat_message(
                     )
                     .as_setting()
                     .to_string();
-                    let gateway = Arc::new(crate::remote::portal_gateway::PortalGateway::new(
-                        key,
-                        sink.clone(),
-                        session_id.clone(),
-                        mode,
-                        Some(execution_tier),
-                        &channel_id,
-                    ));
-                    match (&services.remote_registry, &services.remote_msg_tx) {
-                        (Some(registry), Some(msg_tx)) => {
-                            registry.lock().await.register(gateway.clone());
-                            let injector: Arc<dyn crate::remote::inject::Injector> =
-                                Arc::new(crate::remote::inject::ChannelInjector::new(
-                                    msg_tx.clone(),
-                                    _proxy_id.clone(),
-                                ));
-                            // The product's own zone, not `*.workers.dev`: that
-                            // host is firewall-blocked on some networks, and the
-                            // block is invisible from the portal side (the token
-                            // fetch dies before the socket is opened, so nothing
-                            // is ever attempted and nothing is logged).
-                            let relay = std::env::var("NEVOFLUX_RELAY_URL")
-                                .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
-                            // The JWT is re-minted per connect attempt inside the
-                            // loop, so hand it the account credentials, not a
-                            // token that expires in 15 minutes.
-                            let (ch, sid) = (channel_id.clone(), session_id.clone());
-                            let (acct_base, acct_token) = (base.clone(), account_token.clone());
-                            let reg = registry.clone();
-                            tokio::spawn(async move {
-                                crate::remote::ws::run_gateway(
-                                    &relay, &ch, acct_base, acct_token, sid, injector, sink,
-                                    gateway, reg,
-                                )
-                                .await;
-                            });
-                            serde_json::json!({
-                                "type": "system_response",
-                                "payload": {
-                                    "request_id": request_id,
-                                    "command": "remote.start",
-                                    "success": true,
-                                    "data": { "channel_id": channel_id, "pairing_code": pairing }
-                                }
-                            })
-                        }
-                        _ => serde_json::json!({
+
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
                             "type": "system_response",
                             "payload": {
                                 "request_id": request_id,
                                 "command": "remote.start",
                                 "success": false,
-                                "error": { "code": "REMOTE_NOT_WIRED", "message": "remote gateway not configured" }
+                                "error": { "code": code, "message": message }
                             }
-                        }),
+                        })
+                    };
+
+                    match (&services.remote_registry, &services.remote_msg_tx) {
+                        (Some(registry), Some(msg_tx)) => {
+                            let req = crate::remote::start::ChannelRequest {
+                                channel_id: channel_id.clone(),
+                                pairing_code: pairing.clone(),
+                                session_id,
+                                mode,
+                                execution_tier: Some(execution_tier),
+                                injector_proxy_id: _proxy_id.clone(),
+                            };
+                            match crate::remote::start::open_channel(req, registry, msg_tx).await {
+                                Ok(_gateway) => serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "remote.start",
+                                        "success": true,
+                                        "data": { "channel_id": channel_id, "pairing_code": pairing }
+                                    }
+                                }),
+                                Err(e @ crate::remote::start::OpenError::NotLoggedIn) => {
+                                    fail("NOT_LOGGED_IN", e.to_string())
+                                }
+                                Err(e @ crate::remote::start::OpenError::JwtMint(_)) => {
+                                    fail("JWT_MINT_ERROR", e.to_string())
+                                }
+                            }
+                        }
+                        _ => fail("REMOTE_NOT_WIRED", "remote gateway not configured".into()),
                     }
                 }
                 "content_store.delete" => {
