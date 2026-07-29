@@ -5960,6 +5960,26 @@ async fn handle_chat_message_streaming(
         .with_client_context(identity.clone(), proxy_id.clone())
         .with_session_id(session_id.clone());
 
+    // A session with a browser of its own routes `browser_*` there rather than
+    // back at whoever sent the message. On the desktop the sender IS the
+    // browser and this table is empty; for a headless head the sender is a
+    // synthetic proxy with no writer behind it, so without this every
+    // `browser_*` call would be dropped at the writer lookup.
+    //
+    // Only tool dispatch moves. `stream_identity` below was captured from this
+    // function's own `identity`, so the turn's chat frames still leave under
+    // the sender and reach a portal through the M2 tap.
+    if let Some(bindings) = crate::registry::CURRENT_SESSION_BINDINGS.get() {
+        if let Some(entry) = bindings.get(&session_id) {
+            info!(
+                session_id = %session_id,
+                bound_browser = %entry.proxy_id,
+                "chat turn routed to the session's bound browser"
+            );
+            services_with_context = services_with_context.with_bound_browser(&entry);
+        }
+    }
+
     // Create a per-session interrupt flag and register it so stop_generation can find it
     let session_interrupt_flag = Arc::new(AtomicBool::new(false));
     services_with_context.interrupt_flag = session_interrupt_flag.clone();
