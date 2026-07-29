@@ -46,6 +46,14 @@ impl Translator {
                     .unwrap_or("Request failed");
                 vec![json!({ "kind": "error", "message": message })]
             }
+            // The session's contents are gone, so the phone's copy has to go
+            // too. The synthesized stream identity resets along with it: a
+            // clear usually follows a turn, and a stale `streamId` would hang
+            // the next turn's deltas off a message that no longer exists.
+            Some("session_cleared") => {
+                self.current_stream = None;
+                vec![json!({ "kind": "session_cleared" })]
+            }
             // A stopped turn ends here and nowhere else. `stop_generation`
             // cancels the stream forwarder, so the `done:true` chunk that
             // normally closes a turn is never sent — deliberately.
@@ -707,6 +715,36 @@ mod tests {
         assert_eq!(
             t.downlink(&chunk("", false)),
             vec![json!({ "kind": "stream_start", "streamId": "s0" })]
+        );
+    }
+
+    #[test]
+    fn downlink_session_cleared_reaches_the_phone() {
+        let mut t = Translator::new();
+        assert_eq!(
+            t.downlink(&json!({
+                "type": "session_cleared",
+                "payload": { "session_id": "s", "messages": 3, "artifacts": 0 }
+            })),
+            vec![json!({ "kind": "session_cleared" })]
+        );
+    }
+
+    #[test]
+    fn a_cleared_session_opens_a_fresh_stream_for_the_next_turn() {
+        // Clearing usually follows a turn. Keeping the old synthesized stream
+        // id would hang the next turn's deltas off a message that was just
+        // deleted.
+        let mut t = Translator::new();
+        t.downlink(&chunk("hi", false));
+        t.downlink(&json!({
+            "type": "session_cleared",
+            "payload": { "session_id": "s" }
+        }));
+        let after = t.downlink(&chunk("next", false));
+        assert_eq!(
+            after[0]["kind"], "stream_start",
+            "a turn after a clear must open a new stream"
         );
     }
 
