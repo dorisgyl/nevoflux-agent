@@ -108,7 +108,13 @@ RUN if [ "$INSTALL_GBRAIN" = "1" ]; then set -eu; \
       echo "gbrain installed ($GBRAIN_PIN); brain enabled; [llm].provider=$LLM_PROVIDER (key from *_API_KEY env at runtime)"; \
     fi
 
-VOLUME ["/work"]
+# /work drains task results. /var/nevoflux/data holds the daemon database and —
+# for --remote-control — the channel identity (pairing code included) plus that
+# head's browser profile. Mount it on a real volume for that mode: on a tmpfs,
+# as the task service below does, the pairing is destroyed every time the
+# container stops, and a phone that was paired can only report that it no
+# longer connects.
+VOLUME ["/work", "/var/nevoflux/data"]
 
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/entrypoint.sh"]
 # Long-running service (serves the task API); for untrusted use `run --task` one-shot.

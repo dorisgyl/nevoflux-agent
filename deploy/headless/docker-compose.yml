@@ -135,7 +135,66 @@ services:
           memory: 4g
           pids: 512          # merged from pids_limit (compose v2 rejects both set distinctly)
 
+  # ---- Remote control: drive this container from a phone ---------------------
+  # `docker compose --profile remote up remote`
+  #
+  # Prints a connect block on startup — link + pairing code — that you paste
+  # whole into the portal on your phone. Serves NO HTTP: the relay socket is
+  # the only outward face, so there is nothing to publish and no port to guard.
+  #
+  #   THE PAIRING CODE IS THE ONLY SECRET. Whoever has it drives this container
+  #   with whatever NEVOFLUX_REMOTE_MODE / NEVOFLUX_REMOTE_EXECUTION_TIER grant
+  #   is set below. Read it out of `docker compose logs remote` once, and keep
+  #   it the way you would keep a password.
+  remote:
+    profiles: ["remote"]
+    image: nevoflux/agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["--daemon", "--remote-control"]
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (or your provider's key)}"
+      # What this head is set to. Fixed at startup: the phone displays these and
+      # cannot raise them, because a container has no local user standing by to
+      # take a grant back. Omit both to take [remote_control] from config.toml,
+      # or the built-in defaults (agent / read-only).
+      NEVOFLUX_REMOTE_MODE: "agent"
+      NEVOFLUX_REMOTE_EXECUTION_TIER: "browser-auto"
+      RUST_LOG: "info"
+      # NEVOFLUX_PORTAL_URL: "https://portal.nevoflux.app"
+      # NEVOFLUX_RELAY_URL:  "wss://relay.nevoflux.app"
+    volumes:
+      # REQUIRED, and deliberately NOT a tmpfs. Holds remote-control.json (the
+      # channel and its pairing code), this head's browser profile, and the
+      # conversation. Without it every restart is a different head and the
+      # paired phone simply stops working.
+      - remote-data:/var/nevoflux/data
+      # The nevoflux account token, read-only. A mounted file rather than an
+      # environment variable on purpose: the agent's own `bash` runs inside
+      # this process and can read its environment.
+      - ./account-token:/var/nevoflux/data/account-token:ro
+      - ./out:/work
+    tmpfs:
+      - /tmp
+      - /home/nevo/.gbrain
+      - /home/nevo/.cache
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+          pids: 512
+    restart: unless-stopped
+
 volumes:
+  remote-data:
+    # This head's identity, browser profile and history. Deleting this volume
+    # un-pairs every phone that was paired with it.
   base-profiles:
     # Populate once with pre-authenticated profiles (a human logs in), then clone
     # per task. `external: true` to reuse an existing named volume.
