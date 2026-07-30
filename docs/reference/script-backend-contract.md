@@ -102,6 +102,36 @@ concatenated increments are used only when it is absent.
 When no delta channel is attached (running the script from the CLI, say) both
 functions are no-ops, so a script never breaks with "function not defined".
 
+## 4b. Browser tool result envelopes
+
+Getting an envelope wrong is **silent**: the unwrap yields nothing and the
+backend reports "not found" instead of "I misread the result". These were
+verified against a running browser:
+
+| call | result |
+|---|---|
+| `browser_navigate` | `{"tab_id": N, "url": ..., "new_tab": bool}` |
+| `browser_get_tabs` | `{"tabs": [{id, url, title, active, ...}]}` |
+| `browser_query_all` | `{"count": N, "elements": [{tag, id, text, visible, path_selector}]}` |
+| `browser_get_markdown` | `{"markdown", "success", "title", "url"}` |
+| `browser_get_elements` | `{"element_count", "refs", "stats", "title", "tree", "url"}` |
+| any failure | `{"__tool_error": true, "error": "..."}` |
+
+Two properties that bite in practice: `elements[].text` is **truncated to 100
+characters** and carries **no href**, and `browser_get_markdown` returns an
+empty `markdown` for script-heavy pages even though `success` is `true` and the
+title/url are correct — so prefer `browser_query_all` for extraction and treat
+markdown as a convenience.
+
+Argument names matter as much: `browser_wait_for` only forwards `selector` and
+`timeout_ms` (a `state` argument is silently dropped), and
+`browser_wait_for_stable` takes `strategy` / `max_wait`, not `timeout_ms`.
+
+**The post-navigation actor swap.** Right after `browser_navigate`, a query can
+fail with `Actor 'Nevoflux' destroyed before query 'execute' was resolved`: the
+content actor for the old document is torn down when the new one commits.
+It is transient — retry and the call binds to the new actor.
+
 ## 5. Legacy behaviour
 
 The return value of `run(task)` is passed through **as is**: a string is taken

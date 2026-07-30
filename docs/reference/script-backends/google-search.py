@@ -2,19 +2,18 @@
 #
 # Turns the headless OpenAI endpoint into a search tool: the user message is the
 # query, the reply is the result list. Demonstrates the whole contract —
-# `chat(request)`, progress notes, incremental text, and contract-shaped errors.
+# `chat(request)`, progress notes, incremental text, contract-shaped errors.
 #
 # Install:
-#   NEVOFLUX_OPENAI_MODELS='google-search=/opt/nevoflux/google-search.py'
+#   NEVOFLUX_OPENAI_MODELS='google-search=/opt/nevoflux/scripts/google-search.py'
 #
-# Then any OpenAI client works:
 #   curl localhost:8081/v1/chat/completions -H 'content-type: application/json' \
 #     -d '{"model":"google-search","messages":[{"role":"user","content":"rust async runtime"}]}'
 #
-# Selectors rot as Google ships UI changes. When that happens the returned
-# `message` names the step that failed — fix that step, not the whole script.
-
-# ---- Copied from webui_backend.py (Monty has no module system) ---------------
+# It navigates straight to the results URL instead of driving the homepage.
+# Filling the search box means fighting the autocomplete dropdown, the consent
+# interstitial, and a homepage whose body is mostly inline script — none of
+# which say anything about the search results we actually want.
 
 
 def is_err(r):
@@ -23,51 +22,76 @@ def is_err(r):
 
 
 def fail(step, label, err):
-    """Build a contract error. `step`/`label` make the failure locatable —
-    a scraping backend WILL rot, so saying which step died matters more than
-    anything else in the message."""
+    """Contract error. The step number is what makes a rotted selector
+    diagnosable — a scraping backend WILL rot."""
     detail = err.get("error", "failed") if isinstance(err, dict) else str(err)
     return {
         "error": {
-            "message": "step %s (%s) failed: %s" % (step, label, detail),
+            # Monty has no `str % tuple` formatting — concatenate instead.
+            "message": "step " + str(step) + " (" + label + ") failed: " + str(detail),
             "type": "server_error",
             "code": "script_step_failed",
         }
     }
 
 
-def fill_first(selectors, text, tab_id):
-    """Try each input selector in turn; return the one that worked, else None.
-    A single selector is too brittle — the same page ships different markup to
-    different locales and experiment buckets."""
-    for sel in selectors:
-        r = browser_input(selector=sel, text=text, mode="fill", verify=True, tab_id=tab_id)
-        if not is_err(r):
-            return sel
-    return None
+def actor_gone(r):
+    """True for the transient that follows a navigation: the content actor for
+    the old document is destroyed when the new one commits, so a query issued
+    across that boundary dies with 'Actor ... destroyed before query'. Retrying
+    binds to the new actor."""
+    return is_err(r) and "destroyed before query" in str(r.get("error", ""))
 
 
-def query_visible(selector, tab_id):
-    """Return the visible elements matching `selector`.
+def wait_for(selector, tab_id, timeout_ms, attempts=3):
+    """browser_wait_for, retried past the post-navigation actor swap."""
+    r = None
+    for _ in range(attempts):
+        r = browser_wait_for(selector=selector, timeout_ms=timeout_ms, tab_id=tab_id)
+        if not actor_gone(r):
+            return r
+    return r
 
-    `browser_query_all` yields dicts shaped
-    `{tag, id, text, visible, path_selector}` — note there is **no href**, and
-    `text` is truncated to 100 characters. If you need URLs, parse
-    `browser_get_markdown` instead.
+
+def query_all(selector, tab_id):
+    """Visible elements matching `selector`.
+
+    `browser_query_all` answers `{"count": N, "elements": [...]}`, and each
+    element is `{tag, id, text, visible, path_selector}` — no href, and `text`
+    is truncated to 100 characters.
     """
     r = browser_query_all(selector=selector, tab_id=tab_id)
-    if is_err(r):
+    if is_err(r) or not isinstance(r, dict):
         return []
-    items = r.get("result", r) if isinstance(r, dict) else r
+    items = r.get("elements", [])
     if not isinstance(items, list):
         return []
     return [el for el in items if el.get("visible")]
 
 
-# ---- The backend -------------------------------------------------------------
+# Percent-encoding by hand: Monty has no urllib. Covers what a search query
+# realistically contains; anything else is passed through, which Google
+# tolerates for ordinary text.
+SAFE_ESCAPES = {
+    " ": "+",
+    "&": "%26",
+    "?": "%3F",
+    "#": "%23",
+    "+": "%2B",
+    "%": "%25",
+    "/": "%2F",
+    '"': "%22",
+    "'": "%27",
+}
 
-# Google serves different markup per locale/experiment; try each in order.
-QUERY_SELECTORS = ["textarea[name='q']", "input[name='q']", "[aria-label='Search']"]
+
+def encode_query(text):
+    out = ""
+    for ch in text:
+        out = out + SAFE_ESCAPES.get(ch, ch)
+    return out
+
+
 RESULTS_READY = "#search"
 TITLE_SELECTORS = ["#search h3", "#rso h3", "h3"]
 
@@ -83,58 +107,51 @@ def chat(request):
             }
         }
 
-    emit_progress("opening google.com")
-    nav = browser_navigate(url="https://www.google.com")
+    url = "https://www.google.com/search?q=" + encode_query(query)
+    emit_progress("searching")
+    nav = browser_navigate(url=url)
     if is_err(nav):
-        return fail(1, "navigate to google.com", nav)
+        return fail(1, "navigate to the results URL", nav)
     tab = nav["tab_id"]
 
-    # navigate opens an INACTIVE tab; activate it so interactions land there.
+    # navigate opens an INACTIVE tab; activate it so later reads land there.
     browser_activate_tab(tab_id=tab)
 
-    emit_progress("typing the query")
-    browser_wait_for(selector=QUERY_SELECTORS[0], timeout_ms=10000, tab_id=tab)
-    if fill_first(QUERY_SELECTORS, query, tab) is None:
-        return fail(2, "fill the search box", "all selectors failed")
-
-    emit_progress("submitting")
-    # Enter beats clicking the button: the button is sometimes covered by the
-    # autocomplete dropdown that opens as soon as the box is filled.
-    r = browser_key_press(key="Enter", tab_id=tab)
-    if is_err(r):
-        return fail(3, "submit the search", r)
-
     emit_progress("waiting for results")
-    ready = browser_wait_for(selector=RESULTS_READY, timeout_ms=15000, tab_id=tab)
-    if is_err(ready):
-        return fail(4, "wait for the results container", ready)
-    browser_wait_for_stable(tab_id=tab, max_wait=5000)
+    # Waiting is an optimisation, not the verdict: if the container is served a
+    # consent page or different markup, #search never appears and bailing here
+    # would hide what the page actually was. Extraction below is the real check.
+    if is_err(wait_for(RESULTS_READY, tab, 15000)):
+        emit_progress("results container never appeared; extracting anyway")
 
     titles = []
     for sel in TITLE_SELECTORS:
-        titles = query_visible(sel, tab)
+        titles = query_all(sel, tab)
         if titles:
             break
     if not titles:
-        return fail(5, "extract result titles", "no visible h3 under the results container")
+        # Say what the page was: "no titles" alone cannot distinguish a layout
+        # change from a consent interstitial or a bot check.
+        head = query_all("body", tab)
+        body = head[0].get("text", "") if head else "<no body>"
+        return fail(3, "extract result titles", "no visible h3; body starts: " + str(body))
 
-    # Emit each result as it is read. The client sees the list build up rather
-    # than waiting in silence for the whole page to be parsed.
     lines = []
     for i in range(len(titles)):
         text = (titles[i].get("text") or "").strip()
         if not text:
             continue
-        line = "%d. %s" % (len(lines) + 1, text)
+        line = str(len(lines) + 1) + ". " + text
         lines.append(line)
+        # Emit as each result is read: the client watches the list build up
+        # instead of waiting in silence.
         emit_text(line + "\n")
         if len(lines) >= 10:
             break
 
     if not lines:
-        return fail(5, "extract result titles", "every matched title was empty")
+        return fail(3, "extract result titles", "every matched title was empty")
 
-    # The explicit return wins over the emitted increments, so build the same
-    # text here — returning something different would make the streamed and
-    # non-streamed responses disagree.
+    # The explicit return wins over the emitted increments, so it must be the
+    # same text — otherwise streaming and non-streaming clients disagree.
     return {"content": "\n".join(lines)}

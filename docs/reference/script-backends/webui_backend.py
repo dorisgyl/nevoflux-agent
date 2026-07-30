@@ -24,7 +24,8 @@ def fail(step, label, err):
     detail = err.get("error", "failed") if isinstance(err, dict) else str(err)
     return {
         "error": {
-            "message": "step %s (%s) failed: %s" % (step, label, detail),
+            # Monty has no `str % tuple` formatting — concatenate instead.
+            "message": "step " + str(step) + " (" + label + ") failed: " + str(detail),
             "type": "server_error",
             "code": "script_step_failed",
         }
@@ -51,10 +52,17 @@ def fill_first(selectors, text, tab_id):
     return None
 
 
-def wait_any(selectors, tab_id, timeout_ms=5000):
-    """Wait until any one of `selectors` is visible; return it, else None."""
+def wait_any(selectors, tab_id, timeout_ms=5000, attempts=3):
+    """Wait until any one of `selectors` is visible; return it, else None.
+
+    Retries past the post-navigation actor swap (see `actor_gone`), which would
+    otherwise surface as a spurious "not found" right after `browser_navigate`.
+    """
     for sel in selectors:
-        r = browser_wait_for(selector=sel, timeout_ms=timeout_ms, tab_id=tab_id)
+        for _ in range(attempts):
+            r = browser_wait_for(selector=sel, timeout_ms=timeout_ms, tab_id=tab_id)
+            if not actor_gone(r):
+                break
         if not is_err(r):
             return sel
     return None
@@ -63,18 +71,37 @@ def wait_any(selectors, tab_id, timeout_ms=5000):
 def query_visible(selector, tab_id):
     """Return the visible elements matching `selector`.
 
-    `browser_query_all` yields dicts shaped
-    `{tag, id, text, visible, path_selector}` — note there is **no href**, and
-    `text` is truncated to 100 characters. If you need URLs or long text, parse
-    `browser_get_markdown` instead.
+    Envelope (verified against a running browser): `browser_query_all` answers
+    `{"count": N, "elements": [...]}`, each element being
+    `{tag, id, text, visible, path_selector}` — **no href**, and `text` is
+    truncated to 100 characters. Getting this envelope wrong is silent: the
+    unwrap yields nothing and the backend just reports "not found".
     """
     r = browser_query_all(selector=selector, tab_id=tab_id)
-    if is_err(r):
+    if is_err(r) or not isinstance(r, dict):
         return []
-    items = r.get("result", r) if isinstance(r, dict) else r
+    items = r.get("elements", [])
     if not isinstance(items, list):
         return []
     return [el for el in items if el.get("visible")]
+
+
+def list_tabs():
+    """Open tabs. `browser_get_tabs` answers `{"tabs": [...]}`; each tab is
+    `{id, url, title, active, ...}`."""
+    r = browser_get_tabs()
+    if is_err(r) or not isinstance(r, dict):
+        return []
+    items = r.get("tabs", [])
+    return items if isinstance(items, list) else []
+
+
+def actor_gone(r):
+    """True for the transient that follows a navigation: the content actor for
+    the old document is destroyed when the new one commits, so a query issued
+    across that boundary fails with 'Actor ... destroyed before query'.
+    Retrying binds to the new actor."""
+    return is_err(r) and "destroyed before query" in str(r.get("error", ""))
 
 
 def slice_section(markdown, start_marker, end_markers):
