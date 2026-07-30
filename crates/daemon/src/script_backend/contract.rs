@@ -142,10 +142,189 @@ impl ScriptOutcome {
     }
 }
 
+/// 采样参数。脚本按需读取；本网关自身不解释它们。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScriptParams {
+    /// 采样温度。
+    pub temperature: Option<f64>,
+    /// 生成上限。
+    pub max_tokens: Option<u64>,
+}
+
+/// 交给脚本的一条消息。`content` 恒为字符串，`content_parts` 恒为数组。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScriptMessage {
+    /// `system` / `user` / `assistant` / `tool`
+    pub role: String,
+    /// 压平后的纯文本。
+    pub content: String,
+    /// 原始内容块；字符串/`null` 形态时为空数组。
+    pub content_parts: Vec<crate::http::openai_wire::ContentPart>,
+    /// `tool` 角色消息关联的调用 id。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// 脚本收到的请求。两种协议的并集：`messages` 由 OpenAI 侧填满，
+/// `arguments` 由 MCP 侧填满，另一侧是退化形态但**恒存在**，
+/// 这样脚本不必关心自己被谁调用。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScriptRequest {
+    /// 契约版本，当前恒为 1。
+    pub contract_version: u32,
+    /// `openai` 或 `mcp`。
+    pub protocol: String,
+    /// 客户端请求的模型名。
+    pub model: String,
+    /// 完整对话历史。
+    pub messages: Vec<ScriptMessage>,
+    /// MCP `tools/call` 的原始参数；OpenAI 侧为 `{}`。
+    pub arguments: serde_json::Value,
+    /// 便利字段：最后一条非空 user 消息的压平文本。
+    pub task: String,
+    /// 客户端声明的工具。
+    pub tools: Vec<serde_json::Value>,
+    /// 工具选择策略。
+    pub tool_choice: Option<serde_json::Value>,
+    /// 客户端是否要求流式。
+    pub stream: bool,
+    /// 采样参数。
+    pub params: ScriptParams,
+    /// 追踪信息（`task_id` 等）。
+    pub metadata: serde_json::Value,
+}
+
+impl ScriptRequest {
+    /// 从 OpenAI 请求构造。`task` 由调用方传入（已由
+    /// [`crate::http::openai_wire::ChatCompletionRequest::last_user_text`] 解析），
+    /// `task_id` 用于追踪。
+    pub fn from_openai(
+        req: &crate::http::openai_wire::ChatCompletionRequest,
+        task: &str,
+        task_id: &str,
+    ) -> Self {
+        let messages = req
+            .messages
+            .iter()
+            .map(|m| ScriptMessage {
+                role: m.role.clone(),
+                content: m.content.to_text(),
+                content_parts: m.content.parts(),
+                tool_call_id: m.tool_call_id.clone(),
+            })
+            .collect();
+
+        Self {
+            contract_version: 1,
+            protocol: "openai".to_string(),
+            model: req.model.clone(),
+            messages,
+            arguments: serde_json::json!({}),
+            task: task.to_string(),
+            tools: req.tools.clone(),
+            tool_choice: req.tool_choice.clone(),
+            stream: req.stream,
+            params: ScriptParams {
+                temperature: req.temperature,
+                max_tokens: req.max_tokens,
+            },
+            metadata: serde_json::json!({ "task_id": task_id }),
+        }
+    }
+
+    /// 序列化成交给脚本的 JSON 值。
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::openai_wire::ChatCompletionRequest;
     use serde_json::json;
+
+    fn parse_req(body: &str) -> ChatCompletionRequest {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn script_request_carries_full_history_flattened_and_raw() {
+        let req = parse_req(
+            r#"{"model":"gemini-web","stream":true,"messages":[
+                 {"role":"system","content":[{"type":"text","text":"你是助手"}]},
+                 {"role":"user","content":"你好"}]}"#,
+        );
+        let sr = ScriptRequest::from_openai(&req, "你好", "task-7");
+        let v = sr.to_value();
+
+        assert_eq!(v["contract_version"], 1);
+        assert_eq!(v["protocol"], "openai");
+        assert_eq!(v["model"], "gemini-web");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["task"], "你好");
+        assert_eq!(v["metadata"]["task_id"], "task-7");
+
+        // 压平文本恒为 str
+        assert_eq!(v["messages"][0]["content"], "你是助手");
+        // 原始结构保留
+        assert_eq!(v["messages"][0]["content_parts"][0]["text"], "你是助手");
+        // 字符串形态的 content_parts 是空数组，不是 null
+        assert_eq!(v["messages"][1]["content"], "你好");
+        assert!(v["messages"][1]["content_parts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn script_request_has_degenerate_mcp_fields() {
+        // arguments 对 OpenAI 侧是空对象——两个键恒存在，脚本无需关心调用来源
+        let req = parse_req(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let v = ScriptRequest::from_openai(&req, "hi", "task-0").to_value();
+        assert!(v["arguments"].is_object());
+        assert_eq!(v["arguments"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn script_request_passes_tools_and_params_through() {
+        let req = parse_req(
+            r#"{"model":"m","temperature":0.5,"max_tokens":128,
+                "tools":[{"type":"function","function":{"name":"read_file"}}],
+                "tool_choice":"auto",
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let v = ScriptRequest::from_openai(&req, "hi", "task-0").to_value();
+        assert_eq!(v["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["params"]["temperature"], 0.5);
+        assert_eq!(v["params"]["max_tokens"], 128);
+    }
+
+    #[test]
+    fn script_request_keeps_tool_call_id_on_tool_messages() {
+        let req = parse_req(
+            r#"{"model":"m","messages":[
+                 {"role":"user","content":"读文件"},
+                 {"role":"tool","tool_call_id":"call_1","content":"文件内容"}]}"#,
+        );
+        let v = ScriptRequest::from_openai(&req, "读文件", "task-0").to_value();
+        assert_eq!(v["messages"][1]["role"], "tool");
+        assert_eq!(v["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(v["messages"][1]["content"], "文件内容");
+    }
+
+    #[test]
+    fn script_request_renders_as_valid_python_literal() {
+        // 与 entry::to_python_literal 的联结：stream:true 必须变成 True
+        let req =
+            parse_req(r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#);
+        let lit = crate::script_backend::to_python_literal(
+            &ScriptRequest::from_openai(&req, "hi", "t").to_value(),
+        );
+        assert!(lit.contains("True"), "got {lit}");
+        assert!(!lit.contains("true"), "got {lit}");
+    }
 
     #[test]
     fn content_outcome_defaults_to_stop() {

@@ -7,5 +7,8 @@
 pub mod contract;
 pub mod entry;
 
-pub use contract::{OutcomeBody, OutcomeError, ScriptOutcome, ScriptToolCall, Usage};
+pub use contract::{
+    OutcomeBody, OutcomeError, ScriptMessage, ScriptOutcome, ScriptParams, ScriptRequest,
+    ScriptToolCall, Usage,
+};
 pub use entry::{build_invocation, detect_entry, to_python_literal, EntryPoint};

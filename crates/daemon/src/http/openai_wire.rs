@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 /// OpenAI 内容数组里的一项。只有文本项带 `text`；图片/音频项没有，直接跳过。
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ContentPart {
     /// `text` / `image_url` / `input_text` …… 目前仅用于日志。
     #[serde(default, rename = "type")]
@@ -46,6 +46,15 @@ impl MessageContent {
                 .collect::<Vec<_>>()
                 .join("\n"),
             MessageContent::Null => String::new(),
+        }
+    }
+
+    /// 原始内容块。字符串/`null` 形态返回空 vec——契约里 `content_parts`
+    /// 恒存在，缺失时是 `[]` 而不是 `null`，脚本可以无条件迭代。
+    pub fn parts(&self) -> Vec<ContentPart> {
+        match self {
+            MessageContent::Parts(parts) => parts.clone(),
+            _ => Vec::new(),
         }
     }
 }
