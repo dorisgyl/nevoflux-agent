@@ -77,6 +77,12 @@ pub struct TaskRequest {
     /// 走 `Runner` 签名而不是这里）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_request: Option<serde_json::Value>,
+    /// 本任务要用的后端脚本路径；`None` = 走 agent 循环。
+    ///
+    /// 由前端按 `model` 名解析后填入。`NEVOFLUX_HEADLESS_SCRIPT` 退化为未指定
+    /// 时的兜底，因为它是**进程级**开关，与按请求选后端不兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -154,6 +160,7 @@ impl TaskRequest {
                 .filter(|s| !s.is_empty()),
             // 前端在 from_env 之后按需填充（见 http::router::chat_completions）。
             chat_request: None,
+            backend: None,
         }
     }
 }

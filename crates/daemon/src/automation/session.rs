@@ -133,10 +133,13 @@ pub async fn execute_task_attempt(
     // user Python file defining `def run(task): ...`, run it directly via the
     // code-mode executor (Monty) against the bound browser — NO LLM, no agent
     // loop. Deterministic browser-use pipeline; the interface `task` is passed in.
-    if let Some(script_path) = std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
+    // 逐任务后端优先；环境变量退化为兜底，保持 CLI / `run --task` 的现有行为。
+    let script_path = script_call.and_then(|c| c.script_path.clone()).or_else(|| {
+        std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    if let Some(script_path) = script_path {
         return run_headless_script(&services, &script_path, task, script_call);
     }
 
@@ -321,6 +324,8 @@ pub struct ScriptCall {
     pub wall_clock_secs: Option<u64>,
     /// 协作式取消标志：客户端断开时置位。
     pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 本任务要用的后端脚本路径；`None` 时回落到 `NEVOFLUX_HEADLESS_SCRIPT`。
+    pub script_path: Option<String>,
 }
 
 /// Everything the per-task orchestration needs, threaded from the daemon.

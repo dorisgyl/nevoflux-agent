@@ -84,12 +84,22 @@ pub fn build_headless_runner(
                     display,
                     mode: parse_agent_mode(&req.mode),
                     workspace,
-                    script_call: req.chat_request.clone().map(|request| session::ScriptCall {
-                        request,
-                        sink: sink.clone(),
-                        wall_clock_secs: req.wall_clock_secs,
-                        cancel_flag: cancel.clone(),
-                    }),
+                    // chat_request 或 backend 任一存在就构造：前者是 OpenAI/MCP
+                    // 前端的结构化请求，后者让纯 `POST /tasks` 也能指定后端。
+                    script_call: if req.chat_request.is_some() || req.backend.is_some() {
+                        Some(session::ScriptCall {
+                            request: req
+                                .chat_request
+                                .clone()
+                                .unwrap_or_else(|| serde_json::json!({})),
+                            sink: sink.clone(),
+                            wall_clock_secs: req.wall_clock_secs,
+                            cancel_flag: cancel.clone(),
+                            script_path: req.backend.clone(),
+                        })
+                    } else {
+                        None
+                    },
                 };
                 let policy = req.to_policy();
                 let outcome = if session_mode {

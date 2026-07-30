@@ -157,11 +157,15 @@ async fn chat_completions(
         );
     };
 
-    let model = openai_wire::resolve_model(&req.model);
+    let (model, backend) = match openai_wire::resolve_backend(&req.model) {
+        Ok(v) => v,
+        Err(e) => return openai_wire::error_response(StatusCode::NOT_FOUND, e),
+    };
     let script_request = crate::script_backend::ScriptRequest::from_openai(&req, &task, "pending");
 
     let mut treq = TaskRequest::from_env(task);
     treq.chat_request = Some(script_request.to_value());
+    treq.backend = backend;
 
     // 非流式请求同样开 sink：结构化结果（tool_calls / usage / finish_reason）
     // 无法从 `TaskResponse.output` 这个字符串通道回传，两种模式统一从终帧取。

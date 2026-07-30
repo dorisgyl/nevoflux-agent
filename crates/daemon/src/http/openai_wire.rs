@@ -131,28 +131,95 @@ pub fn advertised_model() -> String {
         .unwrap_or_else(|| "nevoflux-script".to_string())
 }
 
-/// `GET /v1/models` 的响应体。
-pub fn models_response() -> serde_json::Value {
-    serde_json::json!({
-        "object": "list",
-        "data": [{
-            "id": advertised_model(),
-            "object": "model",
-            "created": unix_now(),
-            "owned_by": "nevoflux",
-        }],
-    })
+/// 后端路由表：`NEVOFLUX_OPENAI_MODELS='name=/path/a.py,other='`。
+///
+/// 值为空表示该模型不走脚本、走真 agent 循环。未设置该变量时回退到单后端
+/// 模式：广播 [`advertised_model`]，脚本路径取 `NEVOFLUX_HEADLESS_SCRIPT`。
+pub fn model_routes() -> Vec<(String, Option<String>)> {
+    match std::env::var("NEVOFLUX_OPENAI_MODELS") {
+        Ok(spec) if !spec.trim().is_empty() => spec
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let (name, path) = match entry.split_once('=') {
+                    Some((n, p)) => (n.trim(), p.trim()),
+                    None => (entry, ""),
+                };
+                if name.is_empty() {
+                    return None;
+                }
+                Some((
+                    name.to_string(),
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(path.to_string())
+                    },
+                ))
+            })
+            .collect(),
+        _ => vec![(
+            advertised_model(),
+            std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        )],
+    }
 }
 
-/// 解析客户端请求的模型名。
+/// `GET /v1/models` 的响应体：列出路由表里的全部后端。
+pub fn models_response() -> serde_json::Value {
+    let created = unix_now();
+    let data: Vec<serde_json::Value> = model_routes()
+        .into_iter()
+        .map(|(id, _)| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": created,
+                "owned_by": "nevoflux",
+            })
+        })
+        .collect();
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+/// 解析客户端请求的模型名 →（回显名, 脚本路径）。
 ///
-/// 第 1 阶段**接受任意名字**并原样回显（响应里的 `model` 应当回显请求值），
-/// 空名回落到广播名。这保证发 `"model":"gpt-4"` 的存量客户端不受影响。
-pub fn resolve_model(requested: &str) -> String {
+/// **单后端模式接受任意名字**并原样回显，保证发 `"model":"gpt-4"` 的存量
+/// 客户端不受影响；配置了多后端时，未知名字返回 404 `model_not_found`——
+/// 此时名字是有意义的选择，静默兜底会让人以为选中了另一个后端。
+pub fn resolve_backend(requested: &str) -> Result<(String, Option<String>), ErrorBody> {
+    let routes = model_routes();
+    let multi = std::env::var("NEVOFLUX_OPENAI_MODELS")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
     if requested.trim().is_empty() {
-        advertised_model()
+        let (name, path) = routes
+            .first()
+            .cloned()
+            .unwrap_or((advertised_model(), None));
+        return Ok((name, path));
+    }
+    if let Some((name, path)) = routes.iter().find(|(n, _)| n == requested) {
+        return Ok((name.clone(), path.clone()));
+    }
+    if multi {
+        let known: Vec<&str> = routes.iter().map(|(n, _)| n.as_str()).collect();
+        Err(ErrorBody::not_found(
+            format!(
+                "no such model: {requested} (available: {})",
+                known.join(", ")
+            ),
+            "model_not_found",
+        ))
     } else {
-        requested.to_string()
+        let path = routes.first().and_then(|(_, p)| p.clone());
+        Ok((requested.to_string(), path))
     }
 }
 
@@ -542,11 +609,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_echoes_client_choice_and_falls_back() {
-        // 第 1 阶段只有一个后端：任何 model 名都接受，原样回显，
-        // 空名回落到广播名（客户端发 "gpt-4" 也必须能用）。
-        assert_eq!(resolve_model("gpt-4"), "gpt-4");
-        assert_eq!(resolve_model(""), advertised_model());
+    fn model_routing_table_and_resolution() {
+        // env 是进程级的，所有 env 断言合并进一个用例串行执行，
+        // 避免并行测试互相干扰。
+        std::env::remove_var("NEVOFLUX_OPENAI_MODELS");
+        std::env::remove_var("NEVOFLUX_HEADLESS_SCRIPT");
+
+        // 单后端：任意名字都接受，原样回显
+        assert_eq!(resolve_backend("gpt-4").unwrap().0, "gpt-4");
+        assert!(resolve_backend("gpt-4").unwrap().1.is_none());
+
+        std::env::set_var("NEVOFLUX_HEADLESS_SCRIPT", "/opt/a.py");
+        assert_eq!(
+            resolve_backend("anything").unwrap().1.as_deref(),
+            Some("/opt/a.py")
+        );
+
+        // 多后端：名字必须在表里
+        std::env::set_var("NEVOFLUX_OPENAI_MODELS", "gemini-web=/opt/g.py,agent=");
+        let (name, path) = resolve_backend("gemini-web").unwrap();
+        assert_eq!(name, "gemini-web");
+        assert_eq!(path.as_deref(), Some("/opt/g.py"));
+        // 空值 = 走 agent 循环
+        assert!(resolve_backend("agent").unwrap().1.is_none());
+        let err = resolve_backend("gpt-4").unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("model_not_found"));
+        // 空名回落到第一个
+        assert_eq!(resolve_backend("").unwrap().0, "gemini-web");
+
+        let listed = models_response();
+        assert_eq!(listed["data"][0]["id"], "gemini-web");
+        assert_eq!(listed["data"][1]["id"], "agent");
+
+        std::env::remove_var("NEVOFLUX_OPENAI_MODELS");
+        std::env::remove_var("NEVOFLUX_HEADLESS_SCRIPT");
     }
 
     #[test]

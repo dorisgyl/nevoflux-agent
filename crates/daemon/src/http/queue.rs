@@ -164,6 +164,7 @@ mod tests {
             save_profile: false,
             save_profile_as: None,
             chat_request: None,
+            backend: None,
         }
     }
 
