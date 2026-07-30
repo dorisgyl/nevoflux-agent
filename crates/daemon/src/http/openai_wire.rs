@@ -111,6 +111,42 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 本服务对外广播的模型名。取 `NEVOFLUX_HEADLESS_MODEL`，默认 `nevoflux-script`。
+///
+/// 第 1 阶段一个进程只有一个后端（`NEVOFLUX_HEADLESS_SCRIPT` 是进程级开关），
+/// 因此只广播一个名字。按 model 名路由到不同后端在第 4 阶段实现。
+pub fn advertised_model() -> String {
+    std::env::var("NEVOFLUX_HEADLESS_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "nevoflux-script".to_string())
+}
+
+/// `GET /v1/models` 的响应体。
+pub fn models_response() -> serde_json::Value {
+    serde_json::json!({
+        "object": "list",
+        "data": [{
+            "id": advertised_model(),
+            "object": "model",
+            "created": unix_now(),
+            "owned_by": "nevoflux",
+        }],
+    })
+}
+
+/// 解析客户端请求的模型名。
+///
+/// 第 1 阶段**接受任意名字**并原样回显（响应里的 `model` 应当回显请求值），
+/// 空名回落到广播名。这保证发 `"model":"gpt-4"` 的存量客户端不受影响。
+pub fn resolve_model(requested: &str) -> String {
+    if requested.trim().is_empty() {
+        advertised_model()
+    } else {
+        requested.to_string()
+    }
+}
+
 /// 构造一个非流式 `chat.completion` 响应体。
 ///
 /// 字段集按最严格的客户端要求给全：`created` 与 `choices[].finish_reason` 在
@@ -302,6 +338,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.last_user_text().as_deref(), Some("有内容"));
+    }
+
+    #[test]
+    fn advertised_model_defaults_and_reads_env() {
+        // 该测试串行修改进程环境变量，故与其它 env 测试合并在同一个用例内。
+        std::env::remove_var("NEVOFLUX_HEADLESS_MODEL");
+        assert_eq!(advertised_model(), "nevoflux-script");
+        std::env::set_var("NEVOFLUX_HEADLESS_MODEL", "gemini-web");
+        assert_eq!(advertised_model(), "gemini-web");
+        std::env::remove_var("NEVOFLUX_HEADLESS_MODEL");
+    }
+
+    #[test]
+    fn models_response_is_a_list_object() {
+        let v = models_response();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"][0]["object"], "model");
+        assert_eq!(v["data"][0]["owned_by"], "nevoflux");
+        assert!(v["data"][0]["id"].as_str().is_some());
+    }
+
+    #[test]
+    fn resolve_model_echoes_client_choice_and_falls_back() {
+        // 第 1 阶段只有一个后端：任何 model 名都接受，原样回显，
+        // 空名回落到广播名（客户端发 "gpt-4" 也必须能用）。
+        assert_eq!(resolve_model("gpt-4"), "gpt-4");
+        assert_eq!(resolve_model(""), advertised_model());
     }
 
     #[test]
