@@ -3,7 +3,10 @@
 //! 这一层只认识 OpenAI 的线格式——不知道脚本后端，也不知道浏览器。
 //! 任务侧的契约仍在 [`crate::http::types`]。
 
-use serde::Deserialize;
+use axum::extract::FromRequest;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
 
 /// OpenAI 内容数组里的一项。只有文本项带 `text`；图片/音频项没有，直接跳过。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -100,6 +103,101 @@ impl ChatCompletionRequest {
     }
 }
 
+/// OpenAI 错误对象。`code` / `param` 未设置时不出现在 JSON 里。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ErrorBody {
+    /// 人类可读的错误说明。
+    pub message: String,
+    /// `invalid_request_error` / `server_error` / `timeout` …
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 机器可读的细分码，如 `model_not_found`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// 出错的字段名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
+impl ErrorBody {
+    /// 400：请求本身不合法。
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "invalid_request_error".into(),
+            code: None,
+            param: None,
+        }
+    }
+
+    /// 404：资源（如 model）不存在。
+    pub fn not_found(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "invalid_request_error".into(),
+            code: Some(code.into()),
+            param: None,
+        }
+    }
+
+    /// 502：后端执行失败。
+    pub fn server(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "server_error".into(),
+            code: Some(code.into()),
+            param: None,
+        }
+    }
+
+    /// 504：超出预算。
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "timeout".into(),
+            code: Some("timeout".into()),
+            param: None,
+        }
+    }
+}
+
+/// 错误信封 `{"error": {...}}`。
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorEnvelope {
+    /// 错误对象。
+    pub error: ErrorBody,
+}
+
+/// 构造一个带 OpenAI 信封的错误响应。
+pub fn error_response(status: StatusCode, body: ErrorBody) -> Response {
+    (status, axum::Json(ErrorEnvelope { error: body })).into_response()
+}
+
+/// `axum::Json` 的替身：把反序列化失败翻译成 OpenAI 错误信封（400）。
+///
+/// 直接用 `Json<T>` 时，axum 会在进入 handler **之前**返回 422 和一行裸 serde
+/// 文本（内含 Rust 内部类型名），OpenAI 客户端无法解析。
+pub struct OpenAiJson<T>(pub T);
+
+#[axum::async_trait]
+impl<T, S> FromRequest<S> for OpenAiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(OpenAiJson(value)),
+            Err(rejection) => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorBody::invalid_request(rejection.body_text()),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +269,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.last_user_text().as_deref(), Some("有内容"));
+    }
+
+    #[test]
+    fn error_body_serializes_to_openai_envelope() {
+        let body = ErrorBody::invalid_request("missing field `messages`");
+        let v = serde_json::to_value(ErrorEnvelope { error: body }).unwrap();
+        assert_eq!(v["error"]["message"], "missing field `messages`");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        // 未设置的字段不出现在信封里，而不是 null
+        assert!(v["error"].get("param").is_none());
+    }
+
+    #[test]
+    fn error_body_carries_code_when_given() {
+        let v = serde_json::to_value(ErrorEnvelope {
+            error: ErrorBody::not_found("no such model: gpt-9", "model_not_found"),
+        })
+        .unwrap();
+        assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn malformed_body_yields_400_envelope_not_axum_text() {
+        use axum::body::Body;
+        use axum::extract::FromRequest;
+        use axum::http::Request;
+
+        let req = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"m"}"#)) // 缺 messages
+            .unwrap();
+
+        let rejection = OpenAiJson::<ChatCompletionRequest>::from_request(req, &())
+            .await
+            .err()
+            .expect("missing messages must be rejected");
+
+        assert_eq!(rejection.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(rejection.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("messages"));
     }
 
     #[test]
