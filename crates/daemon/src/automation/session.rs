@@ -10,14 +10,18 @@
 use crate::agent_host::DaemonHostFunctions;
 use crate::automation::policy::Policy;
 use crate::automation::retry_decision;
-use crate::http::types::TaskStatus;
 use crate::automation::session_holder::{self, LiveSession, SessionHolder};
 use crate::browser_launch::{spawn_and_supervise, BrowserLaunchConfig};
+use crate::http::types::TaskStatus;
 use crate::registry::BrowserEntry;
 use crate::wasm::services::{BrowserRequest, HostServices};
 use nevoflux_protocol::common::BrowserToolAction;
 use std::future::Future;
 use std::time::Duration;
+
+/// 沙箱预算相对任务墙钟留出的余量（秒）：脚本被掐断后仍要有时间把错误
+/// 汇报上来，不能和墙钟同时到期。
+const SCRIPT_BUDGET_MARGIN_SECS: u64 = 10;
 
 /// Result of one attempt at a task.
 #[derive(Debug, Clone)]
@@ -101,6 +105,7 @@ pub async fn execute_task_attempt(
     task: &str,
     mode: nevoflux_builtin_wasm::AgentMode,
     session_id: String,
+    script_call: Option<&ScriptCall>,
 ) -> AttemptOutcome {
     let Some(agent_config) = services_template.agent_config.clone() else {
         return AttemptOutcome {
@@ -128,11 +133,14 @@ pub async fn execute_task_attempt(
     // user Python file defining `def run(task): ...`, run it directly via the
     // code-mode executor (Monty) against the bound browser — NO LLM, no agent
     // loop. Deterministic browser-use pipeline; the interface `task` is passed in.
-    if let Some(script_path) = std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return run_headless_script(&services, &script_path, task);
+    // 逐任务后端优先；环境变量退化为兜底，保持 CLI / `run --task` 的现有行为。
+    let script_path = script_call.and_then(|c| c.script_path.clone()).or_else(|| {
+        std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    if let Some(script_path) = script_path {
+        return run_headless_script(&services, &script_path, task, script_call);
     }
 
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
@@ -206,7 +214,12 @@ pub async fn execute_task_attempt(
 ///
 /// This is headless-only — it is reached solely from [`execute_task_attempt`],
 /// which only runs inside the `--headless` task runner.
-fn run_headless_script(services: &HostServices, script_path: &str, task: &str) -> AttemptOutcome {
+fn run_headless_script(
+    services: &HostServices,
+    script_path: &str,
+    task: &str,
+    script_call: Option<&ScriptCall>,
+) -> AttemptOutcome {
     let user_code = match std::fs::read_to_string(script_path) {
         Ok(c) => c,
         Err(e) => {
@@ -217,7 +230,7 @@ fn run_headless_script(services: &HostServices, script_path: &str, task: &str) -
                 error: Some(format!(
                     "headless script mode: cannot read NEVOFLUX_HEADLESS_SCRIPT '{script_path}': {e}"
                 )),
-            }
+            };
         }
     };
     let Some(browser_ctx) = services.browser_context() else {
@@ -229,39 +242,90 @@ fn run_headless_script(services: &HostServices, script_path: &str, task: &str) -
         };
     };
 
-    // Inject the task and call `run(task)` as the trailing expression, so its
-    // return value lands in `CodeModeResult.result`; prints land in `.output`.
-    // serde_json's string encoding is a valid Python string literal (safe against
-    // quotes/newlines in the task).
-    let task_literal = serde_json::to_string(task).unwrap_or_else(|_| "\"\"".into());
-    let wrapped = format!("{user_code}\n\nrun({task_literal})\n");
+    // 入口选择：脚本定义了 `def chat(` 就走契约入口，否则回退老的 `run(task)`。
+    // 请求体渲染成 Python 字面量——JSON 的 true/false/null 在 Monty 里不是
+    // 合法名字，直接拼 JSON 会当场炸。调用表达式放末尾，其返回值即为
+    // `CodeModeResult.result`；prints 落在 `.output`。
+    let entry = crate::script_backend::detect_entry(&user_code);
+    let empty = serde_json::json!({});
+    let request = script_call.map(|c| &c.request).unwrap_or(&empty);
+    let wrapped = crate::script_backend::build_invocation(&user_code, entry, request, task);
 
-    let result = crate::agent::code_mode::execute_python_simple(&wrapped, Some(browser_ctx));
+    let sink = script_call.and_then(|c| c.sink.as_ref());
+    // 沙箱预算由任务墙钟推导，不再吃 executor 的 180s 默认值——那是三层超时里
+    // 最紧的一道，且唯一不可外部配置，会在墙钟到期前先把脚本掐死。
+    let budget = script_call
+        .and_then(|c| c.wall_clock_secs)
+        .map(|secs| Duration::from_secs(secs.saturating_sub(SCRIPT_BUDGET_MARGIN_SECS).max(5)));
+    let result = crate::agent::code_mode::execute_python_with_sink(
+        &wrapped,
+        Some(browser_ctx),
+        script_call.and_then(|c| c.sink.clone()),
+        budget,
+        script_call.and_then(|c| c.cancel_flag.clone()),
+    );
     if result.success {
         // Prefer the returned value; fall back to printed output.
-        let output = match &result.result {
-            Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
-            Some(v) if !v.is_null() => v.to_string(),
-            _ => result.output.clone(),
+        let value = match &result.result {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                serde_json::Value::String(s.clone())
+            }
+            Some(v) if !v.is_null() => v.clone(),
+            _ => serde_json::Value::String(result.output.clone()),
         };
+        let outcome = crate::script_backend::ScriptOutcome::from_value(&value);
+
+        // 结构化结果（tool_calls / usage / finish_reason）经 sink 回传；
+        // `output` 只留人类可读文本，供 `GET /tasks/:id` 等既有消费者使用。
+        let text = match &outcome.body {
+            crate::script_backend::OutcomeBody::Content(t) => t.clone(),
+            _ => value.to_string(),
+        };
+        if let Some(sink) = sink {
+            sink.finish(crate::script_backend::FinishPayload::from_outcome(outcome));
+        }
         AttemptOutcome {
             success: true,
             tainted: true,
-            output: Some(output),
+            output: Some(text),
             error: None,
         }
     } else {
+        let message = result
+            .error
+            .unwrap_or_else(|| "headless script execution failed".into());
+        if let Some(sink) = sink {
+            sink.finish(crate::script_backend::FinishPayload::from_error(
+                message.clone(),
+                "server_error",
+                "script_error",
+            ));
+        }
         AttemptOutcome {
             success: false,
             tainted: true,
             output: None,
-            error: Some(
-                result
-                    .error
-                    .unwrap_or_else(|| "headless script execution failed".into()),
-            ),
+            error: Some(message),
         }
     }
+}
+
+/// 一次脚本调用的结构化上下文：请求体 + 增量出口。
+///
+/// 走 `AutomationDeps` 而不是 `TaskRequest`，是因为 sink 是运行时管道而非
+/// 线格式数据（`TaskRequest` 是公开 API 表面）。
+#[derive(Clone)]
+pub struct ScriptCall {
+    /// [`crate::script_backend::ScriptRequest`] 的 JSON。
+    pub request: serde_json::Value,
+    /// 增量出口；`None` 表示调用方不收增量。
+    pub sink: Option<crate::script_backend::DeltaSink>,
+    /// 任务墙钟（秒），用于推导沙箱预算。
+    pub wall_clock_secs: Option<u64>,
+    /// 协作式取消标志：客户端断开时置位。
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 本任务要用的后端脚本路径；`None` 时回落到 `NEVOFLUX_HEADLESS_SCRIPT`。
+    pub script_path: Option<String>,
 }
 
 /// Everything the per-task orchestration needs, threaded from the daemon.
@@ -282,6 +346,8 @@ pub struct AutomationDeps {
     pub mode: nevoflux_builtin_wasm::AgentMode,
     /// Per-task workspace dir (drain target for result + debug bundle, P6/Q12).
     pub workspace: std::path::PathBuf,
+    /// 结构化脚本调用上下文；`None` 表示走老路径（脚本只拿 task 字符串）。
+    pub script_call: Option<ScriptCall>,
 }
 
 /// Run a full task: taint-gated retry over fresh attempts, each of which clones
@@ -314,40 +380,40 @@ pub async fn execute_full_task(
             display: deps.display.clone(),
             register_timeout: std::time::Duration::from_secs(60),
         };
-        let result = match crate::browser_launch::spawn_and_supervise(cfg, deps.registry.clone())
-            .await
-        {
-            Err(e) => AttemptOutcome {
-                success: false,
-                tainted: false, // browser never started ⇒ untainted (retryable)
-                output: None,
-                error: Some(format!("browser launch failed: {e}")),
-            },
-            Ok(mut handle) => {
-                let outcome = match deps.registry.single() {
-                    Ok(browser) => {
-                        execute_task_attempt(
-                            deps.services_template.clone(),
-                            &browser,
-                            policy,
-                            task,
-                            deps.mode,
-                            format!("automation-{attempt}"),
-                        )
-                        .await
-                    }
-                    Err(e) => AttemptOutcome {
-                        success: false,
-                        tainted: false,
-                        output: None,
-                        error: Some(format!("binding failed: {e}")),
-                    },
-                };
-                // Reap the launcher child for this attempt.
-                handle.terminate().await;
-                outcome
-            }
-        };
+        let result =
+            match crate::browser_launch::spawn_and_supervise(cfg, deps.registry.clone()).await {
+                Err(e) => AttemptOutcome {
+                    success: false,
+                    tainted: false, // browser never started ⇒ untainted (retryable)
+                    output: None,
+                    error: Some(format!("browser launch failed: {e}")),
+                },
+                Ok(mut handle) => {
+                    let outcome = match deps.registry.single() {
+                        Ok(browser) => {
+                            execute_task_attempt(
+                                deps.services_template.clone(),
+                                &browser,
+                                policy,
+                                task,
+                                deps.mode,
+                                format!("automation-{attempt}"),
+                                deps.script_call.as_ref(),
+                            )
+                            .await
+                        }
+                        Err(e) => AttemptOutcome {
+                            success: false,
+                            tainted: false,
+                            output: None,
+                            error: Some(format!("binding failed: {e}")),
+                        },
+                    };
+                    // Reap the launcher child for this attempt.
+                    handle.terminate().await;
+                    outcome
+                }
+            };
         // Kill any browser process still holding this clone profile (the launcher
         // relaunches the real browser under a new pid, so reaping the child isn't
         // enough), then remove the clone dir. Prevents cross-task process leaks.
@@ -514,6 +580,7 @@ pub async fn execute_session_task(
             task,
             deps.mode,
             format!("session-{attempt}"),
+            deps.script_call.as_ref(),
         )
         .await
     })
@@ -572,7 +639,10 @@ mod tests {
             .contains("saved to base: acme"));
 
         let empty = SaveReport::default();
-        assert_eq!(append_save_note(Some("done".into()), &empty), Some("done".into()));
+        assert_eq!(
+            append_save_note(Some("done".into()), &empty),
+            Some("done".into())
+        );
 
         let failed = SaveReport {
             saved_to: None,
@@ -680,6 +750,7 @@ mod tests {
             "open example.com",
             nevoflux_builtin_wasm::AgentMode::Browser,
             "sess-1".into(),
+            None,
         )
         .await;
         assert!(!out.success);

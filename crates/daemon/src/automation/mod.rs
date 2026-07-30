@@ -60,7 +60,10 @@ pub fn build_headless_runner(
     let session_mode = session_mode_enabled(std::env::var("NEVOFLUX_SESSION_MODE").ok().as_deref());
 
     Some(std::sync::Arc::new(
-        move |id: String, req: crate::http::types::TaskRequest| {
+        move |id: String,
+              req: crate::http::types::TaskRequest,
+              sink: Option<crate::script_backend::DeltaSink>,
+              cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
             let template = template.clone();
             let registry = registry.clone();
             let browser_bin = browser_bin.clone();
@@ -81,6 +84,22 @@ pub fn build_headless_runner(
                     display,
                     mode: parse_agent_mode(&req.mode),
                     workspace,
+                    // chat_request 或 backend 任一存在就构造：前者是 OpenAI/MCP
+                    // 前端的结构化请求，后者让纯 `POST /tasks` 也能指定后端。
+                    script_call: if req.chat_request.is_some() || req.backend.is_some() {
+                        Some(session::ScriptCall {
+                            request: req
+                                .chat_request
+                                .clone()
+                                .unwrap_or_else(|| serde_json::json!({})),
+                            sink: sink.clone(),
+                            wall_clock_secs: req.wall_clock_secs,
+                            cancel_flag: cancel.clone(),
+                            script_path: req.backend.clone(),
+                        })
+                    } else {
+                        None
+                    },
                 };
                 let policy = req.to_policy();
                 let outcome = if session_mode {
@@ -98,6 +117,26 @@ pub fn build_headless_runner(
                 };
                 if outcome.status == crate::http::types::TaskStatus::Failed {
                     metrics.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                // 兜底终帧：脚本没跑到（浏览器起不来、配置缺失等）时 sink 上
+                // 不会有 Finish，HTTP 层就会一直等。`finish` 是幂等的，脚本
+                // 已经发过则这里是空操作。
+                if let Some(s) = sink.as_ref() {
+                    let payload = if outcome.status == crate::http::types::TaskStatus::Failed {
+                        crate::script_backend::FinishPayload::from_error(
+                            outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "task failed".into()),
+                            "server_error",
+                            "task_failed",
+                        )
+                    } else {
+                        crate::script_backend::FinishPayload::from_text(
+                            outcome.output.clone().unwrap_or_default(),
+                        )
+                    };
+                    s.finish(payload);
                 }
                 crate::http::types::TaskResponse {
                     id,

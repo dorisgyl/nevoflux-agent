@@ -64,6 +64,7 @@ pub mod remote;
 pub mod retry;
 pub mod router;
 pub mod schedules;
+pub mod script_backend;
 pub mod secrets;
 pub mod server;
 pub mod session;

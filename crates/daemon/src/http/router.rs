@@ -7,6 +7,7 @@
 //! against the already-tested queue/metrics.
 
 use crate::http::metrics::Metrics;
+use crate::http::openai_wire;
 use crate::http::queue::TaskQueue;
 use crate::http::types::{TaskRequest, TaskStatus};
 use axum::{
@@ -14,13 +15,12 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
 };
 use futures::stream::Stream;
-use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,7 +51,9 @@ pub fn router(state: AppState) -> Router {
 /// OpenAI-compatible routes, unstated so the caller applies state once. For a
 /// dedicated port: `openai_routes().with_state(state)`.
 pub fn openai_routes() -> Router<AppState> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(models))
 }
 
 /// Bind `addr` and serve `app` until the process exits.
@@ -60,10 +62,7 @@ pub async fn serve(addr: SocketAddr, app: Router) -> std::io::Result<()> {
     axum::serve(listener, app).await
 }
 
-async fn submit_task(
-    State(s): State<AppState>,
-    Json(req): Json<TaskRequest>,
-) -> impl IntoResponse {
+async fn submit_task(State(s): State<AppState>, Json(req): Json<TaskRequest>) -> impl IntoResponse {
     let id = s.queue.submit(req);
     (StatusCode::OK, Json(serde_json::json!({ "id": id })))
 }
@@ -128,70 +127,174 @@ async fn task_events(
 
 // ---- OpenAI-compatible chat completions -------------------------------------
 
-#[derive(Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+/// OpenAI-compatible `GET /v1/models`.
+async fn models() -> impl IntoResponse {
+    (StatusCode::OK, Json(openai_wire::models_response()))
 }
 
-#[derive(Deserialize)]
-struct ChatCompletionRequest {
-    #[serde(default)]
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    stream: bool,
-}
-
-/// OpenAI-compatible `POST /v1/chat/completions`. The last `user` message becomes
-/// a browser task (mode/profile/policy from env via [`TaskRequest::from_env`]);
-/// the agent runs it and its answer is returned as the assistant message.
-/// Non-streaming.
+/// OpenAI-compatible `POST /v1/chat/completions`. The last non-empty `user`
+/// message becomes a browser task (mode/profile/policy from env via
+/// [`TaskRequest::from_env`]); the agent runs it and its answer comes back as
+/// the assistant message. Non-streaming.
+///
+/// Wire-format concerns (content shapes, error envelope, response fields) live
+/// in [`crate::http::openai_wire`]; this handler only binds them to the queue.
 async fn chat_completions(
     State(s): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> impl IntoResponse {
-    let task = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    if task.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": {"message": "no user message"}})),
-        )
-            .into_response();
-    }
-    let treq = TaskRequest::from_env(task);
-    let resp = s
-        .queue
-        .submit_and_wait(treq, Duration::from_secs(600))
-        .await;
-    let content = resp
-        .output
-        .clone()
-        .or_else(|| resp.error.clone())
-        .unwrap_or_default();
-    let finish = if resp.status == TaskStatus::Succeeded {
-        "stop"
-    } else {
-        "error"
+    body: Result<openai_wire::OpenAiJson<openai_wire::ChatCompletionRequest>, Response>,
+) -> Response {
+    let req = match body {
+        Ok(openai_wire::OpenAiJson(req)) => req,
+        Err(rejection) => return rejection,
     };
-    let body = serde_json::json!({
-        "id": format!("chatcmpl-{}", resp.id),
-        "object": "chat.completion",
-        "model": if req.model.is_empty() { "nevoflux-headless".to_string() } else { req.model },
-        "choices": [{
-            "index": 0,
-            "message": { "role": "assistant", "content": content },
-            "finish_reason": finish
-        }]
-    });
-    (StatusCode::OK, Json(body)).into_response()
+
+    let Some(task) = req.last_user_text() else {
+        return openai_wire::error_response(
+            StatusCode::BAD_REQUEST,
+            openai_wire::ErrorBody::invalid_request(
+                "no non-empty user message: the last user message carries the task",
+            ),
+        );
+    };
+
+    let (model, backend) = match openai_wire::resolve_backend(&req.model) {
+        Ok(v) => v,
+        Err(e) => return openai_wire::error_response(StatusCode::NOT_FOUND, e),
+    };
+    let script_request = crate::script_backend::ScriptRequest::from_openai(&req, &task, "pending");
+
+    let mut treq = TaskRequest::from_env(task);
+    treq.chat_request = Some(script_request.to_value());
+    treq.backend = backend;
+
+    // 非流式请求同样开 sink：结构化结果（tool_calls / usage / finish_reason）
+    // 无法从 `TaskResponse.output` 这个字符串通道回传，两种模式统一从终帧取。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (id, cancel) = s
+        .queue
+        .submit_streaming(treq, crate::script_backend::DeltaSink::new(tx));
+
+    if req.stream {
+        return stream_completion(rx, id, model, cancel);
+    }
+
+    let mut collected = String::new();
+    let mut finish: Option<crate::script_backend::FinishPayload> = None;
+    while let Some(delta) = rx.recv().await {
+        match delta {
+            crate::script_backend::Delta::Text(t) => collected.push_str(&t),
+            crate::script_backend::Delta::Progress(_) => {}
+            crate::script_backend::Delta::Finish(p) => {
+                finish = Some(*p);
+                break;
+            }
+        }
+    }
+
+    // 终帧由 runner 闭包兜底保证；走到这里说明 runner 自己没了。
+    let Some(mut finish) = finish else {
+        return openai_wire::error_response(
+            StatusCode::BAD_GATEWAY,
+            openai_wire::ErrorBody::server("task ended without a result", "no_result"),
+        );
+    };
+    if finish.content.is_empty() && finish.tool_calls.is_empty() && !collected.is_empty() {
+        finish.content = collected;
+    }
+
+    if let Some((message, kind, code)) = finish.error.clone() {
+        let status = if kind == "timeout" {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return openai_wire::error_response(
+            status,
+            openai_wire::ErrorBody::server(message, code.unwrap_or_else(|| "script_error".into())),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(openai_wire::completion_response_from_finish(
+            &id, &model, &finish,
+        )),
+    )
+        .into_response()
+}
+
+/// 流被丢弃（客户端断开）时置位取消标志。
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 把增量通道变成 SSE 流。
+///
+/// 帧序：role 首帧 → 若干 content 增量（进度走注释帧，客户端忽略但连接保活）
+/// → 终帧（`finish_reason`，或错误数据帧）→ `[DONE]`。
+fn stream_completion(
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::script_backend::Delta>,
+    id: String,
+    model: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Response {
+    use crate::script_backend::Delta;
+    use futures::StreamExt as _;
+
+    // 守卫随流一起存活：客户端断开时 axum 丢弃流，Drop 置位取消标志，
+    // 脚本在下一个工具调用边界停下。终帧正常到达后再置位是无害的
+    // （任务此时已终结）。
+    let guard = CancelOnDrop(cancel);
+
+    let stream = futures::stream::unfold(
+        (rx, id, model, false, false, guard),
+        |(mut rx, id, model, sent_role, done, guard)| async move {
+            if done {
+                return None;
+            }
+            if !sent_role {
+                let ev = Event::default().data(openai_wire::chunk_role(&id, &model).to_string());
+                return Some((Ok(ev), (rx, id, model, true, false, guard)));
+            }
+            match rx.recv().await {
+                Some(Delta::Text(t)) => {
+                    let ev = Event::default()
+                        .data(openai_wire::chunk_delta(&id, &model, &t).to_string());
+                    Some((Ok(ev), (rx, id, model, true, false, guard)))
+                }
+                Some(Delta::Progress(p)) => {
+                    let ev = Event::default().comment(p);
+                    Some((Ok(ev), (rx, id, model, true, false, guard)))
+                }
+                Some(Delta::Finish(p)) => {
+                    let frame = if let Some((message, kind, code)) = p.error.clone() {
+                        openai_wire::chunk_error(&openai_wire::ErrorBody::server(
+                            message,
+                            code.unwrap_or(kind),
+                        ))
+                    } else {
+                        openai_wire::chunk_finish(&id, &model, &p)
+                    };
+                    let ev = Event::default().data(frame.to_string());
+                    Some((Ok(ev), (rx, id, model, true, true, guard)))
+                }
+                // 通道关闭而没有终帧：runner 自己没了。收尾即可，
+                // 此时状态码早已发出，没有别的表达手段。
+                None => None,
+            }
+        },
+    )
+    .chain(futures::stream::once(async {
+        Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+    }));
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Tear down the reused browser session (session mode). Locks the same
@@ -222,10 +325,9 @@ async fn close_session(body: Option<Json<CloseSessionRequest>>) -> impl IntoResp
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
     let pm = crate::profile::ProfileManager { base_dir, work_dir };
-    let report = crate::automation::session_holder::teardown_locked(
-        &mut guard, &pm, req.save, req.save_as,
-    )
-    .await;
+    let report =
+        crate::automation::session_holder::teardown_locked(&mut guard, &pm, req.save, req.save_as)
+            .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -280,9 +382,131 @@ mod tests {
         assert_eq!(v["closed"], false);
     }
 
+    #[tokio::test]
+    async fn chat_completions_accepts_rig_shaped_body() {
+        let app = router(test_state());
+        let body = r#"{"model":"deepseekv4-flash","messages":[
+            {"role":"system","content":[{"type":"text","text":"You are helpful"}]},
+            {"role":"user","content":[{"type":"text","text":"你好"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["model"], "deepseekv4-flash");
+        assert!(v["created"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(v["choices"][0]["message"]["content"], "ok");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_missing_messages_with_400_envelope() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_empty_prompt_with_400_envelope() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"system","content":"s"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("user"));
+    }
+
+    #[tokio::test]
+    async fn streaming_request_returns_sse_chunks() {
+        let app = router(test_state());
+        let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("chat.completion.chunk"), "got {text}");
+        assert!(text.contains("\"role\":\"assistant\""), "got {text}");
+        assert!(text.contains("[DONE]"), "got {text}");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_lists_one_model() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+        assert!(v["data"][0]["id"].as_str().is_some());
+    }
+
     fn test_state() -> AppState {
-        let runner: Runner = Arc::new(|id, _req| {
+        let runner: Runner = Arc::new(|id, _req, sink, _cancel| {
             Box::pin(async move {
+                // 生产侧由 runner 闭包兜底发终帧；假 runner 里手动模拟。
+                if let Some(s) = sink {
+                    s.finish(crate::script_backend::FinishPayload::from_text("ok".into()));
+                }
                 TaskResponse {
                     id,
                     status: TaskStatus::Succeeded,

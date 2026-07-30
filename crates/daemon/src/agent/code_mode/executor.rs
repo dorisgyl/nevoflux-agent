@@ -929,10 +929,26 @@ use std::sync::Arc;
 ///
 /// `tools_config` optionally restricts which tools can be executed at runtime.
 /// When set, the executor guard checks the allowlist before dispatching.
+/// 取第一个位置实参并转成字符串。伪工具（`emit_text` / `emit_progress`）
+/// 没有 param mapping，实参以数组形式到达；非字符串按 JSON 文本处理。
+fn first_string_arg(args: &serde_json::Value) -> String {
+    let first = match args {
+        serde_json::Value::Array(items) => items.first().cloned(),
+        serde_json::Value::Object(map) => map.values().next().cloned(),
+        other => Some(other.clone()),
+    };
+    match first {
+        Some(serde_json::Value::String(s)) => s,
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
+}
+
 fn build_registry_and_executor(
     browser_ctx: Option<BrowserContext>,
     param_mappings: HashMap<String, Vec<String>>,
     tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+    sink: Option<crate::script_backend::DeltaSink>,
 ) -> (
     Vec<String>,
     impl Fn(
@@ -953,14 +969,20 @@ fn build_registry_and_executor(
     };
 
     let shared_registry = Arc::new(registry);
-    let external_names: Vec<String> = shared_registry
+    let mut external_names: Vec<String> = shared_registry
         .tool_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
+    // 伪工具：脚本的增量出口。无条件暴露——没有 sink 时它们是空操作，
+    // 这样同一份脚本在带/不带增量通道的两种调用下都不会因“函数未定义”而崩。
+    external_names.push("emit_text".to_string());
+    external_names.push("emit_progress".to_string());
 
     let param_cache = Arc::new(effective_mappings);
     let tools_config = Arc::new(tools_config);
+
+    let sink = sink.map(std::sync::Arc::new);
 
     let tool_executor = move |name: &str, args: serde_json::Value| {
         let name = name.to_string();
@@ -968,8 +990,23 @@ fn build_registry_and_executor(
         let registry = shared_registry.clone();
         let mappings = param_cache.clone();
         let tools_config = tools_config.clone();
+        let sink = sink.clone();
         let fut: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> =
             Box::pin(async move {
+                // 伪工具：脚本的增量出口。拦在这里而不是进注册表，因为它不是
+                // 浏览器能力，也不该出现在 LLM 的工具清单里。
+                if name == "emit_text" || name == "emit_progress" {
+                    let text = first_string_arg(&args);
+                    if let Some(sink) = sink.as_ref() {
+                        if name == "emit_text" {
+                            sink.text(text);
+                        } else {
+                            sink.progress(text);
+                        }
+                    }
+                    return Ok(serde_json::json!({ "ok": true }));
+                }
+
                 // Executor guard: check tool allowlist if configured
                 match tools_config.as_ref() {
                     Some(nevoflux_protocol::subagent::ToolsConfig::None) => {
@@ -1063,7 +1100,7 @@ pub fn execute_python_simple_with_timeout(
     // Empty mappings = positional args use generic names (arg0, arg1, ...).
     // When SignatureCache is wired in from the caller, real mappings will be provided.
     let (external_names, tool_executor) =
-        build_registry_and_executor(browser_ctx, HashMap::new(), None);
+        build_registry_and_executor(browser_ctx, HashMap::new(), None, None);
     let mut executor = CodeModeExecutor::new();
     if let Some(max_duration) = max_duration {
         executor = executor.with_max_duration(max_duration);
@@ -1075,6 +1112,40 @@ pub fn execute_python_simple_with_timeout(
     let llm_rewrite =
         |_prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
             Box::pin(async { Err("No LLM retry in orchestrate tool mode".to_string()) })
+        };
+
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            executor
+                .execute(code, &external_names, tool_executor, llm_rewrite)
+                .await
+        })
+    })
+}
+
+/// 同 [`execute_python_simple_with_timeout`]，但把脚本的 `emit_text` /
+/// `emit_progress` 接到 `sink` 上。脚本后端（[`crate::script_backend`]）用这个入口。
+pub fn execute_python_with_sink(
+    code: &str,
+    browser_ctx: Option<BrowserContext>,
+    sink: Option<crate::script_backend::DeltaSink>,
+    max_duration: Option<Duration>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> CodeModeResult {
+    let runtime = tokio::runtime::Handle::current();
+    let (external_names, tool_executor) =
+        build_registry_and_executor(browser_ctx, HashMap::new(), None, sink);
+    let mut executor = CodeModeExecutor::new();
+    if let Some(max_duration) = max_duration {
+        executor = executor.with_max_duration(max_duration);
+    }
+    if let Some(flag) = cancel_flag {
+        executor = executor.with_cancel_flag(flag);
+    }
+
+    let llm_rewrite =
+        |_prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            Box::pin(async { Err("No LLM retry in script backend mode".to_string()) })
         };
 
     tokio::task::block_in_place(|| {
@@ -1109,7 +1180,7 @@ pub fn execute_python_with_llm(
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     let (external_names, tool_executor) =
-        build_registry_and_executor(browser_ctx, HashMap::new(), None);
+        build_registry_and_executor(browser_ctx, HashMap::new(), None, None);
     // orchestrate scripts are long-running by design — give them the 24h budget.
     let mut executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
     if let Some(flag) = cancel_flag {
@@ -1896,5 +1967,43 @@ combined
         assert!(parsed["result"].is_null());
         assert_eq!(parsed["success"], false);
         assert_eq!(parsed["error"], "something broke");
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use crate::script_backend::{Delta, DeltaSink};
+
+    /// emit 通路端到端：脚本 → 主机函数 → channel。`browser_ctx = None`，
+    /// 所以这条测试不依赖 Xvfb/浏览器。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn emit_text_reaches_the_sink() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let code = "emit_progress(\"开始\")\nemit_text(\"你\")\nemit_text(\"好\")\n\"done\"\n";
+        let result = execute_python_with_sink(
+            code,
+            None,
+            Some(DeltaSink::new(tx)),
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        assert!(result.success, "script failed: {:?}", result.error);
+        assert_eq!(rx.recv().await.unwrap(), Delta::Progress("开始".into()));
+        assert_eq!(rx.recv().await.unwrap(), Delta::Text("你".into()));
+        assert_eq!(rx.recv().await.unwrap(), Delta::Text("好".into()));
+    }
+
+    /// 没有 sink 时 emit 是空操作，脚本不应因未定义函数而失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn emit_without_sink_is_a_no_op() {
+        let result = execute_python_with_sink(
+            "emit_text(\"忽略\")\n\"ok\"\n",
+            None,
+            None,
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        assert!(result.success, "script failed: {:?}", result.error);
     }
 }

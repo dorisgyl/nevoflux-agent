@@ -1,0 +1,180 @@
+//! 入口选择与调用代码生成：把用户脚本 + 请求拼成一段可执行源码。
+
+/// 脚本对外暴露的入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPoint {
+    /// `def chat(request)` —— 完整契约入口。
+    Chat,
+    /// `def run(task)` —— 老入口，只收一个字符串。
+    Run,
+}
+
+/// 判断脚本用哪个入口：定义了 `def chat(` 就用 `chat`，否则回退 `run`。
+///
+/// 刻意用**静态扫描**而非运行时探测：运行时 `try/except NameError` 会把
+/// `chat()` 内部真实的 NameError 一并吞掉，静默降级到 `run()`，这类 bug
+/// 极难定位。扫描逐行进行，跳过注释行，并要求 `chat` 后紧跟 `(`，
+/// 以免 `chat_helper` / `mychat` 之类的名字误判。
+pub fn detect_entry(code: &str) -> EntryPoint {
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("def ") else {
+            continue;
+        };
+        let name = rest.trim_start();
+        if let Some(after) = name.strip_prefix("chat") {
+            if after.trim_start().starts_with('(') {
+                return EntryPoint::Chat;
+            }
+        }
+    }
+    EntryPoint::Run
+}
+
+/// 把 JSON 值渲染成**合法的 Python 字面量**。
+///
+/// 不能直接用 `serde_json::to_string`：Monty 是 Python 解释器，JSON 的
+/// `true` / `false` / `null` 在那里是未定义的名字，会当场炸。字符串则可以
+/// 直接复用 JSON 的转义——两者的转义规则一致，所以字符串内容里的
+/// `true` / `null` 不会被误改（这正是逐 token 渲染而非文本替换的原因）。
+pub fn to_python_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(true) => "True".to_string(),
+        serde_json::Value::Bool(false) => "False".to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(to_python_literal).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
+                    format!("{key}: {}", to_python_literal(v))
+                })
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+    }
+}
+
+/// 拼出交给执行器的完整源码：用户代码 + 一行入口调用。
+///
+/// 调用表达式放在末尾，其返回值即为 `CodeModeResult.result`
+/// （与 `session.rs` 现有的 `run(...)` 拼法一致）。
+pub fn build_invocation(
+    user_code: &str,
+    entry: EntryPoint,
+    request: &serde_json::Value,
+    task: &str,
+) -> String {
+    match entry {
+        EntryPoint::Chat => {
+            format!("{user_code}\n\nchat({})\n", to_python_literal(request))
+        }
+        EntryPoint::Run => {
+            let literal = serde_json::to_string(task).unwrap_or_else(|_| "\"\"".to_string());
+            format!("{user_code}\n\nrun({literal})\n")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detects_chat_entry() {
+        let code = "def chat(request):\n    return {'content': 'hi'}\n";
+        assert_eq!(detect_entry(code), EntryPoint::Chat);
+    }
+
+    #[test]
+    fn falls_back_to_run_when_only_run_defined() {
+        let code = "def run(task):\n    return 'hi'\n";
+        assert_eq!(detect_entry(code), EntryPoint::Run);
+    }
+
+    #[test]
+    fn chat_wins_when_both_defined() {
+        let code =
+            "def run(task):\n    return 'old'\n\ndef chat(request):\n    return {'content': 'new'}\n";
+        assert_eq!(detect_entry(code), EntryPoint::Chat);
+    }
+
+    #[test]
+    fn does_not_match_chat_in_comments_or_other_names() {
+        // 注释里提到 chat、以及 chat_helper / mychat 这类名字都不算定义了入口
+        let code = "# def chat(request) 这是注释\ndef chat_helper(x):\n    return x\ndef mychat(request):\n    return 1\ndef run(task):\n    return 'ok'\n";
+        assert_eq!(detect_entry(code), EntryPoint::Run);
+    }
+
+    #[test]
+    fn json_true_false_null_become_python_literals() {
+        // Monty 是 Python：JSON 的 true/false/null 不是合法字面量
+        let v = json!({"stream": true, "quiet": false, "tool_choice": null});
+        let lit = to_python_literal(&v);
+        assert!(lit.contains("True"), "got {lit}");
+        assert!(lit.contains("False"), "got {lit}");
+        assert!(lit.contains("None"), "got {lit}");
+        assert!(!lit.contains("true"), "got {lit}");
+        assert!(!lit.contains("null"), "got {lit}");
+    }
+
+    #[test]
+    fn strings_containing_keywords_are_not_rewritten() {
+        // 关键点：只替换 JSON 的字面量 token，不碰字符串内容
+        let v = json!({"task": "把 true 和 null 写进文档"});
+        let lit = to_python_literal(&v);
+        assert!(lit.contains("把 true 和 null 写进文档"), "got {lit}");
+    }
+
+    #[test]
+    fn nested_structures_render() {
+        let v = json!({"messages": [{"role": "user", "content": "hi", "ok": true}], "n": 3});
+        let lit = to_python_literal(&v);
+        assert!(lit.starts_with('{') && lit.ends_with('}'), "got {lit}");
+        assert!(lit.contains("[{"), "got {lit}");
+        assert!(lit.contains("\"role\": \"user\""), "got {lit}");
+        assert!(lit.contains("True"), "got {lit}");
+    }
+
+    #[test]
+    fn quotes_and_newlines_survive() {
+        let v = json!({"task": "他说\"你好\"\n换行"});
+        let lit = to_python_literal(&v);
+        // JSON 的转义规则与 Python 一致，直接复用
+        assert!(lit.contains("\\\""), "got {lit}");
+        assert!(lit.contains("\\n"), "got {lit}");
+    }
+
+    #[test]
+    fn build_invocation_appends_chat_call() {
+        let code = "def chat(request):\n    return {'content': 'hi'}\n";
+        let req = json!({"task": "你好", "stream": false});
+        let out = build_invocation(code, EntryPoint::Chat, &req, "你好");
+        assert!(out.starts_with(code), "用户代码必须原样在前");
+        assert!(out.contains("\nchat({"), "got {out}");
+        assert!(out.contains("False"), "got {out}");
+        assert!(out.trim_end().ends_with(')'), "got {out}");
+    }
+
+    #[test]
+    fn build_invocation_appends_run_call_with_task_only() {
+        let code = "def run(task):\n    return 'hi'\n";
+        let req = json!({"task": "你好", "stream": false});
+        let out = build_invocation(code, EntryPoint::Run, &req, "你好");
+        assert!(out.contains("\nrun(\"你好\")"), "got {out}");
+        // legacy 入口只拿到 task 字符串，看不到 request
+        assert!(!out.contains("stream"), "got {out}");
+    }
+}
