@@ -166,12 +166,12 @@ async fn chat_completions(
     // 非流式请求同样开 sink：结构化结果（tool_calls / usage / finish_reason）
     // 无法从 `TaskResponse.output` 这个字符串通道回传，两种模式统一从终帧取。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let id = s
+    let (id, cancel) = s
         .queue
         .submit_streaming(treq, crate::script_backend::DeltaSink::new(tx));
 
     if req.stream {
-        return stream_completion(rx, id, model);
+        return stream_completion(rx, id, model, cancel);
     }
 
     let mut collected = String::new();
@@ -219,6 +219,15 @@ async fn chat_completions(
         .into_response()
 }
 
+/// 流被丢弃（客户端断开）时置位取消标志。
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 把增量通道变成 SSE 流。
 ///
 /// 帧序：role 首帧 → 若干 content 增量（进度走注释帧，客户端忽略但连接保活）
@@ -227,29 +236,35 @@ fn stream_completion(
     rx: tokio::sync::mpsc::UnboundedReceiver<crate::script_backend::Delta>,
     id: String,
     model: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Response {
     use crate::script_backend::Delta;
     use futures::StreamExt as _;
 
+    // 守卫随流一起存活：客户端断开时 axum 丢弃流，Drop 置位取消标志，
+    // 脚本在下一个工具调用边界停下。终帧正常到达后再置位是无害的
+    // （任务此时已终结）。
+    let guard = CancelOnDrop(cancel);
+
     let stream = futures::stream::unfold(
-        (rx, id, model, false, false),
-        |(mut rx, id, model, sent_role, done)| async move {
+        (rx, id, model, false, false, guard),
+        |(mut rx, id, model, sent_role, done, guard)| async move {
             if done {
                 return None;
             }
             if !sent_role {
                 let ev = Event::default().data(openai_wire::chunk_role(&id, &model).to_string());
-                return Some((Ok(ev), (rx, id, model, true, false)));
+                return Some((Ok(ev), (rx, id, model, true, false, guard)));
             }
             match rx.recv().await {
                 Some(Delta::Text(t)) => {
                     let ev = Event::default()
                         .data(openai_wire::chunk_delta(&id, &model, &t).to_string());
-                    Some((Ok(ev), (rx, id, model, true, false)))
+                    Some((Ok(ev), (rx, id, model, true, false, guard)))
                 }
                 Some(Delta::Progress(p)) => {
                     let ev = Event::default().comment(p);
-                    Some((Ok(ev), (rx, id, model, true, false)))
+                    Some((Ok(ev), (rx, id, model, true, false, guard)))
                 }
                 Some(Delta::Finish(p)) => {
                     let frame = if let Some((message, kind, code)) = p.error.clone() {
@@ -261,7 +276,7 @@ fn stream_completion(
                         openai_wire::chunk_finish(&id, &model, &p)
                     };
                     let ev = Event::default().data(frame.to_string());
-                    Some((Ok(ev), (rx, id, model, true, true)))
+                    Some((Ok(ev), (rx, id, model, true, true, guard)))
                 }
                 // 通道关闭而没有终帧：runner 自己没了。收尾即可，
                 // 此时状态码早已发出，没有别的表达手段。
@@ -482,7 +497,7 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        let runner: Runner = Arc::new(|id, _req, sink| {
+        let runner: Runner = Arc::new(|id, _req, sink, _cancel| {
             Box::pin(async move {
                 // 生产侧由 runner 闭包兜底发终帧；假 runner 里手动模拟。
                 if let Some(s) = sink {

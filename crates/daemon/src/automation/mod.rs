@@ -62,7 +62,8 @@ pub fn build_headless_runner(
     Some(std::sync::Arc::new(
         move |id: String,
               req: crate::http::types::TaskRequest,
-              sink: Option<crate::script_backend::DeltaSink>| {
+              sink: Option<crate::script_backend::DeltaSink>,
+              cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
             let template = template.clone();
             let registry = registry.clone();
             let browser_bin = browser_bin.clone();
@@ -87,8 +88,7 @@ pub fn build_headless_runner(
                         request,
                         sink: sink.clone(),
                         wall_clock_secs: req.wall_clock_secs,
-                        // 取消标志在第 4 阶段 Task 5 接上（HTTP 侧断连时置位）。
-                        cancel_flag: None,
+                        cancel_flag: cancel.clone(),
                     }),
                 };
                 let policy = req.to_policy();

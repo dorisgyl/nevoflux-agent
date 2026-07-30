@@ -9,7 +9,7 @@ use crate::http::types::{TaskRequest, TaskResponse, TaskStatus};
 use crate::script_backend::DeltaSink;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Runs one task to a terminal [`TaskResponse`]. Implemented by the automation
@@ -19,7 +19,12 @@ use std::sync::{Arc, RwLock};
 /// 传入（只是在进程内收集），因为结构化结果（`tool_calls` / `usage`）无法从
 /// `TaskResponse.output` 这个字符串通道回传。
 pub type Runner = Arc<
-    dyn Fn(String, TaskRequest, Option<DeltaSink>) -> BoxFuture<'static, TaskResponse>
+    dyn Fn(
+            String,
+            TaskRequest,
+            Option<DeltaSink>,
+            Option<Arc<AtomicBool>>,
+        ) -> BoxFuture<'static, TaskResponse>
         + Send
         + Sync,
 >;
@@ -54,15 +59,26 @@ impl TaskQueue {
 
     /// Submit a task; returns its id immediately (status `Queued`).
     pub fn submit(&self, req: TaskRequest) -> String {
-        self.submit_with(req, None)
+        self.submit_with(req, None, None)
     }
 
-    /// 同 [`Self::submit`]，但把增量出口交给 runner。
-    pub fn submit_streaming(&self, req: TaskRequest, sink: DeltaSink) -> String {
-        self.submit_with(req, Some(sink))
+    /// 同 [`Self::submit`]，但把增量出口交给 runner，并返回一个协作式取消标志。
+    ///
+    /// 调用方（HTTP 层）在客户端断开时置位，脚本在下一个工具调用边界停止。
+    /// 不这么做的话，每个关掉页面的客户端都会在容器里留下一个跑满墙钟的任务，
+    /// 而队列是串行的——一个僵尸任务堵住后面所有请求。
+    pub fn submit_streaming(&self, req: TaskRequest, sink: DeltaSink) -> (String, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = self.submit_with(req, Some(sink), Some(flag.clone()));
+        (id, flag)
     }
 
-    fn submit_with(&self, req: TaskRequest, sink: Option<DeltaSink>) -> String {
+    fn submit_with(
+        &self,
+        req: TaskRequest,
+        sink: Option<DeltaSink>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> String {
         let id = format!("task-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         self.statuses
             .write()
@@ -76,7 +92,7 @@ impl TaskQueue {
             if let Some(r) = statuses.write().unwrap().get_mut(&run_id) {
                 r.status = TaskStatus::Running;
             }
-            let resp = runner(run_id.clone(), req, sink).await;
+            let resp = runner(run_id.clone(), req, sink, cancel).await;
             statuses.write().unwrap().insert(run_id, resp);
         });
         id
@@ -153,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_runs_task_and_tracks_status() {
-        let runner: Runner = Arc::new(|id, _req, _sink| {
+        let runner: Runner = Arc::new(|id, _req, _sink, _cancel| {
             Box::pin(async move {
                 TaskResponse {
                     id,
@@ -184,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn submit_streaming_hands_the_sink_to_the_runner() {
         use crate::script_backend::{Delta, DeltaSink, FinishPayload};
-        let runner: Runner = Arc::new(|id, _req, sink| {
+        let runner: Runner = Arc::new(|id, _req, sink, _cancel| {
             Box::pin(async move {
                 if let Some(s) = sink {
                     s.text("增量");
@@ -202,7 +218,7 @@ mod tests {
         });
         let q = TaskQueue::new(runner);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _id = q.submit_streaming(sample_request(), DeltaSink::new(tx));
+        let (_id, _cancel) = q.submit_streaming(sample_request(), DeltaSink::new(tx));
         assert_eq!(rx.recv().await.unwrap(), Delta::Text("增量".into()));
         match rx.recv().await.unwrap() {
             Delta::Finish(p) => assert_eq!(p.content, "完成"),
@@ -210,10 +226,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn submit_streaming_returns_a_cancel_flag_the_runner_receives() {
+        use crate::script_backend::DeltaSink;
+        use std::sync::atomic::Ordering;
+        // runner 把收到的 flag 原样置位，证明它确实到达了执行侧
+        let runner: Runner = Arc::new(|id, _req, _sink, cancel| {
+            Box::pin(async move {
+                if let Some(c) = cancel {
+                    c.store(true, Ordering::SeqCst);
+                }
+                TaskResponse {
+                    id,
+                    status: TaskStatus::Succeeded,
+                    attempts: 1,
+                    output: None,
+                    error: None,
+                    artifacts: vec![],
+                }
+            })
+        });
+        let q = TaskQueue::new(runner);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (id, flag) = q.submit_streaming(sample_request(), DeltaSink::new(tx));
+        for _ in 0..200 {
+            if q.status(&id).map(|r| r.status) == Some(TaskStatus::Succeeded) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(flag.load(Ordering::SeqCst), "runner never saw the flag");
+    }
+
     #[test]
     fn unknown_task_status_is_none() {
         let runner: Runner =
-            Arc::new(|id, _req, _sink| Box::pin(async move { super::queued(&id) }));
+            Arc::new(|id, _req, _sink, _cancel| Box::pin(async move { super::queued(&id) }));
         let q = TaskQueue::new(runner);
         assert!(q.status("nope").is_none());
     }
@@ -223,7 +271,7 @@ mod tests {
         // Runner would sleep forever; but the worker is never scheduled because
         // this test never awaits after submit, so the task stays Queued and
         // cancel wins deterministically.
-        let runner: Runner = Arc::new(|id, _req, _sink| {
+        let runner: Runner = Arc::new(|id, _req, _sink, _cancel| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 super::queued(&id)
