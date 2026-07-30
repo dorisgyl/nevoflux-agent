@@ -23,6 +23,29 @@ use std::time::Duration;
 /// 汇报上来，不能和墙钟同时到期。
 const SCRIPT_BUDGET_MARGIN_SECS: u64 = 10;
 
+/// `NEVOFLUX_HEADLESS_SCRIPT`，空串视为未设置。
+fn env_headless_script() -> Option<String> {
+    std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// 选出这次任务要跑的脚本；`None` = 走 agent 循环。
+///
+/// **有 `script_call` 就说明前端已经做过决策**，此时它的 `None` 是"这个 model
+/// 明确不走脚本"，绝不能再掉到环境变量上——`NEVOFLUX_OPENAI_MODELS` 里
+/// `agent=`（空值）的语义正是靠这一点成立。环境变量只在完全没有结构化请求
+/// 时兜底，保住 `POST /tasks` 与 CLI `run --task` 的既有行为。
+fn resolve_script_path(
+    script_call: Option<&ScriptCall>,
+    env_script: Option<String>,
+) -> Option<String> {
+    match script_call {
+        Some(call) => call.script_path.clone(),
+        None => env_script,
+    }
+}
+
 /// Result of one attempt at a task.
 #[derive(Debug, Clone)]
 pub struct AttemptOutcome {
@@ -133,13 +156,7 @@ pub async fn execute_task_attempt(
     // user Python file defining `def run(task): ...`, run it directly via the
     // code-mode executor (Monty) against the bound browser — NO LLM, no agent
     // loop. Deterministic browser-use pipeline; the interface `task` is passed in.
-    // 逐任务后端优先；环境变量退化为兜底，保持 CLI / `run --task` 的现有行为。
-    let script_path = script_call.and_then(|c| c.script_path.clone()).or_else(|| {
-        std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    });
-    if let Some(script_path) = script_path {
+    if let Some(script_path) = resolve_script_path(script_call, env_headless_script()) {
         return run_headless_script(&services, &script_path, task, script_call);
     }
 
@@ -616,6 +633,37 @@ fn append_save_note(output: Option<String>, report: &session_holder::SaveReport)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call_with(script_path: Option<&str>) -> ScriptCall {
+        ScriptCall {
+            request: serde_json::json!({}),
+            sink: None,
+            wall_clock_secs: None,
+            cancel_flag: None,
+            script_path: script_path.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn env_script_only_applies_without_a_front_end_decision() {
+        let env = Some("/opt/env.py".to_string());
+
+        // 没有结构化请求（POST /tasks、CLI run --task）→ 环境变量兜底
+        assert_eq!(
+            resolve_script_path(None, env.clone()),
+            Some("/opt/env.py".to_string())
+        );
+
+        // 前端选了具体后端 → 用它
+        assert_eq!(
+            resolve_script_path(Some(&call_with(Some("/opt/picked.py"))), env.clone()),
+            Some("/opt/picked.py".to_string())
+        );
+
+        // 前端明确判定“不走脚本”（NEVOFLUX_OPENAI_MODELS 里的 `agent=`）→
+        // 必须是 agent 循环，不能掉回环境变量，否则空值语义完全失效
+        assert_eq!(resolve_script_path(Some(&call_with(None)), env), None);
+    }
 
     #[test]
     fn about_blank_reset_request_is_navigate() {
