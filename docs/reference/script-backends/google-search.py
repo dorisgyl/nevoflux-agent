@@ -93,7 +93,7 @@ def chat(request):
     browser_activate_tab(tab_id=tab)
 
     emit_progress("typing the query")
-    browser_wait_for(selector=QUERY_SELECTORS[0], state="visible", timeout_ms=10000, tab_id=tab)
+    browser_wait_for(selector=QUERY_SELECTORS[0], timeout_ms=10000, tab_id=tab)
     if fill_first(QUERY_SELECTORS, query, tab) is None:
         return fail(2, "fill the search box", "all selectors failed")
 
@@ -105,10 +105,10 @@ def chat(request):
         return fail(3, "submit the search", r)
 
     emit_progress("waiting for results")
-    ready = browser_wait_for(selector=RESULTS_READY, state="visible", timeout_ms=15000, tab_id=tab)
+    ready = browser_wait_for(selector=RESULTS_READY, timeout_ms=15000, tab_id=tab)
     if is_err(ready):
         return fail(4, "wait for the results container", ready)
-    browser_wait_for_stable(tab_id=tab, timeout_ms=5000)
+    browser_wait_for_stable(tab_id=tab, max_wait=5000)
 
     titles = []
     for sel in TITLE_SELECTORS:

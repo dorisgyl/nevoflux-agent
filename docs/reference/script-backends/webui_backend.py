@@ -54,7 +54,7 @@ def fill_first(selectors, text, tab_id):
 def wait_any(selectors, tab_id, timeout_ms=5000):
     """Wait until any one of `selectors` is visible; return it, else None."""
     for sel in selectors:
-        r = browser_wait_for(selector=sel, state="visible", timeout_ms=timeout_ms, tab_id=tab_id)
+        r = browser_wait_for(selector=sel, timeout_ms=timeout_ms, tab_id=tab_id)
         if not is_err(r):
             return sel
     return None
