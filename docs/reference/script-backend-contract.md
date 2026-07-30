@@ -48,9 +48,16 @@ A `# def chat(...)` in a comment does not count, and neither do names like
   "tool_choice": "auto",
   "stream": True,
   "params": {"temperature": 0.7, "max_tokens": 4096},
-  "metadata": {"task_id": "task-7"},
+  "metadata": {"task_id": "task-7", "budget_secs": 230},
 }
 ```
+
+`metadata.budget_secs` is the wall-clock budget the sandbox will actually
+enforce on this call (the task wall clock minus a safety margin). A polling
+backend should wind down before it runs out and return what it has: overrunning
+means being killed mid-flight, which throws away the partial answer it had
+already emitted. The value is injected where the number is computed and
+enforced, so it cannot disagree with the limit that fires.
 
 `messages` and `arguments` are **both always present**, each possibly in a
 degenerate form — so a script never has to know whether the OpenAI or the MCP
@@ -166,6 +173,34 @@ When a streaming client disconnects, a cancellation flag is set and the script
 stops at the **next tool-call boundary**. Long waits therefore have to advance
 through tool calls such as `browser_wait_for`; a pure compute loop cannot be
 cancelled.
+
+## 7b. Signed-in backends: the base profile
+
+Each task runs on a **throwaway clone** of a base profile, so signing in through
+VNC persists only if the task that owns that session asks for it. Mounting
+`./base-profiles` is necessary but not sufficient — without `save_profile` the
+clone (and the sign-in) is discarded at teardown.
+
+Run the sign-in as a **task**, not through `/v1/chat/completions`: signing in
+takes minutes and the OpenAI path cannot raise the wall clock per request, while
+the sandbox budget is derived from it.
+
+```bash
+curl -s localhost:8084/tasks -H 'content-type: application/json' -d '{
+  "task": "sign in",
+  "backend": "/opt/nevoflux/scripts/login-wait.py",
+  "profile": "gemini",
+  "wall_clock_secs": 900,
+  "save_profile": true,
+  "save_profile_as": "gemini"
+}'
+```
+
+Sign in at `http://localhost:8085/vnc.html` while it waits. `login-wait.py`
+returns as soon as the post-login signal appears, and teardown writes the clone
+to `/base-profiles/gemini` (an atomic replace that strips `lock` /
+`.parentlock` and the automation pref). Point later tasks at it with
+`NEVOFLUX_TASK_PROFILE: "gemini"`.
 
 ## 8. How errors map to HTTP
 

@@ -399,6 +399,23 @@ impl ErrorBody {
         }
     }
 
+    /// 用后端给出的 `type` / `code` 原样构造。
+    ///
+    /// 脚本报的类型必须能穿到客户端：把它一律压成 `server_error` 会让超时看起来
+    /// 像脚本 bug，客户端据此重试，只会再烧一遍同样的预算。
+    pub fn from_parts(
+        message: impl Into<String>,
+        kind: impl Into<String>,
+        code: Option<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            kind: kind.into(),
+            code,
+            param: None,
+        }
+    }
+
     /// 504：超出预算。
     pub fn timeout(message: impl Into<String>) -> Self {
         Self {
@@ -687,6 +704,18 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
         // 未设置的字段不出现在信封里，而不是 null
         assert!(v["error"].get("param").is_none());
+    }
+
+    #[test]
+    fn from_parts_preserves_the_backend_type() {
+        // A timeout must NOT be flattened into server_error: the router picks
+        // 504 off this field, and a client would retry a 502 into the same wall.
+        let v = serde_json::to_value(ErrorEnvelope {
+            error: ErrorBody::from_parts("budget exceeded", "timeout", Some("timeout".into())),
+        })
+        .unwrap();
+        assert_eq!(v["error"]["type"], "timeout");
+        assert_eq!(v["error"]["code"], "timeout");
     }
 
     #[test]

@@ -127,7 +127,7 @@ pub const ORCHESTRATE_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60)
 /// LLM retry in orchestrate tool mode" error on the orchestrate path (where
 /// `llm_rewrite` is a stub). So a timeout must be returned directly, not routed
 /// through the repair path.
-fn is_timeout_error(error_type: &str, error_msg: &str) -> bool {
+pub fn is_timeout_error(error_type: &str, error_msg: &str) -> bool {
     error_type == "TimeoutError" || error_msg.contains("time limit exceeded")
 }
 

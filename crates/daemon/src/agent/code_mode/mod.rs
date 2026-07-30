@@ -15,6 +15,6 @@ pub mod signature;
 
 pub use executor::{
     execute_python_simple, execute_python_simple_with_timeout, execute_python_with_llm,
-    execute_python_with_sink, CodeModeExecutor, CodeModeResult, ToolCallResult,
+    execute_python_with_sink, is_timeout_error, CodeModeExecutor, CodeModeResult, ToolCallResult,
     DEFAULT_MAX_DURATION, ORCHESTRATE_MAX_DURATION,
 };

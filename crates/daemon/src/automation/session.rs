@@ -264,16 +264,27 @@ fn run_headless_script(
     // 合法名字，直接拼 JSON 会当场炸。调用表达式放末尾，其返回值即为
     // `CodeModeResult.result`；prints 落在 `.output`。
     let entry = crate::script_backend::detect_entry(&user_code);
-    let empty = serde_json::json!({});
-    let request = script_call.map(|c| &c.request).unwrap_or(&empty);
-    let wrapped = crate::script_backend::build_invocation(&user_code, entry, request, task);
-
     let sink = script_call.and_then(|c| c.sink.as_ref());
     // 沙箱预算由任务墙钟推导，不再吃 executor 的 180s 默认值——那是三层超时里
     // 最紧的一道，且唯一不可外部配置，会在墙钟到期前先把脚本掐死。
     let budget = script_call
         .and_then(|c| c.wall_clock_secs)
         .map(|secs| Duration::from_secs(secs.saturating_sub(SCRIPT_BUDGET_MARGIN_SECS).max(5)));
+
+    // 把预算告诉脚本自己。拿不到 deadline 的轮询后端只能猜还能跑几轮，猜多了
+    // 就是被掐断——连同已经 emit 出去的部分答案一起丢。在这里注入而不是在前端，
+    // 是因为这里才是真正算出并执行那个数字的地方，两边不可能对不上。
+    let empty = serde_json::json!({});
+    let mut request = script_call.map(|c| c.request.clone()).unwrap_or(empty);
+    if let (Some(obj), Some(b)) = (request.as_object_mut(), budget) {
+        let meta = obj
+            .entry("metadata")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(m) = meta.as_object_mut() {
+            m.insert("budget_secs".into(), serde_json::json!(b.as_secs()));
+        }
+    }
+    let wrapped = crate::script_backend::build_invocation(&user_code, entry, &request, task);
     let result = crate::agent::code_mode::execute_python_with_sink(
         &wrapped,
         Some(browser_ctx),
@@ -311,11 +322,20 @@ fn run_headless_script(
         let message = result
             .error
             .unwrap_or_else(|| "headless script execution failed".into());
+        // A blown budget is not a script defect: the spec maps it to 504
+        // `timeout`, and a client retrying a 502 would just burn the same
+        // budget again. The classifier is the executor's own, so this cannot
+        // drift from what actually aborts a run.
+        let (kind, code) = if crate::agent::code_mode::is_timeout_error("", &message) {
+            ("timeout", "timeout")
+        } else {
+            ("server_error", "script_error")
+        };
         if let Some(sink) = sink {
             sink.finish(crate::script_backend::FinishPayload::from_error(
                 message.clone(),
-                "server_error",
-                "script_error",
+                kind,
+                code,
             ));
         }
         AttemptOutcome {
@@ -642,6 +662,19 @@ mod tests {
             cancel_flag: None,
             script_path: script_path.map(|s| s.to_string()),
         }
+    }
+
+    /// The message the executor produces on a blown budget must be classified
+    /// as a timeout, not as a script defect — that is what earns a 504 instead
+    /// of a 502 at the HTTP layer.
+    #[test]
+    fn a_blown_budget_is_classified_as_a_timeout() {
+        let msg = "TimeoutError: time limit exceeded: 251.927288643s > 230s";
+        assert!(crate::agent::code_mode::is_timeout_error("", msg));
+        assert!(!crate::agent::code_mode::is_timeout_error(
+            "",
+            "TypeError: unsupported operand type(s) for %: 'str' and 'tuple'"
+        ));
     }
 
     #[test]

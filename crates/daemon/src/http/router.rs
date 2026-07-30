@@ -210,7 +210,7 @@ async fn chat_completions(
         };
         return openai_wire::error_response(
             status,
-            openai_wire::ErrorBody::server(message, code.unwrap_or_else(|| "script_error".into())),
+            openai_wire::ErrorBody::from_parts(message, kind, code),
         );
     }
 
@@ -272,9 +272,11 @@ fn stream_completion(
                 }
                 Some(Delta::Finish(p)) => {
                     let frame = if let Some((message, kind, code)) = p.error.clone() {
-                        openai_wire::chunk_error(&openai_wire::ErrorBody::server(
-                            message,
-                            code.unwrap_or(kind),
+                        // Same reasoning as the non-streaming path: the backend's
+                        // type must survive. In a stream it is the ONLY signal —
+                        // the status code was sent long before the failure.
+                        openai_wire::chunk_error(&openai_wire::ErrorBody::from_parts(
+                            message, kind, code,
                         ))
                     } else {
                         openai_wire::chunk_finish(&id, &model, &p)
