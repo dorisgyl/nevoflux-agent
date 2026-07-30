@@ -170,6 +170,10 @@ async fn chat_completions(
         .queue
         .submit_streaming(treq, crate::script_backend::DeltaSink::new(tx));
 
+    if req.stream {
+        return stream_completion(rx, id, model);
+    }
+
     let mut collected = String::new();
     let mut finish: Option<crate::script_backend::FinishPayload> = None;
     while let Some(delta) = rx.recv().await {
@@ -212,6 +216,65 @@ async fn chat_completions(
             &id, &model, &finish,
         )),
     )
+        .into_response()
+}
+
+/// 把增量通道变成 SSE 流。
+///
+/// 帧序：role 首帧 → 若干 content 增量（进度走注释帧，客户端忽略但连接保活）
+/// → 终帧（`finish_reason`，或错误数据帧）→ `[DONE]`。
+fn stream_completion(
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::script_backend::Delta>,
+    id: String,
+    model: String,
+) -> Response {
+    use crate::script_backend::Delta;
+    use futures::StreamExt as _;
+
+    let stream = futures::stream::unfold(
+        (rx, id, model, false, false),
+        |(mut rx, id, model, sent_role, done)| async move {
+            if done {
+                return None;
+            }
+            if !sent_role {
+                let ev = Event::default().data(openai_wire::chunk_role(&id, &model).to_string());
+                return Some((Ok(ev), (rx, id, model, true, false)));
+            }
+            match rx.recv().await {
+                Some(Delta::Text(t)) => {
+                    let ev = Event::default()
+                        .data(openai_wire::chunk_delta(&id, &model, &t).to_string());
+                    Some((Ok(ev), (rx, id, model, true, false)))
+                }
+                Some(Delta::Progress(p)) => {
+                    let ev = Event::default().comment(p);
+                    Some((Ok(ev), (rx, id, model, true, false)))
+                }
+                Some(Delta::Finish(p)) => {
+                    let frame = if let Some((message, kind, code)) = p.error.clone() {
+                        openai_wire::chunk_error(&openai_wire::ErrorBody::server(
+                            message,
+                            code.unwrap_or(kind),
+                        ))
+                    } else {
+                        openai_wire::chunk_finish(&id, &model, &p)
+                    };
+                    let ev = Event::default().data(frame.to_string());
+                    Some((Ok(ev), (rx, id, model, true, true)))
+                }
+                // 通道关闭而没有终帧：runner 自己没了。收尾即可，
+                // 此时状态码早已发出，没有别的表达手段。
+                None => None,
+            }
+        },
+    )
+    .chain(futures::stream::once(async {
+        Ok::<Event, Infallible>(Event::default().data("[DONE]"))
+    }));
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
         .into_response()
 }
 
@@ -367,6 +430,36 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["error"]["message"].as_str().unwrap().contains("user"));
+    }
+
+    #[tokio::test]
+    async fn streaming_request_returns_sse_chunks() {
+        let app = router(test_state());
+        let body = r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("chat.completion.chunk"), "got {text}");
+        assert!(text.contains("\"role\":\"assistant\""), "got {text}");
+        assert!(text.contains("[DONE]"), "got {text}");
     }
 
     #[tokio::test]

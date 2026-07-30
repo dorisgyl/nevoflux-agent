@@ -209,6 +209,82 @@ pub fn completion_response_from_finish(
     })
 }
 
+/// 流式首帧：只带 role，OpenAI 客户端据此建立 assistant 消息。
+pub fn chunk_role(task_id: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion.chunk",
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant" },
+            "finish_reason": serde_json::Value::Null,
+        }],
+    })
+}
+
+/// 流式增量帧（`chat.completion.chunk`）。
+pub fn chunk_delta(task_id: &str, model: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion.chunk",
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": text },
+            "finish_reason": serde_json::Value::Null,
+        }],
+    })
+}
+
+/// 流式终帧：空 delta + `finish_reason`（有工具调用时带上）。
+pub fn chunk_finish(
+    task_id: &str,
+    model: &str,
+    finish: &crate::script_backend::FinishPayload,
+) -> serde_json::Value {
+    let mut delta = serde_json::json!({});
+    if !finish.tool_calls.is_empty() {
+        delta["tool_calls"] = serde_json::Value::Array(
+            finish
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    serde_json::json!({
+                        "index": i,
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": serde_json::to_string(&c.arguments)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    serde_json::json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion.chunk",
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish.finish_reason,
+        }],
+    })
+}
+
+/// 流中错误帧：SSE 发出响应头后状态码已不可改，只能把错误当数据帧发。
+pub fn chunk_error(body: &ErrorBody) -> serde_json::Value {
+    serde_json::json!({ "error": body })
+}
+
 /// OpenAI 错误对象。`code` / `param` 未设置时不出现在 JSON 里。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorBody {
@@ -375,6 +451,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.last_user_text().as_deref(), Some("有内容"));
+    }
+
+    #[test]
+    fn chunk_frames_have_the_right_object_type() {
+        let d = chunk_delta("task-1", "m", "你");
+        assert_eq!(d["object"], "chat.completion.chunk");
+        assert_eq!(d["choices"][0]["delta"]["content"], "你");
+        assert!(d["choices"][0]["finish_reason"].is_null());
+
+        let r = chunk_role("task-1", "m");
+        assert_eq!(r["choices"][0]["delta"]["role"], "assistant");
+
+        let f = chunk_finish(
+            "task-1",
+            "m",
+            &crate::script_backend::FinishPayload::from_text("x".into()),
+        );
+        assert_eq!(f["choices"][0]["finish_reason"], "stop");
+        // 终帧的 delta 不带 content
+        assert!(f["choices"][0]["delta"]["content"].is_null());
     }
 
     #[test]
