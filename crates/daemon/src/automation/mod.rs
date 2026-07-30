@@ -60,7 +60,9 @@ pub fn build_headless_runner(
     let session_mode = session_mode_enabled(std::env::var("NEVOFLUX_SESSION_MODE").ok().as_deref());
 
     Some(std::sync::Arc::new(
-        move |id: String, req: crate::http::types::TaskRequest| {
+        move |id: String,
+              req: crate::http::types::TaskRequest,
+              sink: Option<crate::script_backend::DeltaSink>| {
             let template = template.clone();
             let registry = registry.clone();
             let browser_bin = browser_bin.clone();
@@ -81,6 +83,10 @@ pub fn build_headless_runner(
                     display,
                     mode: parse_agent_mode(&req.mode),
                     workspace,
+                    script_call: req.chat_request.clone().map(|request| session::ScriptCall {
+                        request,
+                        sink: sink.clone(),
+                    }),
                 };
                 let policy = req.to_policy();
                 let outcome = if session_mode {
@@ -98,6 +104,26 @@ pub fn build_headless_runner(
                 };
                 if outcome.status == crate::http::types::TaskStatus::Failed {
                     metrics.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                // 兜底终帧：脚本没跑到（浏览器起不来、配置缺失等）时 sink 上
+                // 不会有 Finish，HTTP 层就会一直等。`finish` 是幂等的，脚本
+                // 已经发过则这里是空操作。
+                if let Some(s) = sink.as_ref() {
+                    let payload = if outcome.status == crate::http::types::TaskStatus::Failed {
+                        crate::script_backend::FinishPayload::from_error(
+                            outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "task failed".into()),
+                            "server_error",
+                            "task_failed",
+                        )
+                    } else {
+                        crate::script_backend::FinishPayload::from_text(
+                            outcome.output.clone().unwrap_or_default(),
+                        )
+                    };
+                    s.finish(payload);
                 }
                 crate::http::types::TaskResponse {
                     id,
