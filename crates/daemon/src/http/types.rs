@@ -70,6 +70,13 @@ pub struct TaskRequest {
     /// Optional base name to save-as (default: the base the session cloned from).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_profile_as: Option<String>,
+    /// 结构化的脚本请求（[`crate::script_backend::ScriptRequest`] 的 JSON）。
+    ///
+    /// 由 OpenAI / MCP 前端填充；`None` 表示走老路径，脚本只拿到 `task` 字符串。
+    /// 放在线格式契约里是合适的——它是**数据**，不是运行时管道（增量 sink
+    /// 走 `Runner` 签名而不是这里）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_request: Option<serde_json::Value>,
 }
 
 fn default_mode() -> String {
@@ -145,6 +152,8 @@ impl TaskRequest {
             save_profile_as: std::env::var("NEVOFLUX_SAVE_PROFILE_AS")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // 前端在 from_env 之后按需填充（见 http::router::chat_completions）。
+            chat_request: None,
         }
     }
 }
@@ -185,6 +194,18 @@ pub struct TaskResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_request_defaults_to_none_and_parses() {
+        let plain: TaskRequest = serde_json::from_str(r#"{"task":"开页面"}"#).unwrap();
+        assert!(plain.chat_request.is_none());
+
+        let with_chat: TaskRequest = serde_json::from_str(
+            r#"{"task":"你好","chat_request":{"contract_version":1,"task":"你好"}}"#,
+        )
+        .unwrap();
+        assert_eq!(with_chat.chat_request.unwrap()["contract_version"], 1);
+    }
 
     #[test]
     fn task_request_deserializes_with_policy() {

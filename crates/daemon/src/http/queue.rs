@@ -13,7 +13,8 @@ use std::sync::{Arc, RwLock};
 
 /// Runs one task to a terminal [`TaskResponse`]. Implemented by the automation
 /// session runner (P3); mocked in tests.
-pub type Runner = Arc<dyn Fn(String, TaskRequest) -> BoxFuture<'static, TaskResponse> + Send + Sync>;
+pub type Runner =
+    Arc<dyn Fn(String, TaskRequest) -> BoxFuture<'static, TaskResponse> + Send + Sync>;
 
 /// Accepts and tracks tasks.
 pub struct TaskQueue {
@@ -72,7 +73,11 @@ impl TaskQueue {
     /// Submit `req` and poll until it reaches a terminal status (or `timeout`).
     /// Used by the synchronous front-ends (OpenAI-compatible / MCP). On timeout
     /// returns the last-known snapshot (still `Running`).
-    pub async fn submit_and_wait(&self, req: TaskRequest, timeout: std::time::Duration) -> TaskResponse {
+    pub async fn submit_and_wait(
+        &self,
+        req: TaskRequest,
+        timeout: std::time::Duration,
+    ) -> TaskResponse {
         let id = self.submit(req);
         let start = std::time::Instant::now();
         loop {
@@ -125,6 +130,7 @@ mod tests {
             end_session: false,
             save_profile: false,
             save_profile_as: None,
+            chat_request: None,
         }
     }
 
@@ -160,8 +166,7 @@ mod tests {
 
     #[test]
     fn unknown_task_status_is_none() {
-        let runner: Runner =
-            Arc::new(|id, _req| Box::pin(async move { super::queued(&id) }));
+        let runner: Runner = Arc::new(|id, _req| Box::pin(async move { super::queued(&id) }));
         let q = TaskQueue::new(runner);
         assert!(q.status("nope").is_none());
     }
