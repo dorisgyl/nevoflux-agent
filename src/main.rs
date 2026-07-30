@@ -779,7 +779,7 @@ async fn run_daemon(
                         tracing::warn!(
                             "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
                         );
-                        Arc::new(|id, _req| {
+                        Arc::new(|id, _req, _sink, _cancel| {
                             Box::pin(async move {
                                 http::types::TaskResponse {
                                     id,
