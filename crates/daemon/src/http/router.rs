@@ -158,36 +158,61 @@ async fn chat_completions(
     };
 
     let model = openai_wire::resolve_model(&req.model);
-    let treq = TaskRequest::from_env(task);
-    let resp = s
-        .queue
-        .submit_and_wait(treq, Duration::from_secs(600))
-        .await;
+    let script_request = crate::script_backend::ScriptRequest::from_openai(&req, &task, "pending");
 
-    match resp.status {
-        TaskStatus::Succeeded => {
-            let content = resp.output.clone().unwrap_or_default();
-            (
-                StatusCode::OK,
-                Json(openai_wire::completion_response(
-                    &resp.id, &model, &content, "stop",
-                )),
-            )
-                .into_response()
+    let mut treq = TaskRequest::from_env(task);
+    treq.chat_request = Some(script_request.to_value());
+
+    // 非流式请求同样开 sink：结构化结果（tool_calls / usage / finish_reason）
+    // 无法从 `TaskResponse.output` 这个字符串通道回传，两种模式统一从终帧取。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let id = s
+        .queue
+        .submit_streaming(treq, crate::script_backend::DeltaSink::new(tx));
+
+    let mut collected = String::new();
+    let mut finish: Option<crate::script_backend::FinishPayload> = None;
+    while let Some(delta) = rx.recv().await {
+        match delta {
+            crate::script_backend::Delta::Text(t) => collected.push_str(&t),
+            crate::script_backend::Delta::Progress(_) => {}
+            crate::script_backend::Delta::Finish(p) => {
+                finish = Some(*p);
+                break;
+            }
         }
-        TaskStatus::Failed => openai_wire::error_response(
-            StatusCode::BAD_GATEWAY,
-            openai_wire::ErrorBody::server(
-                resp.error.clone().unwrap_or_else(|| "task failed".into()),
-                "task_failed",
-            ),
-        ),
-        // Queued/Running 只可能来自 submit_and_wait 超时。
-        _ => openai_wire::error_response(
-            StatusCode::GATEWAY_TIMEOUT,
-            openai_wire::ErrorBody::timeout("task did not finish within the server budget"),
-        ),
     }
+
+    // 终帧由 runner 闭包兜底保证；走到这里说明 runner 自己没了。
+    let Some(mut finish) = finish else {
+        return openai_wire::error_response(
+            StatusCode::BAD_GATEWAY,
+            openai_wire::ErrorBody::server("task ended without a result", "no_result"),
+        );
+    };
+    if finish.content.is_empty() && finish.tool_calls.is_empty() && !collected.is_empty() {
+        finish.content = collected;
+    }
+
+    if let Some((message, kind, code)) = finish.error.clone() {
+        let status = if kind == "timeout" {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return openai_wire::error_response(
+            status,
+            openai_wire::ErrorBody::server(message, code.unwrap_or_else(|| "script_error".into())),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(openai_wire::completion_response_from_finish(
+            &id, &model, &finish,
+        )),
+    )
+        .into_response()
 }
 
 /// Tear down the reused browser session (session mode). Locks the same
@@ -364,8 +389,12 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        let runner: Runner = Arc::new(|id, _req, _sink| {
+        let runner: Runner = Arc::new(|id, _req, sink| {
             Box::pin(async move {
+                // 生产侧由 runner 闭包兜底发终帧；假 runner 里手动模拟。
+                if let Some(s) = sink {
+                    s.finish(crate::script_backend::FinishPayload::from_text("ok".into()));
+                }
                 TaskResponse {
                     id,
                     status: TaskStatus::Succeeded,

@@ -156,16 +156,40 @@ pub fn resolve_model(requested: &str) -> String {
     }
 }
 
-/// 构造一个非流式 `chat.completion` 响应体。
+/// 由终帧构造非流式响应。
 ///
-/// 字段集按最严格的客户端要求给全：`created` 与 `choices[].finish_reason` 在
-/// rig-core 的响应类型里都是非 Option，缺失会导致客户端反序列化失败。
-pub fn completion_response(
+/// `tool_calls[].function.arguments` 必须是**字符串化的 JSON**——这是线格式
+/// 要求，与契约里的对象形态不同，转换在这里完成。
+pub fn completion_response_from_finish(
     task_id: &str,
     model: &str,
-    content: &str,
-    finish_reason: &str,
+    finish: &crate::script_backend::FinishPayload,
 ) -> serde_json::Value {
+    let mut message = serde_json::json!({ "role": "assistant" });
+    if finish.tool_calls.is_empty() {
+        message["content"] = serde_json::Value::String(finish.content.clone());
+    } else {
+        message["content"] = serde_json::Value::Null;
+        message["tool_calls"] = serde_json::Value::Array(
+            finish
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": serde_json::to_string(&c.arguments)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let usage = finish.usage.unwrap_or_default();
     serde_json::json!({
         "id": format!("chatcmpl-{task_id}"),
         "object": "chat.completion",
@@ -173,11 +197,15 @@ pub fn completion_response(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "logprobs": serde_json::Value::Null,
-            "finish_reason": finish_reason,
+            "finish_reason": finish.finish_reason,
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        },
     })
 }
 
@@ -350,6 +378,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_arguments_are_stringified_on_the_wire() {
+        use crate::script_backend::{FinishPayload, ScriptToolCall};
+        let payload = FinishPayload {
+            content: String::new(),
+            tool_calls: vec![ScriptToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/a"}),
+            }],
+            finish_reason: "tool_calls".into(),
+            usage: None,
+            error: None,
+        };
+        let v = completion_response_from_finish("task-1", "m", &payload);
+        let tc = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "read_file");
+        // 线格式要求 arguments 是**字符串**，不是对象
+        let args = tc["function"]["arguments"].as_str().expect("string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(args).unwrap()["path"],
+            "/tmp/a"
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        // 有工具调用时 content 应为 null
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn usage_from_script_is_reported() {
+        use crate::script_backend::{FinishPayload, Usage};
+        let payload = FinishPayload {
+            content: "hi".into(),
+            tool_calls: vec![],
+            finish_reason: "stop".into(),
+            usage: Some(Usage {
+                prompt_tokens: 7,
+                completion_tokens: 2,
+                total_tokens: 9,
+            }),
+            error: None,
+        };
+        let v = completion_response_from_finish("task-1", "m", &payload);
+        assert_eq!(v["usage"]["prompt_tokens"], 7);
+        assert_eq!(v["usage"]["total_tokens"], 9);
+    }
+
+    #[test]
     fn advertised_model_defaults_and_reads_env() {
         // 该测试串行修改进程环境变量，故与其它 env 测试合并在同一个用例内。
         std::env::remove_var("NEVOFLUX_HEADLESS_MODEL");
@@ -378,7 +455,11 @@ mod tests {
 
     #[test]
     fn completion_response_has_all_required_fields() {
-        let v = completion_response("task-3", "gemini-web", "你好", "stop");
+        let v = completion_response_from_finish(
+            "task-3",
+            "gemini-web",
+            &crate::script_backend::FinishPayload::from_text("你好".into()),
+        );
         assert_eq!(v["id"], "chatcmpl-task-3");
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["model"], "gemini-web");
@@ -394,7 +475,11 @@ mod tests {
     /// 少一个字段就会在客户端侧炸——这个测试让它在 CI 里炸，而不是在生产。
     #[test]
     fn rig_client_can_deserialize_our_response() {
-        let v = completion_response("task-0", "gemini-web", "Example Domain", "stop");
+        let v = completion_response_from_finish(
+            "task-0",
+            "gemini-web",
+            &crate::script_backend::FinishPayload::from_text("Example Domain".into()),
+        );
         let parsed: Result<rig::providers::openai::CompletionResponse, _> =
             serde_json::from_value(v);
         let parsed = parsed.expect("rig must be able to parse our response");
