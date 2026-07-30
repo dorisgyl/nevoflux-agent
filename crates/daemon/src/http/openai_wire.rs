@@ -103,6 +103,39 @@ impl ChatCompletionRequest {
     }
 }
 
+/// 当前 Unix 秒。客户端（如 rig）把 `created` 当必填字段。
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 构造一个非流式 `chat.completion` 响应体。
+///
+/// 字段集按最严格的客户端要求给全：`created` 与 `choices[].finish_reason` 在
+/// rig-core 的响应类型里都是非 Option，缺失会导致客户端反序列化失败。
+pub fn completion_response(
+    task_id: &str,
+    model: &str,
+    content: &str,
+    finish_reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion",
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "logprobs": serde_json::Value::Null,
+            "finish_reason": finish_reason,
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+    })
+}
+
 /// OpenAI 错误对象。`code` / `param` 未设置时不出现在 JSON 里。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ErrorBody {
@@ -269,6 +302,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.last_user_text().as_deref(), Some("有内容"));
+    }
+
+    #[test]
+    fn completion_response_has_all_required_fields() {
+        let v = completion_response("task-3", "gemini-web", "你好", "stop");
+        assert_eq!(v["id"], "chatcmpl-task-3");
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["model"], "gemini-web");
+        assert!(v["created"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(v["choices"][0]["index"], 0);
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "你好");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 互操作证明：用 rig-core 自己的响应类型反序列化我们的输出。
+    /// rig 的 `created: u64` 和 `Choice.finish_reason: String` 都不是 Option，
+    /// 少一个字段就会在客户端侧炸——这个测试让它在 CI 里炸，而不是在生产。
+    #[test]
+    fn rig_client_can_deserialize_our_response() {
+        let v = completion_response("task-0", "gemini-web", "Example Domain", "stop");
+        let parsed: Result<rig::providers::openai::CompletionResponse, _> =
+            serde_json::from_value(v);
+        let parsed = parsed.expect("rig must be able to parse our response");
+        assert_eq!(parsed.choices.len(), 1);
+        assert_eq!(parsed.choices[0].finish_reason, "stop");
     }
 
     #[test]
