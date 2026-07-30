@@ -59,6 +59,20 @@ means being killed mid-flight, which throws away the partial answer it had
 already emitted. The value is injected where the number is computed and
 enforced, so it cannot disagree with the limit that fires.
 
+Two things make budgeting harder than it looks, both learned the hard way:
+
+- **Monty has no clock**, so a script cannot measure how much of its budget it
+  has spent — it can only bound the round count up front. That makes the
+  per-round cost estimate the whole ballgame, and it must be *measured*: a
+  round is usually dominated by `browser_get_markdown`, which on a large page
+  cost ~20s in practice, against guesses of 2s and 4s that were off by an order
+  of magnitude.
+- **Do not rely on a completion selector alone.** Stop after N rounds without
+  growth as well. A rotted (or never-appearing) "done" control otherwise keeps
+  the loop running until the sandbox kills it — with the finished answer
+  already in hand. `webui_backend.py` has both patterns as `budget_ticks` and
+  `poll_growing_text(..., idle_limit=...)`.
+
 `messages` and `arguments` are **both always present**, each possibly in a
 degenerate form — so a script never has to know whether the OpenAI or the MCP
 front-end called it.

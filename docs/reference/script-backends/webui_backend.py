@@ -120,22 +120,49 @@ def slice_section(markdown, start_marker, end_markers):
     return after.strip()
 
 
-def poll_growing_text(tab_id, start_marker, end_markers, done_selectors, max_rounds=60):
+def budget_ticks(request, per_tick_secs, reserve_secs, default_ticks=60):
+    """How many poll rounds fit in the budget the sandbox will actually enforce.
+
+    `metadata.budget_secs` comes from the daemon (task wall clock minus a
+    margin). Monty has no clock, so a script cannot measure elapsed time — it
+    can only bound the round count up front, which makes `per_tick_secs` the
+    number that matters. **Measure it against the real page**: a round is
+    usually dominated by `browser_get_markdown`, which on a large page can cost
+    tens of seconds. Guessing low gets the script killed with the answer
+    already in hand; guessing high only shortens the tail.
+    """
+    meta = request.get("metadata") or {}
+    budget = meta.get("budget_secs")
+    if not budget:
+        return default_ticks
+    usable = budget - reserve_secs
+    if usable < per_tick_secs:
+        return 1
+    return max(1, int(usable / per_tick_secs))
+
+
+def poll_growing_text(
+    tab_id, start_marker, end_markers, done_selectors, max_rounds=60, idle_limit=2
+):
     """Poll a page that renders text progressively, emitting the new characters.
 
     Returns the final text. The increment is "whatever this round's slice has
-    that the last one didn't" — which is exactly what a progressively rendered
-    page adds between polls.
+    that the last one didn't" — exactly what a progressively rendered page adds
+    between polls.
 
-    Any of `done_selectors` becoming visible ends the loop. Polling (rather than
-    waiting once) is the only way this kind of backend can stream at all.
+    Ends on any of `done_selectors`, or after `idle_limit` rounds without
+    growth. **The idle cutoff is not an optimisation**: a completion selector
+    that rots (or never appears) otherwise leaves the loop running until the
+    sandbox kills it, throwing away the answer already emitted. Size
+    `max_rounds` with `budget_ticks`.
 
-    Note each round performs tool calls, which is also what makes the script
-    cancellable: cancellation is checked at tool-call boundaries, so a pure
-    compute loop could never be interrupted.
+    Each round performs tool calls, which is also what makes the script
+    cancellable: cancellation is only checked at tool-call boundaries, so a
+    pure compute loop could never be interrupted.
     """
     sent = ""
     text = ""
+    idle = 0
     for _ in range(max_rounds):
         done = wait_any(done_selectors, tab_id, timeout_ms=1000) is not None
 
@@ -148,6 +175,9 @@ def poll_growing_text(tab_id, start_marker, end_markers, done_selectors, max_rou
         if len(text) > len(sent):
             emit_text(text[len(sent):])
             sent = text
-        if done:
+            idle = 0
+        else:
+            idle = idle + 1
+        if done or idle >= idle_limit:
             break
     return text
