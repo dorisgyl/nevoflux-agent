@@ -4,6 +4,7 @@
 //! handlers + task queue land alongside as P4 Tasks 2–4.
 
 pub mod metrics;
+pub mod openai_wire;
 pub mod queue;
 pub mod router;
 pub mod rpc;
