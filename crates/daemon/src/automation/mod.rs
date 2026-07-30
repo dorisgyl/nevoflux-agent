@@ -86,6 +86,9 @@ pub fn build_headless_runner(
                     script_call: req.chat_request.clone().map(|request| session::ScriptCall {
                         request,
                         sink: sink.clone(),
+                        wall_clock_secs: req.wall_clock_secs,
+                        // 取消标志在第 4 阶段 Task 5 接上（HTTP 侧断连时置位）。
+                        cancel_flag: None,
                     }),
                 };
                 let policy = req.to_policy();

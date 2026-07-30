@@ -19,6 +19,10 @@ use nevoflux_protocol::common::BrowserToolAction;
 use std::future::Future;
 use std::time::Duration;
 
+/// 沙箱预算相对任务墙钟留出的余量（秒）：脚本被掐断后仍要有时间把错误
+/// 汇报上来，不能和墙钟同时到期。
+const SCRIPT_BUDGET_MARGIN_SECS: u64 = 10;
+
 /// Result of one attempt at a task.
 #[derive(Debug, Clone)]
 pub struct AttemptOutcome {
@@ -245,7 +249,18 @@ fn run_headless_script(
     let wrapped = crate::script_backend::build_invocation(&user_code, entry, request, task);
 
     let sink = script_call.and_then(|c| c.sink.as_ref());
-    let result = crate::agent::code_mode::execute_python_simple(&wrapped, Some(browser_ctx));
+    // 沙箱预算由任务墙钟推导，不再吃 executor 的 180s 默认值——那是三层超时里
+    // 最紧的一道，且唯一不可外部配置，会在墙钟到期前先把脚本掐死。
+    let budget = script_call
+        .and_then(|c| c.wall_clock_secs)
+        .map(|secs| Duration::from_secs(secs.saturating_sub(SCRIPT_BUDGET_MARGIN_SECS).max(5)));
+    let result = crate::agent::code_mode::execute_python_with_sink(
+        &wrapped,
+        Some(browser_ctx),
+        script_call.and_then(|c| c.sink.clone()),
+        budget,
+        script_call.and_then(|c| c.cancel_flag.clone()),
+    );
     if result.success {
         // Prefer the returned value; fall back to printed output.
         let value = match &result.result {
@@ -302,6 +317,10 @@ pub struct ScriptCall {
     pub request: serde_json::Value,
     /// 增量出口；`None` 表示调用方不收增量。
     pub sink: Option<crate::script_backend::DeltaSink>,
+    /// 任务墙钟（秒），用于推导沙箱预算。
+    pub wall_clock_secs: Option<u64>,
+    /// 协作式取消标志：客户端断开时置位。
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Everything the per-task orchestration needs, threaded from the daemon.
