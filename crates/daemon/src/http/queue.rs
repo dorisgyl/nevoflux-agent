@@ -6,6 +6,7 @@
 //! in production.
 
 use crate::http::types::{TaskRequest, TaskResponse, TaskStatus};
+use crate::script_backend::DeltaSink;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,8 +14,15 @@ use std::sync::{Arc, RwLock};
 
 /// Runs one task to a terminal [`TaskResponse`]. Implemented by the automation
 /// session runner (P3); mocked in tests.
-pub type Runner =
-    Arc<dyn Fn(String, TaskRequest) -> BoxFuture<'static, TaskResponse> + Send + Sync>;
+///
+/// `sink` 是可选的增量出口：流式请求由 HTTP 层建通道传入，非流式请求同样
+/// 传入（只是在进程内收集），因为结构化结果（`tool_calls` / `usage`）无法从
+/// `TaskResponse.output` 这个字符串通道回传。
+pub type Runner = Arc<
+    dyn Fn(String, TaskRequest, Option<DeltaSink>) -> BoxFuture<'static, TaskResponse>
+        + Send
+        + Sync,
+>;
 
 /// Accepts and tracks tasks.
 pub struct TaskQueue {
@@ -46,6 +54,15 @@ impl TaskQueue {
 
     /// Submit a task; returns its id immediately (status `Queued`).
     pub fn submit(&self, req: TaskRequest) -> String {
+        self.submit_with(req, None)
+    }
+
+    /// 同 [`Self::submit`]，但把增量出口交给 runner。
+    pub fn submit_streaming(&self, req: TaskRequest, sink: DeltaSink) -> String {
+        self.submit_with(req, Some(sink))
+    }
+
+    fn submit_with(&self, req: TaskRequest, sink: Option<DeltaSink>) -> String {
         let id = format!("task-{}", self.seq.fetch_add(1, Ordering::Relaxed));
         self.statuses
             .write()
@@ -59,7 +76,7 @@ impl TaskQueue {
             if let Some(r) = statuses.write().unwrap().get_mut(&run_id) {
                 r.status = TaskStatus::Running;
             }
-            let resp = runner(run_id.clone(), req).await;
+            let resp = runner(run_id.clone(), req, sink).await;
             statuses.write().unwrap().insert(run_id, resp);
         });
         id
@@ -136,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_runs_task_and_tracks_status() {
-        let runner: Runner = Arc::new(|id, _req| {
+        let runner: Runner = Arc::new(|id, _req, _sink| {
             Box::pin(async move {
                 TaskResponse {
                     id,
@@ -164,9 +181,39 @@ mod tests {
         panic!("task did not reach Succeeded");
     }
 
+    #[tokio::test]
+    async fn submit_streaming_hands_the_sink_to_the_runner() {
+        use crate::script_backend::{Delta, DeltaSink, FinishPayload};
+        let runner: Runner = Arc::new(|id, _req, sink| {
+            Box::pin(async move {
+                if let Some(s) = sink {
+                    s.text("增量");
+                    s.finish(FinishPayload::from_text("完成".into()));
+                }
+                TaskResponse {
+                    id,
+                    status: TaskStatus::Succeeded,
+                    attempts: 1,
+                    output: Some("完成".into()),
+                    error: None,
+                    artifacts: vec![],
+                }
+            })
+        });
+        let q = TaskQueue::new(runner);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _id = q.submit_streaming(sample_request(), DeltaSink::new(tx));
+        assert_eq!(rx.recv().await.unwrap(), Delta::Text("增量".into()));
+        match rx.recv().await.unwrap() {
+            Delta::Finish(p) => assert_eq!(p.content, "完成"),
+            other => panic!("expected finish, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unknown_task_status_is_none() {
-        let runner: Runner = Arc::new(|id, _req| Box::pin(async move { super::queued(&id) }));
+        let runner: Runner =
+            Arc::new(|id, _req, _sink| Box::pin(async move { super::queued(&id) }));
         let q = TaskQueue::new(runner);
         assert!(q.status("nope").is_none());
     }
@@ -176,7 +223,7 @@ mod tests {
         // Runner would sleep forever; but the worker is never scheduled because
         // this test never awaits after submit, so the task stays Queued and
         // cancel wins deterministically.
-        let runner: Runner = Arc::new(|id, _req| {
+        let runner: Runner = Arc::new(|id, _req, _sink| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 super::queued(&id)

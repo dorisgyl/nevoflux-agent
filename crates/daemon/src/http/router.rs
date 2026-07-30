@@ -364,7 +364,7 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        let runner: Runner = Arc::new(|id, _req| {
+        let runner: Runner = Arc::new(|id, _req, _sink| {
             Box::pin(async move {
                 TaskResponse {
                     id,
