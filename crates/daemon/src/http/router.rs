@@ -7,6 +7,7 @@
 //! against the already-tested queue/metrics.
 
 use crate::http::metrics::Metrics;
+use crate::http::openai_wire;
 use crate::http::queue::TaskQueue;
 use crate::http::types::{TaskRequest, TaskStatus};
 use axum::{
@@ -14,13 +15,12 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
 };
 use futures::stream::Stream;
-use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,7 +51,9 @@ pub fn router(state: AppState) -> Router {
 /// OpenAI-compatible routes, unstated so the caller applies state once. For a
 /// dedicated port: `openai_routes().with_state(state)`.
 pub fn openai_routes() -> Router<AppState> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(models))
 }
 
 /// Bind `addr` and serve `app` until the process exits.
@@ -60,10 +62,7 @@ pub async fn serve(addr: SocketAddr, app: Router) -> std::io::Result<()> {
     axum::serve(listener, app).await
 }
 
-async fn submit_task(
-    State(s): State<AppState>,
-    Json(req): Json<TaskRequest>,
-) -> impl IntoResponse {
+async fn submit_task(State(s): State<AppState>, Json(req): Json<TaskRequest>) -> impl IntoResponse {
     let id = s.queue.submit(req);
     (StatusCode::OK, Json(serde_json::json!({ "id": id })))
 }
@@ -128,70 +127,67 @@ async fn task_events(
 
 // ---- OpenAI-compatible chat completions -------------------------------------
 
-#[derive(Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+/// OpenAI-compatible `GET /v1/models`.
+async fn models() -> impl IntoResponse {
+    (StatusCode::OK, Json(openai_wire::models_response()))
 }
 
-#[derive(Deserialize)]
-struct ChatCompletionRequest {
-    #[serde(default)]
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    stream: bool,
-}
-
-/// OpenAI-compatible `POST /v1/chat/completions`. The last `user` message becomes
-/// a browser task (mode/profile/policy from env via [`TaskRequest::from_env`]);
-/// the agent runs it and its answer is returned as the assistant message.
-/// Non-streaming.
+/// OpenAI-compatible `POST /v1/chat/completions`. The last non-empty `user`
+/// message becomes a browser task (mode/profile/policy from env via
+/// [`TaskRequest::from_env`]); the agent runs it and its answer comes back as
+/// the assistant message. Non-streaming.
+///
+/// Wire-format concerns (content shapes, error envelope, response fields) live
+/// in [`crate::http::openai_wire`]; this handler only binds them to the queue.
 async fn chat_completions(
     State(s): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> impl IntoResponse {
-    let task = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    if task.trim().is_empty() {
-        return (
+    body: Result<openai_wire::OpenAiJson<openai_wire::ChatCompletionRequest>, Response>,
+) -> Response {
+    let req = match body {
+        Ok(openai_wire::OpenAiJson(req)) => req,
+        Err(rejection) => return rejection,
+    };
+
+    let Some(task) = req.last_user_text() else {
+        return openai_wire::error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": {"message": "no user message"}})),
-        )
-            .into_response();
-    }
+            openai_wire::ErrorBody::invalid_request(
+                "no non-empty user message: the last user message carries the task",
+            ),
+        );
+    };
+
+    let model = openai_wire::resolve_model(&req.model);
     let treq = TaskRequest::from_env(task);
     let resp = s
         .queue
         .submit_and_wait(treq, Duration::from_secs(600))
         .await;
-    let content = resp
-        .output
-        .clone()
-        .or_else(|| resp.error.clone())
-        .unwrap_or_default();
-    let finish = if resp.status == TaskStatus::Succeeded {
-        "stop"
-    } else {
-        "error"
-    };
-    let body = serde_json::json!({
-        "id": format!("chatcmpl-{}", resp.id),
-        "object": "chat.completion",
-        "model": if req.model.is_empty() { "nevoflux-headless".to_string() } else { req.model },
-        "choices": [{
-            "index": 0,
-            "message": { "role": "assistant", "content": content },
-            "finish_reason": finish
-        }]
-    });
-    (StatusCode::OK, Json(body)).into_response()
+
+    match resp.status {
+        TaskStatus::Succeeded => {
+            let content = resp.output.clone().unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(openai_wire::completion_response(
+                    &resp.id, &model, &content, "stop",
+                )),
+            )
+                .into_response()
+        }
+        TaskStatus::Failed => openai_wire::error_response(
+            StatusCode::BAD_GATEWAY,
+            openai_wire::ErrorBody::server(
+                resp.error.clone().unwrap_or_else(|| "task failed".into()),
+                "task_failed",
+            ),
+        ),
+        // Queued/Running 只可能来自 submit_and_wait 超时。
+        _ => openai_wire::error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            openai_wire::ErrorBody::timeout("task did not finish within the server budget"),
+        ),
+    }
 }
 
 /// Tear down the reused browser session (session mode). Locks the same
@@ -222,10 +218,9 @@ async fn close_session(body: Option<Json<CloseSessionRequest>>) -> impl IntoResp
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
     let pm = crate::profile::ProfileManager { base_dir, work_dir };
-    let report = crate::automation::session_holder::teardown_locked(
-        &mut guard, &pm, req.save, req.save_as,
-    )
-    .await;
+    let report =
+        crate::automation::session_holder::teardown_locked(&mut guard, &pm, req.save, req.save_as)
+            .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -278,6 +273,94 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["closed"], false);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_accepts_rig_shaped_body() {
+        let app = router(test_state());
+        let body = r#"{"model":"deepseekv4-flash","messages":[
+            {"role":"system","content":[{"type":"text","text":"You are helpful"}]},
+            {"role":"user","content":[{"type":"text","text":"你好"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["model"], "deepseekv4-flash");
+        assert!(v["created"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(v["choices"][0]["message"]["content"], "ok");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_missing_messages_with_400_envelope() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_empty_prompt_with_400_envelope() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"system","content":"s"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("user"));
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_lists_one_model() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+        assert!(v["data"][0]["id"].as_str().is_some());
     }
 
     fn test_state() -> AppState {
