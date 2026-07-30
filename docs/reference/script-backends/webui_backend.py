@@ -1,22 +1,26 @@
-# 网页版 LLM 后端模板（脚本契约 v1）
+# Template for web-scraping script backends (script contract v1)
 #
-# Monty 沙箱没有模块系统，`import` 不可用——所以这不是一个库，而是**一段可以
-# 复制粘贴的函数块**。新写一个后端时，把这些函数抄进你的脚本，改选择器即可。
+# The Monty sandbox has no module system, so `import` is unavailable — this is
+# not a library but a block of functions to **copy and paste**. Start a new
+# backend by pasting what you need and changing the selectors.
 #
-# 契约要点（完整说明见 docs/reference/script-backend-contract.md）：
+# Contract essentials (full reference: docs/reference/script-backend-contract.md):
 #   def chat(request) -> {"content": str} | {"tool_calls": [...]} | {"error": {...}}
-#   emit_text(str)      正文增量，客户端逐字看到
-#   emit_progress(str)  进度提示，不进正文（OpenAI 侧是 SSE 注释帧）
+#   emit_text(str)      content increments; the client sees them as they arrive
+#   emit_progress(str)  progress notes; never part of the content
+#
+# Worked example: google-search.py
 
 
 def is_err(r):
-    """工具调用返回的是错误信封而不是结果时为 True。"""
+    """True when a tool call returned an error envelope instead of a result."""
     return isinstance(r, dict) and r.get("__tool_error")
 
 
-def fail(step, label, err, tab_id=None):
-    """构造契约错误。`step`/`label` 让失败可定位——网页版后端会随对方
-    改版而腐烂，出错时说清楚死在哪一步比什么都重要。"""
+def fail(step, label, err):
+    """Build a contract error. `step`/`label` make the failure locatable —
+    a scraping backend WILL rot as the target site ships UI changes, so naming
+    the step that died matters more than anything else in the message."""
     detail = err.get("error", "failed") if isinstance(err, dict) else str(err)
     return {
         "error": {
@@ -28,8 +32,9 @@ def fail(step, label, err, tab_id=None):
 
 
 def click_first(selectors, tab_id):
-    """依次尝试一组选择器，返回命中的那个；全失败返回 None。
-    网页版 UI 经常小改，单一选择器太脆。"""
+    """Try each selector in turn; return the one that worked, else None.
+    A single selector is too brittle — the same page ships different markup to
+    different locales and experiment buckets."""
     for sel in selectors:
         r = browser_click(selector=sel, tab_id=tab_id)
         if not is_err(r):
@@ -38,7 +43,7 @@ def click_first(selectors, tab_id):
 
 
 def fill_first(selectors, text, tab_id):
-    """依次尝试一组输入框选择器，返回命中的那个；全失败返回 None。"""
+    """Try each input selector in turn; return the one that worked, else None."""
     for sel in selectors:
         r = browser_input(selector=sel, text=text, mode="fill", verify=True, tab_id=tab_id)
         if not is_err(r):
@@ -46,11 +51,38 @@ def fill_first(selectors, text, tab_id):
     return None
 
 
-def slice_reply(markdown, start_marker, end_markers):
-    """从整页 markdown 里切出回答正文。
+def wait_any(selectors, tab_id, timeout_ms=5000):
+    """Wait until any one of `selectors` is visible; return it, else None."""
+    for sel in selectors:
+        r = browser_wait_for(selector=sel, state="visible", timeout_ms=timeout_ms, tab_id=tab_id)
+        if not is_err(r):
+            return sel
+    return None
 
-    `end_markers` 按**从最具体到最宽泛**排列——先削掉长而独特的 UI 残渣，
-    再削短的，否则短标记会在正文里误命中（比如正文里出现单独一行 "Pro"）。
+
+def query_visible(selector, tab_id):
+    """Return the visible elements matching `selector`.
+
+    `browser_query_all` yields dicts shaped
+    `{tag, id, text, visible, path_selector}` — note there is **no href**, and
+    `text` is truncated to 100 characters. If you need URLs or long text, parse
+    `browser_get_markdown` instead.
+    """
+    r = browser_query_all(selector=selector, tab_id=tab_id)
+    if is_err(r):
+        return []
+    items = r.get("result", r) if isinstance(r, dict) else r
+    if not isinstance(items, list):
+        return []
+    return [el for el in items if el.get("visible")]
+
+
+def slice_section(markdown, start_marker, end_markers):
+    """Cut a section out of the page markdown.
+
+    Order `end_markers` from **most specific to most general**: strip the long,
+    distinctive chrome first, then the short markers. Otherwise a short marker
+    matches inside the content itself and truncates a legitimate answer.
     """
     if start_marker not in markdown:
         return ""
@@ -61,32 +93,34 @@ def slice_reply(markdown, start_marker, end_markers):
     return after.strip()
 
 
-def poll_reply(tab_id, start_marker, end_markers, done_selectors, max_rounds=60):
-    """轮询页面，把新增的正文作为增量吐出去，直到回答完成。
+def poll_growing_text(tab_id, start_marker, end_markers, done_selectors, max_rounds=60):
+    """Poll a page that renders text progressively, emitting the new characters.
 
-    返回最终正文。增量靠"本轮切出的正文比上轮长"来判断——网页版是逐字
-    渲染的，所以差量就是新吐出的字。
+    Returns the final text. The increment is "whatever this round's slice has
+    that the last one didn't" — which is exactly what a progressively rendered
+    page adds between polls.
 
-    `done_selectors` 里任何一个出现即视为回答结束（如"点赞"按钮）。
-    轮询而不是干等，是这个后端能做到真流式的唯一途径。
+    Any of `done_selectors` becoming visible ends the loop. Polling (rather than
+    waiting once) is the only way this kind of backend can stream at all.
+
+    Note each round performs tool calls, which is also what makes the script
+    cancellable: cancellation is checked at tool-call boundaries, so a pure
+    compute loop could never be interrupted.
     """
     sent = ""
-    reply = ""
+    text = ""
     for _ in range(max_rounds):
-        for sel in done_selectors:
-            probe = browser_wait_for(selector=sel, state="visible", timeout_ms=1000, tab_id=tab_id)
-            if not is_err(probe):
-                md = browser_get_markdown(tab_id=tab_id)
-                text = md.get("markdown", "") if isinstance(md, dict) else str(md)
-                reply = slice_reply(text, start_marker, end_markers)
-                if len(reply) > len(sent):
-                    emit_text(reply[len(sent):])
-                return reply
+        done = wait_any(done_selectors, tab_id, timeout_ms=1000) is not None
 
         md = browser_get_markdown(tab_id=tab_id)
-        text = md.get("markdown", "") if isinstance(md, dict) else str(md)
-        reply = slice_reply(text, start_marker, end_markers)
-        if len(reply) > len(sent):
-            emit_text(reply[len(sent):])
-            sent = reply
-    return reply
+        if is_err(md):
+            return text
+        page = md.get("markdown", "") if isinstance(md, dict) else str(md)
+        text = slice_section(page, start_marker, end_markers)
+
+        if len(text) > len(sent):
+            emit_text(text[len(sent):])
+            sent = text
+        if done:
+            break
+    return text
