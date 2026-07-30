@@ -347,9 +347,30 @@ pub fn chunk_finish(
     })
 }
 
-/// 流中错误帧：SSE 发出响应头后状态码已不可改，只能把错误当数据帧发。
-pub fn chunk_error(body: &ErrorBody) -> serde_json::Value {
-    serde_json::json!({ "error": body })
+/// 流中的错误帧：**把错误当正文发**，并在同一帧带上终止原因。
+///
+/// 不能发 `{"error": ...}` 数据帧：客户端把每个 `data:` 反序列化成要求
+/// `choices` 字段的 chunk 类型，错误对象解析失败后被静默跳过（rig-core 0.29
+/// `streaming.rs:177` 记一条日志就 `continue`），于是流以 0 个 chunk 结束，
+/// 用户看到一个没有任何解释的空回答。状态码也救不了——它在失败发生之前就
+/// 已经发出去了。正文是这条路径上唯一还能抵达用户的通道。
+pub fn chunk_error_as_content(
+    task_id: &str,
+    model: &str,
+    message: &str,
+    finish_reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{task_id}"),
+        "object": "chat.completion.chunk",
+        "created": unix_now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": message },
+            "finish_reason": finish_reason,
+        }],
+    })
 }
 
 /// OpenAI 错误对象。`code` / `param` 未设置时不出现在 JSON 里。

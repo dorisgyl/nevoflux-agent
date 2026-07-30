@@ -226,7 +226,12 @@ to `/base-profiles/gemini` (an atomic replace that strips `lock` /
 | script returned `{"error": ...}` | 502 | the code the script supplied |
 | timed out | 504 | `timeout` |
 
-Once the stream has started (SSE has already sent the response headers, so the
-status code can no longer change), the gateway emits an `{"error": {...}}` data
-frame followed by `[DONE]` rather than dropping the connection — a dropped
-connection reaches the client as a bare reset, losing every diagnostic.
+Once the stream has started the status code is already sent, so a failure can
+only travel as a frame. The gateway sends the message as a **content delta**
+with `finish_reason: "error"`, not as an `{"error": {...}}` data frame.
+
+That is not a style choice. Clients deserialize every `data:` line into a chunk
+type that requires `choices`; an error object fails that parse and is skipped
+(rig-core 0.29 `streaming.rs:177` logs it and continues), so the stream ends
+with zero chunks and the user sees an empty answer with no explanation. Content
+is the only channel on this path that reliably reaches a human.

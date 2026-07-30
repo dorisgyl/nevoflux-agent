@@ -271,15 +271,22 @@ fn stream_completion(
                     Some((Ok(ev), (rx, id, model, true, false, guard)))
                 }
                 Some(Delta::Finish(p)) => {
-                    let frame = if let Some((message, kind, code)) = p.error.clone() {
-                        // Same reasoning as the non-streaming path: the backend's
-                        // type must survive. In a stream it is the ONLY signal —
-                        // the status code was sent long before the failure.
-                        openai_wire::chunk_error(&openai_wire::ErrorBody::from_parts(
-                            message, kind, code,
-                        ))
-                    } else {
-                        openai_wire::chunk_finish(&id, &model, &p)
+                    // Errors go out as a CONTENT delta, not as an `{"error":...}`
+                    // data frame. Clients deserialize each frame into a chunk
+                    // type that requires `choices`; an error object fails that
+                    // parse and gets skipped, so the stream ends with zero
+                    // chunks and the user is shown an empty answer with no
+                    // explanation (rig logs it and moves on — verified against
+                    // rig-core 0.29 streaming.rs:177). The status code cannot
+                    // carry it either: it was sent before the failure existed.
+                    let frame = match p.error.clone() {
+                        Some((message, _kind, _code)) => openai_wire::chunk_error_as_content(
+                            &id,
+                            &model,
+                            &message,
+                            &p.finish_reason,
+                        ),
+                        None => openai_wire::chunk_finish(&id, &model, &p),
                     };
                     let ev = Event::default().data(frame.to_string());
                     Some((Ok(ev), (rx, id, model, true, true, guard)))
