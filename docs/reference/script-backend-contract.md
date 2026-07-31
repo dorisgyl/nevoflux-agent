@@ -39,7 +39,8 @@ A `# def chat(...)` in a comment does not count, and neither do names like
     {"role": "system|user|assistant|tool",
      "content": "flattened plain text",   # always a str
      "content_parts": [...],              # raw content blocks, [] when absent
-     "tool_call_id": "call_1"}            # tool role only
+     "tool_call_id": "call_1",            # tool role only
+     "tool_calls": [...]}                 # assistant role only, wire format verbatim
   ],
   "arguments": {},                   # raw MCP tools/call arguments; {} on the OpenAI side
 
@@ -148,10 +149,44 @@ Argument names matter as much: `browser_wait_for` only forwards `selector` and
 `timeout_ms` (a `state` argument is silently dropped), and
 `browser_wait_for_stable` takes `strategy` / `max_wait`, not `timeout_ms`.
 
+**Verify immediately before acting, not when writing.** `browser_input`'s
+`verify=True` checks only at the moment of the fill. Anything that clears the
+field afterwards — a late page reset, a re-render — then submits an empty value,
+and the failure surfaces much later as "no answer" with the real cause long
+gone. Read the field back right before pressing send.
+
 **The post-navigation actor swap.** Right after `browser_navigate`, a query can
 fail with `Actor 'Nevoflux' destroyed before query 'execute' was resolved`: the
 content actor for the old document is torn down when the new one commits.
 It is transient — retry and the call binds to the new actor.
+
+## 4c. Backends that have no tool channel
+
+A chat page can still return real `tool_calls`: describe the tools in the
+prompt, demand a bare JSON object, parse it back, and return it in the contract
+shape. `webui_backend.py` carries the working pieces. What it cost to get there
+is worth knowing before repeating it:
+
+- **Say that a program executes the call.** Asking for JSON "when you need a
+  tool" earned a flat refusal — *"I cannot access your browser tabs"* — because
+  nothing indicated a mechanism existed.
+- **Override the caller's own instructions by name.** A system prompt saying
+  "You CANNOT interact with pages" is a strong prior, and the model quoted it
+  while refusing. The protocol has to name the conflict and declare a winner.
+- **Catch the "I lack information" impulse.** Otherwise the model asks the user
+  to paste the content rather than calling the tool.
+- **Put the protocol last, after the task.** Before it, the task text and any
+  attached-context block screen it off.
+- **Budget the prompt.** A real sidebar request carries the whole skill text, a
+  90-row MCP inventory and learned-knowledge dumps — tens of KB, none of it
+  usable by a chat page, and an oversized message makes the page fail with its
+  own canned error rather than anything diagnosable. Spend the budget on task →
+  protocol → recent history → whatever instructions still fit.
+- **Render both halves of a tool round trip.** With only the result and not the
+  call, the model reads its own request as unanswered and repeats it.
+
+None of this makes the convention a protocol: the model may still ignore the
+format. Parse tolerantly and treat a non-conforming reply as prose.
 
 ## 5. Legacy behaviour
 
