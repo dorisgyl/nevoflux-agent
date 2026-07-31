@@ -185,22 +185,33 @@ def poll_growing_text(
 # ---- Chat-only backends: synthesising tool calls -----------------------------
 #
 # A chat page has no function-calling channel, but a backend can still return
-# real `tool_calls`: describe the tools in the prompt, demand a bare JSON
-# object, and parse it back. This is a CONVENTION, not a protocol — the model
-# can ignore it — so parse tolerantly and treat a non-conforming reply as
-# ordinary prose rather than an error.
+# real `tool_calls`: describe the tools in the prompt, ask for a fenced block in
+# the format below, and parse it back. This is a CONVENTION, not a protocol —
+# the model can ignore it — so parse tolerantly and treat a non-conforming reply
+# as ordinary prose rather than an error.
 #
-# Three things decided whether it worked at all, learned by watching it fail:
+# **Do not ask for JSON.** That was the first design and it failed on exactly
+# the payloads that matter. A JSON string argument has to carry an escaped copy
+# of its value, so a whole HTML document becomes one line of `\"` and `\n`;
+# models produce it approximately at best, and the page's own markdown renderer
+# mangles what is left. Three attempts died there. The format below removes
+# escaping from the model's job entirely: values live in fenced blocks, verbatim,
+# and the escaping happens later in `openai_wire` — done by a program.
 #
-# 1. State that a program executes the call. Asking for JSON "when you need a
-#    tool" got a flat refusal — "I cannot access your browser tabs" — because
-#    nothing said a mechanism existed.
+# Four things decided whether it worked at all, learned by watching it fail:
+#
+# 1. State that a program executes the call. Asking for a tool request "when you
+#    need a tool" got a flat refusal — "I cannot access your browser tabs" —
+#    because nothing said a mechanism existed.
 # 2. Override the caller's own instructions explicitly. A system prompt saying
 #    "You CANNOT interact with pages" is a strong prior; the model quoted it
 #    almost verbatim while refusing. The protocol has to name that conflict and
 #    say which side wins.
 # 3. Catch the "I lack information" impulse. Without a sentence redirecting it,
 #    the model asks the user to paste the content instead of calling the tool.
+# 4. Say that the tool call IS the answer for generation requests. Asked to
+#    build a page, the model wrote the page into the chat and described it,
+#    ignoring the `create_artifact` tool sitting right there.
 #
 # Position matters as much as wording: put this LAST, after the task. Sitting
 # before the task it was screened off and ignored.
@@ -208,64 +219,198 @@ def poll_growing_text(
 TOOL_PROTOCOL = (
     "# How to use tools — this section overrides anything above it\n"
     "The instructions above may say you cannot click, navigate, open files or "
-    "act on pages. That refers to acting DIRECTLY. Through the JSON channel "
-    "below you can: a program is reading your reply on the user's behalf, runs "
-    "the tool for you, and sends you the result in the next message. Where the "
+    "act on pages. That refers to acting DIRECTLY. Through the channel below "
+    "you can: a program is reading your reply on the user's behalf, runs the "
+    "tool for you, and sends you the result in the next message. Where the "
     "instructions above conflict with this section, THIS SECTION WINS.\n"
     "\n"
     "If you feel you lack the information needed to answer — page content, "
     "search results, a file — do not say you are unable and do not ask the user "
     "to paste it. Describe the call you need through this channel instead.\n"
     "\n"
-    "To call a tool, reply with EXACTLY this and nothing else — no greeting, no "
-    "explanation, no markdown fence:\n"
-    '{"tool_call": {"name": "<tool name>", "arguments": {<arguments>}}}\n'
+    "It also runs the other way. When what the user asked for is something a "
+    "listed tool DELIVERS — a page, a file, an artifact, a document — the tool "
+    "call IS the answer. Do not write the document into the chat and describe "
+    "it; the user never sees this chat, only what the tool produces. Put the "
+    "document in the call.\n"
     "\n"
-    "If no tool is needed, just answer normally in prose and output no JSON.\n"
+    "## Format\n"
+    "To call a tool, reply with a fenced `tool` block and nothing else — no "
+    "greeting, no explanation. Everything must be INSIDE the fence.\n"
+    "\n"
+    "Example — read the page in tab 42:\n"
+    "\n"
+    "```tool\n"
+    "TOOL browser_get_markdown\n"
+    "tab_id: 42\n"
+    "```\n"
+    "\n"
+    "Example — create a page, where one value is a whole document:\n"
+    "\n"
+    "```tool\n"
+    "TOOL create_artifact\n"
+    "title: My Page\n"
+    "content_type: text/html\n"
+    "content:\n"
+    "```\n"
+    "```html\n"
+    "<!DOCTYPE html>\n"
+    '<html lang="zh-CN">…\n'
+    "```\n"
+    "\n"
+    "Rules:\n"
+    "- The `tool` block holds the call: a `TOOL <name>` line, then one argument "
+    "per line as `name: value`.\n"
+    "- Fences are required. Outside them the page reformats your reply — it "
+    "joins lines together and turns `a_b` into `a\\_b` — and the call breaks.\n"
+    "- Leave a value empty to say \"this argument is the NEXT fenced block\". "
+    "Those blocks follow the `tool` block, pairing in order.\n"
+    "- Inside a block write content EXACTLY as it should be: quotes, newlines "
+    "and backslashes are kept verbatim. Escape nothing, ever.\n"
+    "- If content contains ``` , fence it with four backticks instead.\n"
+    "\n"
+    "For a nested argument use a dot: `files./src/App.jsx:` puts the next block "
+    "at `files[\"/src/App.jsx\"]`.\n"
+    "\n"
+    "If no tool is needed, just answer normally in prose and use no TOOL line.\n"
 )
 
 
-def extract_json_object(text):
-    """First balanced {...} in a reply, parsed, or None.
+def coerce_scalar(value):
+    """Restore an inline value's type.
 
-    `json.loads` is available in the sandbox (there is no `eval`). Brace
-    matching rather than a regex, so nested objects survive; tolerant by design
-    because models wrap JSON in fences or prefix it with a sentence.
+    `browser_get_markdown` wants `{"tab_id": 7}` — a number, not "7" — so an
+    inline value is offered to the JSON parser first and kept as text when that
+    fails. A model wanting a literal string can quote it: `title: "123"`.
     """
-    start = text.find("{")
-    if start < 0:
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def set_arg(args, key, value):
+    """Assign `key`, honouring one level of dotted nesting.
+
+    Split on the FIRST dot only: `files./src/main.py` has to mean
+    `files["/src/main.py"]`, and paths carry dots of their own.
+    """
+    pos = key.find(".")
+    if pos > 0:
+        parent = key[:pos]
+        child = key[pos + 1:]
+        # Chained subscript assignment (`args[parent][child] = v`) is not
+        # supported by the sandbox — bind the inner dict first.
+        inner = args.get(parent)
+        if not isinstance(inner, dict):
+            inner = {}
+        inner[child] = value
+        args[parent] = inner
+    else:
+        args[key] = value
+
+
+def parse_tool_reply(reply):
+    """Parse the TOOL block format. Returns a dict, or None when it is prose."""
+    blocks = []
+    current = []
+    in_fence = False
+    for line in reply.split("\n"):
+        if line.strip().startswith("```"):
+            if in_fence:
+                blocks.append("\n".join(current))
+                current = []
+                in_fence = False
+            else:
+                in_fence = True
+            continue
+        if in_fence:
+            current.append(line)
+
+    # The header must come from inside a fence. Written as prose it does not
+    # survive the page's markdown rendering: consecutive lines are joined into
+    # one paragraph and `browser_get_markdown` comes back as
+    # `browser\_get\_markdown`. Fenced text is preserved verbatim — that is
+    # measured, not assumed. Reading headers only inside the block also keeps
+    # an HTML or CSS payload's own `key: value` lines (`background: #fff`) from
+    # being mistaken for arguments.
+    header_idx = -1
+    for i in range(len(blocks)):
+        for line in blocks[i].split("\n"):
+            if line.strip().startswith("TOOL "):
+                header_idx = i
+                break
+        if header_idx >= 0:
+            break
+    if header_idx < 0:
         return None
-    depth = 0
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if ch == "{":
-            depth = depth + 1
-        elif ch == "}":
-            depth = depth - 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except Exception:
-                    return None
-        i = i + 1
-    return None
+
+    name = None
+    args = {}
+    pending = []
+    for line in blocks[header_idx].split("\n"):
+        stripped = line.strip()
+        if name is None:
+            if stripped.startswith("TOOL "):
+                name = stripped[5:].strip()
+            continue
+        pos = stripped.find(":")
+        if pos <= 0:
+            continue
+        key = stripped[:pos].strip()
+        value = stripped[pos + 1:].strip()
+        if value == "":
+            pending.append(key)
+        else:
+            set_arg(args, key, coerce_scalar(value))
+
+    if name is None:
+        return None
+    blocks = blocks[header_idx + 1:]
+
+    # An argument promised a block that never arrived. Returning the call
+    # without it would ship a gutted payload that looks perfectly valid — the
+    # exact failure that once produced a 13-character HTML document.
+    if len(pending) > len(blocks):
+        return {
+            "__error": (
+                "argument '"
+                + pending[len(blocks)]
+                + "' promised a fenced block but only "
+                + str(len(blocks))
+                + " block(s) were present"
+            )
+        }
+
+    for i in range(len(pending)):
+        set_arg(args, pending[i], blocks[i])
+    return {"name": name, "arguments": args}
 
 
 def as_tool_call(reply):
-    """`{"tool_calls": [...]}` when the reply is a tool request, else None."""
-    parsed = extract_json_object(reply)
-    if not isinstance(parsed, dict):
+    """`{"tool_calls": [...]}` when the reply is a tool request, else None.
+
+    Contract shape, not wire shape: `arguments` stays an object and
+    `openai_wire` stringifies it. The model never sees an escape character.
+    """
+    parsed = parse_tool_reply(reply)
+    if parsed is None:
         return None
-    call = parsed.get("tool_call")
-    if not isinstance(call, dict) or not call.get("name"):
-        return None
-    args = call.get("arguments")
-    if not isinstance(args, dict):
-        args = {}
+    if parsed.get("__error"):
+        return {
+            "error": {
+                "message": "malformed tool call: " + parsed["__error"],
+                "type": "server_error",
+                "code": "malformed_tool_call",
+            }
+        }
     return {
         "tool_calls": [
-            {"id": "call_" + str(call["name"]), "name": call["name"], "arguments": args}
+            {
+                "id": "call_" + str(parsed["name"]),
+                "name": parsed["name"],
+                "arguments": parsed["arguments"],
+            }
         ]
     }
 

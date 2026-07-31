@@ -163,9 +163,50 @@ It is transient — retry and the call binds to the new actor.
 ## 4c. Backends that have no tool channel
 
 A chat page can still return real `tool_calls`: describe the tools in the
-prompt, demand a bare JSON object, parse it back, and return it in the contract
-shape. `webui_backend.py` carries the working pieces. What it cost to get there
-is worth knowing before repeating it:
+prompt, ask for a call in a format the model can write reliably, parse it back,
+and return it in the contract shape. `webui_backend.py` carries the working
+pieces.
+
+**Do not ask for JSON.** It is the obvious choice and it fails on exactly the
+payloads that matter. A JSON string argument must contain an escaped copy of its
+value, so a whole HTML document collapses into one line of `\"` and `\n`; models
+produce that approximately at best, and the page's markdown renderer damages
+what survives. Ask instead for a fenced block carrying line headers, with long
+values in fenced blocks of their own:
+
+````
+```tool
+TOOL create_artifact
+title: My Page
+content_type: text/html
+content:
+```
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">…
+```
+````
+
+An inline value is offered to `json.loads` first so `tab_id: 42` arrives as a
+number; an empty value means "this argument is the next fenced block", and the
+blocks pair in order. The model writes no escape character anywhere — the
+gateway stringifies `arguments` on the way to the wire format. Measured: a
+3.4 KB HTML document with 147 newlines and 26 double quotes made the round trip
+byte-intact, streaming and non-streaming.
+
+**Everything must be inside a fence, including the header.** Written as prose,
+`TOOL browser_get_markdown` / `tab_id: 7` came back as the single line
+`browser\_get\_markdown tab\_id: 7`: markdown joins consecutive lines into one
+paragraph and escapes underscores. Fenced text is preserved verbatim. Reading
+headers only inside the block has a second benefit — an HTML or CSS payload is
+full of `key: value` shaped lines (`background: #fff`) that would otherwise be
+read as arguments.
+
+**Fail loudly when a promised block is missing.** A call assembled from a header
+whose value block never arrived looks perfectly valid and ships a gutted
+payload; that is what once produced a 13-character HTML document.
+
+What the wording cost is worth knowing before repeating it:
 
 - **Say that a program executes the call.** Asking for JSON "when you need a
   tool" earned a flat refusal — *"I cannot access your browser tabs"* — because
@@ -175,6 +216,11 @@ is worth knowing before repeating it:
   while refusing. The protocol has to name the conflict and declare a winner.
 - **Catch the "I lack information" impulse.** Otherwise the model asks the user
   to paste the content rather than calling the tool.
+- **Say the tool call IS the answer for generation requests.** Asked to build a
+  page, the model wrote the page into the chat and described it, with the
+  `create_artifact` tool listed right there. The channel has to be presented as
+  running both ways: fetching what is missing, *and* delivering what was asked
+  for.
 - **Put the protocol last, after the task.** Before it, the task text and any
   attached-context block screen it off.
 - **Budget the prompt.** A real sidebar request carries the whole skill text, a
