@@ -70,6 +70,12 @@ pub struct ChatMessage {
     /// `tool` 角色消息关联的调用 id。
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// assistant 上一轮请求的工具调用，原样透传。
+    ///
+    /// 少了这个，脚本在多轮里只看得到工具**结果**、看不到是谁请求的调用，
+    /// 无法把一轮完整的工具往返复述给后端。
+    #[serde(default)]
+    pub tool_calls: Vec<serde_json::Value>,
 }
 
 /// `POST /v1/chat/completions` 的请求体。

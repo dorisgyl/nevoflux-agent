@@ -163,6 +163,9 @@ pub struct ScriptMessage {
     /// `tool` 角色消息关联的调用 id。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// assistant 上一轮请求的工具调用（OpenAI 线格式原样）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<serde_json::Value>,
 }
 
 /// 脚本收到的请求。两种协议的并集：`messages` 由 OpenAI 侧填满，
@@ -211,6 +214,7 @@ impl ScriptRequest {
                 content: m.content.to_text(),
                 content_parts: m.content.parts(),
                 tool_call_id: m.tool_call_id.clone(),
+                tool_calls: m.tool_calls.clone(),
             })
             .collect();
 
@@ -299,6 +303,27 @@ mod tests {
         assert_eq!(v["tool_choice"], "auto");
         assert_eq!(v["params"]["temperature"], 0.5);
         assert_eq!(v["params"]["max_tokens"], 128);
+    }
+
+    /// A tool round trip is only intelligible to a backend if it can see BOTH
+    /// halves: the assistant's request and the tool's result.
+    #[test]
+    fn script_request_carries_the_assistant_tool_call_that_produced_a_result() {
+        let req = parse_req(
+            r#"{"model":"m","messages":[
+                 {"role":"user","content":"读文件"},
+                 {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function",
+                     "function":{"name":"read_file","arguments":"{}"}}]},
+                 {"role":"tool","tool_call_id":"call_1","content":"文件内容"}]}"#,
+        );
+        let v = ScriptRequest::from_openai(&req, "读文件", "task-0").to_value();
+        assert_eq!(v["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            v["messages"][1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(v["messages"][2]["tool_call_id"], "call_1");
     }
 
     #[test]
