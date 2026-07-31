@@ -46,9 +46,7 @@ pub fn to_python_literal(value: &serde_json::Value) -> String {
         serde_json::Value::Bool(true) => "True".to_string(),
         serde_json::Value::Bool(false) => "False".to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => {
-            serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
-        }
+        serde_json::Value::String(s) => render_string(s),
         // Collections break across lines. Monty's `CodeLoc::new` panics when a
         // column exceeds u16 (`exception_public.rs:343`), so any exception
         // raised on a line longer than 65535 chars crashes the interpreter
@@ -73,6 +71,41 @@ pub fn to_python_literal(value: &serde_json::Value) -> String {
             format!("{{{}}}", inner.join(",\n"))
         }
     }
+}
+
+/// Longest string chunk emitted on one line. Well under Monty's u16 column
+/// limit, with room for the escaping expansion of the worst-case input.
+const STRING_CHUNK_CHARS: usize = 2000;
+
+/// Render a JSON string as a Python expression, split across lines when long.
+///
+/// A single system prompt can exceed 65535 characters on its own, and Monty's
+/// `CodeLoc::new` panics past a u16 column (`exception_public.rs:343`) — taking
+/// the interpreter thread, and the request's finish frame, with it. Splitting
+/// collections is not enough; the string itself has to be broken up.
+///
+/// Chunking happens on the **decoded** text and each chunk is escaped
+/// separately, so a split can never land inside an escape sequence. Chunks are
+/// joined with `+` rather than relying on adjacent-literal concatenation, which
+/// is a Python nicety the sandbox need not implement.
+fn render_string(s: &str) -> String {
+    let encode = |part: &str| serde_json::to_string(part).unwrap_or_else(|_| "\"\"".to_string());
+    if s.chars().count() <= STRING_CHUNK_CHARS {
+        return encode(s);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        current.push(ch);
+        if (i + 1) % STRING_CHUNK_CHARS == 0 {
+            parts.push(encode(&current));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        parts.push(encode(&current));
+    }
+    format!("({})", parts.join(" +\n"))
 }
 
 /// 拼出交给执行器的完整源码：用户代码 + 一行入口调用。
@@ -190,6 +223,46 @@ mod tests {
         assert!(longest < 60000, "longest line was {longest} chars");
         // The whole thing is still much larger than any single line.
         assert!(out.chars().count() > 20000);
+    }
+
+    /// A single string can blow the column limit on its own, so it is chunked
+    /// too — and the chunks must reassemble to exactly the original text.
+    #[test]
+    fn very_long_strings_are_split_and_lossless() {
+        let original: String = (0..90_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let lit = to_python_literal(&json!({"prompt": original.clone()}));
+        let longest = lit.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(longest < 60000, "longest line was {longest}");
+
+        // Reassemble: every chunk is an independently escaped JSON string.
+        let joined: String = lit
+            .split(" +\n")
+            .map(|p| {
+                p.trim()
+                    .trim_start_matches("{\"prompt\": (")
+                    .trim_end_matches(")}")
+            })
+            .filter(|p| p.starts_with('"'))
+            .map(|p| serde_json::from_str::<String>(p).expect("chunk must be a JSON string"))
+            .collect();
+        assert_eq!(joined, original);
+    }
+
+    #[test]
+    fn strings_with_escapes_survive_chunking() {
+        // A boundary must never land inside an escape sequence: chunking works
+        // on decoded text and escapes each piece separately.
+        let original: String = "他说\"你好\"\n".repeat(1000);
+        let lit = to_python_literal(&json!(original.clone()));
+        let joined: String = lit
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split(" +\n")
+            .map(|p| serde_json::from_str::<String>(p.trim()).expect("chunk must be a JSON string"))
+            .collect();
+        assert_eq!(joined, original);
     }
 
     #[test]
