@@ -48,17 +48,43 @@ pub fn account_token_path() -> std::path::PathBuf {
         .join("account-token")
 }
 
+/// Env var that supplies the token for a headless/container head, ahead of the
+/// on-disk store. Deliberately separate from the desktop `FileTokenStore` (see
+/// `account.rs`): a deployment injects ONE secret (Docker/k8s Secret, Vault)
+/// across N instances instead of copying a laptop's `account-token` into each
+/// container. The same account token is reusable across heads — every instance
+/// still claims its own device and opens its own channel.
+pub const SERVICE_TOKEN_ENV: &str = "NEVOFLUX_SERVICE_TOKEN";
+
+/// Choose the usable token: the env override wins, the on-disk store is the
+/// fallback. Split out so the precedence is unit-testable without mutating the
+/// process environment or touching disk.
+///
+/// A blank env value counts as unset — `-e NEVOFLUX_SERVICE_TOKEN=` in a
+/// container leaves an empty string behind, and reading that as the token would
+/// mask the file with a credential that can never mint a JWT.
+fn resolve_token(env_token: Option<String>, file_token: Option<String>) -> Option<String> {
+    env_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or(file_token)
+}
+
 /// The stored account token, if there is a usable one.
 ///
-/// Exposed so a caller can find out it will fail *before* doing something
-/// expensive — the headless service checks this before launching a browser,
-/// rather than discovering it after.
+/// Resolves `NEVOFLUX_SERVICE_TOKEN` first, then the on-disk store, so a
+/// headless deployment never has to write a secret to the data volume. Exposed
+/// so a caller can find out it will fail *before* doing something expensive —
+/// the headless service checks this before launching a browser, rather than
+/// discovering it after.
 pub fn stored_account_token() -> Option<String> {
     use super::account::TokenStore;
-    match super::account::FileTokenStore::new(account_token_path()).load() {
+    let env_token = std::env::var(SERVICE_TOKEN_ENV).ok();
+    let file_token = match super::account::FileTokenStore::new(account_token_path()).load() {
         Ok(Some(t)) => Some(t),
         _ => None,
-    }
+    };
+    resolve_token(env_token, file_token)
 }
 
 /// Open a channel using the account token stored in the daemon's data dir.
@@ -119,8 +145,10 @@ pub async fn open_channel_with_token(
     let reg = registry.clone();
     let gw = gateway.clone();
     tokio::spawn(async move {
-        super::ws::run_gateway(&relay, &ch, acct_base, acct_token, sid, injector, sink, gw, reg)
-            .await;
+        super::ws::run_gateway(
+            &relay, &ch, acct_base, acct_token, sid, injector, sink, gw, reg,
+        )
+        .await;
     });
 
     Ok(gateway)
@@ -149,6 +177,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn env_token_wins_over_the_file() {
+        // A headless deployment injects the secret through the env; when both
+        // are present the env is what the operator set most recently and is the
+        // one to honour.
+        assert_eq!(
+            resolve_token(Some("env-tok".into()), Some("file-tok".into())),
+            Some("env-tok".into())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_file_when_env_is_unset() {
+        assert_eq!(
+            resolve_token(None, Some("file-tok".into())),
+            Some("file-tok".into())
+        );
+    }
+
+    #[test]
+    fn a_blank_env_value_is_treated_as_unset() {
+        // `-e NEVOFLUX_SERVICE_TOKEN=` leaves an empty string behind. Reading it
+        // as the token would mask a perfectly good file token with a credential
+        // that can never mint a JWT, so a blank env must defer to the file.
+        assert_eq!(
+            resolve_token(Some("   ".into()), Some("file-tok".into())),
+            Some("file-tok".into())
+        );
+        // ...and with no file either, a blank env resolves to nothing rather
+        // than to the empty string.
+        assert_eq!(resolve_token(Some(String::new()), None), None);
+    }
+
+    #[test]
+    fn env_token_is_trimmed() {
+        // Secret files and here-docs routinely add a trailing newline; it must
+        // not travel into the JWT mint as part of the bearer value.
+        assert_eq!(
+            resolve_token(Some("  tok\n".into()), None),
+            Some("tok".into())
+        );
+    }
+
+    #[test]
+    fn nothing_set_resolves_to_none() {
+        assert_eq!(resolve_token(None, None), None);
+    }
+
     #[tokio::test]
     async fn refuses_when_not_logged_in() {
         // No account token ⇒ nothing to mint a relay JWT from. Both callers
@@ -172,9 +248,8 @@ mod tests {
         std::env::set_var("NEVOFLUX_ACCOUNT_URL", "http://127.0.0.1:1");
         let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
         let (tx, _rx) = mpsc::channel(8);
-        let err = err_of(
-            open_channel_with_token(req(), Some("token".into()), &registry, &tx).await,
-        );
+        let err =
+            err_of(open_channel_with_token(req(), Some("token".into()), &registry, &tx).await);
         std::env::remove_var("NEVOFLUX_ACCOUNT_URL");
         assert!(matches!(err, OpenError::JwtMint(_)));
         assert!(registry.lock().await.is_empty());

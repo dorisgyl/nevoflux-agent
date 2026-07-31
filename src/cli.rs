@@ -114,6 +114,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: PackAction,
     },
+    /// nevoflux.app account: sign in (for --remote-control), status, sign out
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Generate shell completions
@@ -206,6 +211,34 @@ pub enum PackAction {
         /// Name of the installed pack
         name: String,
     },
+}
+
+/// Account subcommand actions.
+///
+/// `login` runs the RFC 8628 device authorization grant against nevoflux.app
+/// entirely in-process — no daemon required — so a container can mint its own
+/// account token before `--remote-control` starts. The resulting token is the
+/// same credential `NEVOFLUX_SERVICE_TOKEN` supplies; `--print-token` emits it
+/// on stdout for capture into a secret store.
+#[derive(Subcommand, Debug)]
+pub enum AccountAction {
+    /// Sign in to nevoflux.app (device grant). Prints a URL + code to approve on
+    /// any device, then stores the account token used by `--remote-control`.
+    Login {
+        /// Also print the raw token as the final stdout line (prompts/status go
+        /// to stderr, so stdout carries only the token — capture it with
+        /// `TOKEN=$(nevoflux account login --print-token)`).
+        #[arg(long)]
+        print_token: bool,
+        /// Do not write <data_dir>/account-token; only emit the token on stdout
+        /// (implies --print-token). Use when the token lives solely in a secret.
+        #[arg(long)]
+        no_save: bool,
+    },
+    /// Report whether an account token is present (env override or on disk).
+    Status,
+    /// Remove the stored account-token file.
+    Logout,
 }
 
 #[cfg(test)]
@@ -448,5 +481,63 @@ mod tests {
             }
             _ => panic!("Expected External command for Firefox args"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_account_login() {
+        let cli = Cli::try_parse_from(["nevoflux", "account", "login"]).unwrap();
+        match cli.command {
+            Some(Commands::Account {
+                action:
+                    AccountAction::Login {
+                        print_token,
+                        no_save,
+                    },
+            }) => {
+                assert!(!print_token);
+                assert!(!no_save);
+            }
+            _ => panic!("Expected Account::Login"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_account_login_flags() {
+        let cli =
+            Cli::try_parse_from(["nevoflux", "account", "login", "--print-token", "--no-save"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Account {
+                action:
+                    AccountAction::Login {
+                        print_token,
+                        no_save,
+                    },
+            }) => {
+                assert!(print_token);
+                assert!(no_save);
+            }
+            _ => panic!("Expected Account::Login with flags"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_account_status_and_logout() {
+        assert!(matches!(
+            Cli::try_parse_from(["nevoflux", "account", "status"])
+                .unwrap()
+                .command,
+            Some(Commands::Account {
+                action: AccountAction::Status
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nevoflux", "account", "logout"])
+                .unwrap()
+                .command,
+            Some(Commands::Account {
+                action: AccountAction::Logout
+            })
+        ));
     }
 }

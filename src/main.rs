@@ -14,7 +14,7 @@ mod completions;
 mod logging;
 
 use clap::Parser;
-use cli::{Cli, Commands, ConfigAction};
+use cli::{AccountAction, Cli, Commands, ConfigAction};
 use cli::PackAction;
 use fs2::FileExt;
 use nevoflux_storage::Storage;
@@ -1314,6 +1314,130 @@ async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Handle `nevoflux account <action>`.
+///
+/// `login` runs the RFC 8628 device grant against nevoflux.app entirely
+/// in-process — no daemon needed — so a container can mint its own account token
+/// before `--remote-control` starts, instead of copying one off a desktop. All
+/// human-facing prompts and status go to **stderr** so that, with `--print-token`,
+/// stdout carries only the token and can be piped straight into a secret.
+async fn handle_account_command(action: AccountAction) -> Result<(), Box<dyn std::error::Error>> {
+    use nevoflux_daemon::remote::account::{self, FileTokenStore, PollOutcome, TokenStore};
+    use nevoflux_daemon::remote::start::{account_token_path, SERVICE_TOKEN_ENV};
+
+    // The env override is the same credential the file holds; report it so a
+    // `status`/`logout` is not misread when a container also sets the env.
+    let env_token = std::env::var(SERVICE_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match action {
+        AccountAction::Status => {
+            let path = account_token_path();
+            let file_token = FileTokenStore::new(path.clone())
+                .load()
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty());
+            if env_token.is_some() {
+                println!("logged in (via {SERVICE_TOKEN_ENV}; overrides any file)");
+            } else if file_token.is_some() {
+                println!("logged in (token at {})", path.display());
+            } else {
+                println!("not logged in");
+            }
+            Ok(())
+        }
+        AccountAction::Logout => {
+            let path = account_token_path();
+            FileTokenStore::new(path.clone()).clear()?;
+            eprintln!("Removed {}", path.display());
+            if env_token.is_some() {
+                eprintln!(
+                    "Note: {SERVICE_TOKEN_ENV} is still set in this environment and takes \
+                     precedence over the (now-removed) file."
+                );
+            }
+            Ok(())
+        }
+        AccountAction::Login {
+            print_token,
+            no_save,
+        } => {
+            let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+                .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+            // Same client id the daemon's device-grant RPC uses, so the auth
+            // server treats a CLI login and a sidebar login identically.
+            const CLIENT_ID: &str = "nevoflux-daemon";
+
+            // 1) Start the grant and show the user what to approve.
+            let dc = account::request_device_code(&base, CLIENT_ID).await?;
+            eprintln!("\nTo sign in, open this URL on any device and enter the code:\n");
+            eprintln!("    {}", dc.verification_uri);
+            eprintln!("\n    code:  {}\n", dc.user_code);
+            eprintln!(
+                "Waiting for approval (the code expires in {}s)...",
+                dc.expires_in_secs
+            );
+
+            // 2) Poll until approved / denied / expired. A transient poll error
+            //    is retried rather than fatal — the window is minutes long and a
+            //    blip should not throw away an in-progress sign-in.
+            let mut interval = std::time::Duration::from_secs(dc.interval_secs.max(1));
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(dc.expires_in_secs.max(1));
+            let token = loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err("device code expired before it was approved".into());
+                }
+                tokio::time::sleep(interval).await;
+                match account::poll_device_token(&base, CLIENT_ID, &dc.device_code).await {
+                    Ok(PollOutcome::Pending) => {}
+                    Ok(PollOutcome::SlowDown) => {
+                        interval += std::time::Duration::from_secs(5);
+                    }
+                    Ok(PollOutcome::Denied(d)) => {
+                        return Err(format!("sign-in failed: {d}").into());
+                    }
+                    Ok(PollOutcome::Token(t)) => break t,
+                    Err(e) => eprintln!("(poll error, retrying: {e})"),
+                }
+            };
+
+            // 3) Persist unless told not to. 0600 on Unix — this is account-
+            //    bearer material, not world-readable config.
+            if no_save {
+                eprintln!("Signed in. Token NOT saved (--no-save).");
+            } else {
+                let path = account_token_path();
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).ok();
+                }
+                FileTokenStore::new(path.clone()).save(&token)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+                eprintln!("Signed in. Token saved to {}", path.display());
+                if env_token.is_some() {
+                    eprintln!(
+                        "Note: {SERVICE_TOKEN_ENV} is set and overrides this file at runtime."
+                    );
+                }
+            }
+
+            // 4) Emit the token on stdout when asked (forced by --no-save, or the
+            //    token would be lost). This is the only thing on stdout.
+            if print_token || no_save {
+                println!("{token}");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1328,6 +1452,13 @@ async fn main() {
             Commands::Pack { action } => {
                 if let Err(e) = handle_pack_command(action).await {
                     eprintln!("pack: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Commands::Account { action } => {
+                if let Err(e) = handle_account_command(action).await {
+                    eprintln!("account: {e}");
                     std::process::exit(1);
                 }
                 return;

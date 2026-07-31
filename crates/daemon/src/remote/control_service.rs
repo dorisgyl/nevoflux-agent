@@ -61,8 +61,10 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
     //    operator would read the browser's own startup noise looking for it.
     if super::start::stored_account_token().is_none() {
         return Err(format!(
-            "no nevoflux account token at {}. Sign in on a desktop NevoFlux and mount that \
-             file there (read-only is fine).",
+            "no nevoflux account token. Set the {} env — a container secret, preferred for \
+             headless/multi-instance deployments — or sign in on a desktop NevoFlux and mount \
+             its account-token at {} (read-only is fine).",
+            super::start::SERVICE_TOKEN_ENV,
             super::start::account_token_path().display()
         ));
     }
