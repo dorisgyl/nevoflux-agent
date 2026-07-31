@@ -291,9 +291,24 @@ fn stream_completion(
                     let ev = Event::default().data(frame.to_string());
                     Some((Ok(ev), (rx, id, model, true, true, guard)))
                 }
-                // 通道关闭而没有终帧：runner 自己没了。收尾即可，
-                // 此时状态码早已发出，没有别的表达手段。
-                None => None,
+                // Channel closed with no finish frame: the runner died — a
+                // panic on the executor thread does exactly this, and one was
+                // observed (Monty's CodeLoc panics past a u16 column). Ending
+                // quietly hands the client an empty answer with nothing to
+                // explain it, which is the worst possible failure mode, so say
+                // so in content — the only channel left once headers are sent.
+                None => {
+                    let ev = Event::default().data(
+                        openai_wire::chunk_error_as_content(
+                            &id,
+                            &model,
+                            "the backend ended without producing a result (the task runner died)",
+                            "error",
+                        )
+                        .to_string(),
+                    );
+                    Some((Ok(ev), (rx, id, model, true, true, guard)))
+                }
             }
         },
     )

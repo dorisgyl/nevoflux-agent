@@ -49,9 +49,18 @@ pub fn to_python_literal(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => {
             serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
         }
+        // Collections break across lines. Monty's `CodeLoc::new` panics when a
+        // column exceeds u16 (`exception_public.rs:343`), so any exception
+        // raised on a line longer than 65535 chars crashes the interpreter
+        // thread instead of surfacing as a script error — and a crashed runner
+        // never sends a finish frame, leaving the HTTP client with an empty
+        // answer and no explanation. A real request (system prompt + tool
+        // definitions) is tens of KB, so rendering it on one line is not an
+        // edge case. Newlines inside brackets are implicit continuations, so
+        // this stays a single expression.
         serde_json::Value::Array(items) => {
             let inner: Vec<String> = items.iter().map(to_python_literal).collect();
-            format!("[{}]", inner.join(", "))
+            format!("[{}]", inner.join(",\n"))
         }
         serde_json::Value::Object(map) => {
             let inner: Vec<String> = map
@@ -61,7 +70,7 @@ pub fn to_python_literal(value: &serde_json::Value) -> String {
                     format!("{key}: {}", to_python_literal(v))
                 })
                 .collect();
-            format!("{{{}}}", inner.join(", "))
+            format!("{{{}}}", inner.join(",\n"))
         }
     }
 }
@@ -155,6 +164,32 @@ mod tests {
         // JSON 的转义规则与 Python 一致，直接复用
         assert!(lit.contains("\\\""), "got {lit}");
         assert!(lit.contains("\\n"), "got {lit}");
+    }
+
+    /// Monty panics when a column exceeds u16, so no generated line may come
+    /// close to 65535 characters. A real request carries a multi-KB system
+    /// prompt plus tool schemas; on one line that crashed the interpreter
+    /// thread and the client saw an empty answer.
+    #[test]
+    fn long_requests_do_not_produce_overlong_lines() {
+        let big_prompt = "x".repeat(8000);
+        let tools: Vec<serde_json::Value> = (0..40)
+            .map(|i| json!({"type": "function", "function": {"name": format!("tool_{i}"), "description": "y".repeat(500)}}))
+            .collect();
+        let req = json!({
+            "messages": [{"role": "system", "content": big_prompt}],
+            "tools": tools,
+        });
+        let out = build_invocation(
+            "def chat(request):\n    return {}\n",
+            EntryPoint::Chat,
+            &req,
+            "hi",
+        );
+        let longest = out.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(longest < 60000, "longest line was {longest} chars");
+        // The whole thing is still much larger than any single line.
+        assert!(out.chars().count() > 20000);
     }
 
     #[test]
