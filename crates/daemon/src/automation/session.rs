@@ -46,6 +46,15 @@ fn resolve_script_path(
     }
 }
 
+/// 任务间软重置是否执行。`NEVOFLUX_SESSION_SOFT_RESET=0` 全局关闭；脚本后端
+/// 任务一律跳过——脚本自己管理 tab 生命周期（复用已登录的页面、每轮自行开新
+/// 会话做隔离），把它的活动 tab 打成 about:blank 会废掉复用路径：脚本按 URL
+/// 找不到旧 tab，扩展端又因为全浏览器没有 http(s) 页面而新建 tab，结果是每个
+/// 请求都付一次全量冷加载、还净增一个空白 tab。
+fn should_soft_reset(runs_script_backend: bool, env_val: Option<&str>) -> bool {
+    !runs_script_backend && env_val != Some("0")
+}
+
 /// Result of one attempt at a task.
 #[derive(Debug, Clone)]
 pub struct AttemptOutcome {
@@ -592,8 +601,17 @@ pub async fn execute_session_task(
             }
         }
     } else if let Ok(browser) = deps.registry.single() {
-        // Reuse: reset the visible page before the next task runs.
-        soft_reset_active_tab(&deps.services_template, &browser).await;
+        // Reuse: reset the visible page before the next task runs — agent-loop
+        // tasks only. Script backends keep their tabs across requests; see
+        // `should_soft_reset` for why blanking theirs is counterproductive.
+        let runs_script =
+            resolve_script_path(deps.script_call.as_ref(), env_headless_script()).is_some();
+        if should_soft_reset(
+            runs_script,
+            std::env::var("NEVOFLUX_SESSION_SOFT_RESET").ok().as_deref(),
+        ) {
+            soft_reset_active_tab(&deps.services_template, &browser).await;
+        }
     }
 
     // Run the task against the live browser (own retry loop; NO relaunch — each
@@ -696,6 +714,20 @@ mod tests {
         // 前端明确判定“不走脚本”（NEVOFLUX_OPENAI_MODELS 里的 `agent=`）→
         // 必须是 agent 循环，不能掉回环境变量，否则空值语义完全失效
         assert_eq!(resolve_script_path(Some(&call_with(None)), env), None);
+    }
+
+    /// 软重置只该打在 agent 循环的任务上：脚本后端靠跨请求复用自己的 tab，
+    /// 重置它等于每个请求强制冷加载 + 留一个空白 tab。
+    #[test]
+    fn soft_reset_skips_script_backends_and_honours_env_kill_switch() {
+        // agent 循环 + 无开关 → 重置照常
+        assert!(should_soft_reset(false, None));
+        assert!(should_soft_reset(false, Some("1")));
+        // 脚本后端 → 永远跳过
+        assert!(!should_soft_reset(true, None));
+        assert!(!should_soft_reset(true, Some("1")));
+        // 显式关闭 → 全局跳过
+        assert!(!should_soft_reset(false, Some("0")));
     }
 
     #[test]
