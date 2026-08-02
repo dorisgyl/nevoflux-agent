@@ -15,6 +15,29 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+/// Request-level browser timeout used when the caller does not supply one.
+const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 30_000;
+/// Ceiling on a caller-supplied timeout, so a bad value cannot wedge a task for
+/// its whole wall clock.
+const MAX_BROWSER_TIMEOUT_MS: u64 = 600_000;
+/// Slack added to the response-channel guard so it never fires before the
+/// request's own timeout has had its chance.
+const BROWSER_TIMEOUT_SLACK_MS: u64 = 5_000;
+
+/// Resolve the request-level timeout for one browser call.
+///
+/// Pulled out of `BrowserTool::execute` so it can be tested without a live
+/// `BrowserContext` — the behaviour it encodes was wrong for a long time and is
+/// invisible from the outside (a too-short timeout just looks like a slow page).
+fn resolve_browser_timeout_ms(params: &serde_json::Value) -> u64 {
+    params
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS)
+        .min(MAX_BROWSER_TIMEOUT_MS)
+}
+
 // ============================================================================
 // Tool Execution Record
 // ============================================================================
@@ -1478,13 +1501,25 @@ impl ToolExecutor for BrowserTool {
 
         let (params, tab_id) = Self::build_params(self.action, arguments);
 
+        // The caller's per-call timeout travels inside `params` (see
+        // `build_params`), but the extension reads ONLY the request-level
+        // `timeout_ms` and discards `params.timeout_ms` entirely
+        // (background.js:3899, `executeWaitForViaApi`). Hardcoding 30_000 here
+        // therefore made every script-supplied timeout a silent no-op:
+        // `browser_wait_for(selector, timeout_ms=5000)` blocked for the full
+        // 30s. That matters most for a polling script, which uses a wait on a
+        // deliberately-absent selector as its only clock — so its "5 second"
+        // tick was really 30 seconds and its whole round budget was six times
+        // longer than it asked for.
+        let timeout_ms = resolve_browser_timeout_ms(&params);
+
         let request = BrowserRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             session_id: "code-mode".to_string(),
             tab_id,
             action: self.action,
             params,
-            timeout_ms: 30000,
+            timeout_ms,
             client_identity: self.ctx.client_identity.clone(),
             proxy_id: self.ctx.proxy_id.clone(),
         };
@@ -1497,10 +1532,17 @@ impl ToolExecutor for BrowserTool {
             .await
             .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
 
-        let response: BrowserResponse = tokio::time::timeout(Duration::from_secs(30), response_rx)
-            .await
-            .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
-            .map_err(|_| DaemonError::InternalError("Response channel closed".into()))?;
+        // Outlive the request's OWN timeout, with slack for the round trip.
+        // A fixed 30s guard here would pre-empt any longer per-call timeout and
+        // report a generic "Browser request timed out" instead of whatever the
+        // tool was about to answer.
+        let response: BrowserResponse = tokio::time::timeout(
+            Duration::from_millis(timeout_ms.saturating_add(BROWSER_TIMEOUT_SLACK_MS)),
+            response_rx,
+        )
+        .await
+        .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
+        .map_err(|_| DaemonError::InternalError("Response channel closed".into()))?;
 
         if response.success {
             match response.result {
@@ -1834,6 +1876,53 @@ pub async fn dispatch_recording_tool(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// 回归：脚本传的 `timeout_ms` 必须真的成为请求超时。
+    ///
+    /// 扩展只读请求级的 `timeout_ms`（background.js:3899），params 里那个被
+    /// 丢弃；而这里曾经写死 30_000，于是任何 per-call 超时都是空操作。轮询
+    /// 脚本把「等一个不存在的选择器」当作唯一的时钟，所以它要的 5 秒一拍
+    /// 实际上是 30 秒一拍，整轮预算长了六倍。
+    #[test]
+    fn a_callers_timeout_reaches_the_request() {
+        let (params, _tab) = BrowserTool::build_params(
+            BrowserToolAction::WaitFor,
+            &serde_json::json!({ "selector": "#nope", "timeout_ms": 5000 }),
+        );
+        assert_eq!(
+            params.get("timeout_ms").and_then(|v| v.as_u64()),
+            Some(5000),
+            "build_params must carry the caller's timeout"
+        );
+        assert_eq!(
+            resolve_browser_timeout_ms(&params),
+            5000,
+            "the request must adopt it, not fall back to the 30s default"
+        );
+    }
+
+    #[test]
+    fn browser_timeout_falls_back_and_is_clamped() {
+        // Absent -> default.
+        assert_eq!(
+            resolve_browser_timeout_ms(&serde_json::json!({})),
+            DEFAULT_BROWSER_TIMEOUT_MS
+        );
+        // Zero and non-numeric are not timeouts; they must not mean "instant".
+        assert_eq!(
+            resolve_browser_timeout_ms(&serde_json::json!({ "timeout_ms": 0 })),
+            DEFAULT_BROWSER_TIMEOUT_MS
+        );
+        assert_eq!(
+            resolve_browser_timeout_ms(&serde_json::json!({ "timeout_ms": "soon" })),
+            DEFAULT_BROWSER_TIMEOUT_MS
+        );
+        // An absurd value cannot wedge a task for its whole wall clock.
+        assert_eq!(
+            resolve_browser_timeout_ms(&serde_json::json!({ "timeout_ms": 99_999_999u64 })),
+            MAX_BROWSER_TIMEOUT_MS
+        );
+    }
 
     #[test]
     fn test_registry_creation() {
