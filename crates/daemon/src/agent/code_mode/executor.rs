@@ -327,10 +327,32 @@ impl CodeModeExecutor {
         let mut retries: u32 = 0;
         // E: Tool result cache — survives across retries so re-executed code
         // reuses results from previous tool calls with identical arguments.
+        //
+        // The key carries an OCCURRENCE INDEX (`…#3` = the third call with these
+        // arguments in this attempt), and the counter resets at the top of every
+        // attempt. Without it the key was just (name, args), which is only
+        // correct if a script never calls the same tool twice the same way — and
+        // a polling script does nothing else:
+        //
+        //   * `browser_get_markdown(tab_id=5)` in a poll loop executed ONCE and
+        //     every later round was handed that first snapshot, so the loop
+        //     watched a frozen page for its whole budget;
+        //   * the sleep (`browser_wait_for` on a fixed selector) was cached too,
+        //     so the pacing collapsed and the budget burned in seconds;
+        //   * `emit_progress` is dispatched through this same path, so repeated
+        //     identical progress lines silently vanished — the logs lied about
+        //     what the script was doing, which is the worst part.
+        //
+        // With the index, a REPLAY after an auto-fix still reuses results
+        // positionally (the intent this cache was added for), while a genuinely
+        // new call inside one attempt always executes.
         let mut tool_cache: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
         loop {
+            // Per-attempt occurrence counters; see the note on `tool_cache`.
+            let mut call_occurrences: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
             // Layer 2: Auto-fix mechanical transforms
             let auto_fixed = MontyAutoFixer::fix(&current_code);
             if auto_fixed != current_code {
@@ -601,11 +623,17 @@ impl CodeModeExecutor {
                         };
 
                         // E: Check tool cache before executing
-                        let cache_key = format!(
+                        let call_signature = format!(
                             "{}:{}",
                             function_name,
                             serde_json::to_string(&arguments).unwrap_or_default()
                         );
+                        let occurrence = {
+                            let n = call_occurrences.entry(call_signature.clone()).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        let cache_key = format!("{call_signature}#{occurrence}");
 
                         let (result_json, resume_value): (serde_json::Value, ExternalResult) =
                             if let Some(cached) = tool_cache.get(&cache_key) {
@@ -1992,6 +2020,34 @@ mod sink_tests {
         assert_eq!(rx.recv().await.unwrap(), Delta::Progress("开始".into()));
         assert_eq!(rx.recv().await.unwrap(), Delta::Text("你".into()));
         assert_eq!(rx.recv().await.unwrap(), Delta::Text("好".into()));
+    }
+
+    /// 回归：轮询脚本反复发出**参数完全相同**的调用。工具结果缓存原先按
+    /// (名字, 参数) 记忆且永不失效，于是第二条起就再也不执行——`emit_progress`
+    /// 走的是同一条派发路径，所以相同的进度行会凭空消失，日志因此撒谎，
+    /// 掩盖了「整个轮询在读第一轮那张冻结页面」这件事。
+    ///
+    /// 用 emit 而不是浏览器工具来钉这个行为：它不依赖 Xvfb，而且缓存命中与否
+    /// 直接体现为 channel 上收到几条。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_identical_calls_are_not_swallowed_by_the_tool_cache() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let code = "for i in range(3):\n    emit_progress(\"tick\")\n\"done\"\n";
+        let result = execute_python_with_sink(
+            code,
+            None,
+            Some(DeltaSink::new(tx)),
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        assert!(result.success, "script failed: {:?}", result.error);
+        for i in 0..3 {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                Delta::Progress("tick".into()),
+                "progress note {i} was swallowed by the tool cache"
+            );
+        }
     }
 
     /// 没有 sink 时 emit 是空操作，脚本不应因未定义函数而失败。
