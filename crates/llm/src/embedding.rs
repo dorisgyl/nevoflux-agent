@@ -373,8 +373,10 @@ const EXPECTED_ORT_VERSION: &str = "1.24.2";
 ///
 /// A caller-supplied `ORT_DYLIB_PATH` always wins so operators can override the
 /// bundled library; otherwise fall back to a library bundled next to the
-/// executable (`exe_dir`). Returns `None` to let `ort` use its own default
-/// search (system paths).
+/// executable (`exe_dir`), then to the executable's *parent* directory. The
+/// parent tier exists for cargo's layout: test and example binaries run from
+/// `target/<profile>/deps/`, while `just ort-fetch` installs the runtime into
+/// `target/<profile>/lib/`. Returns `None` when nothing was found.
 #[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
 fn resolve_ort_dylib_path(
     env_override: Option<PathBuf>,
@@ -383,7 +385,27 @@ fn resolve_ort_dylib_path(
     if let Some(p) = env_override {
         return Some(p);
     }
-    exe_dir.and_then(find_bundled_ort_dylib_in)
+    let exe_dir = exe_dir?;
+    find_bundled_ort_dylib_in(exe_dir)
+        .or_else(|| exe_dir.parent().and_then(find_bundled_ort_dylib_in))
+}
+
+/// The error raised when no ONNX Runtime library can be resolved at all.
+///
+/// Split out (and unit-tested) because it is the only user-facing guidance for
+/// a `load-dynamic` build that has nothing to load.
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn no_ort_dylib_error() -> String {
+    format!(
+        "No ONNX Runtime dynamic library found: ORT_DYLIB_PATH is unset and no `{}` \
+         exists in <exe_dir>/lib/, <exe_dir>/, or <exe_dir>/../lib/. This build links \
+         ONNX Runtime dynamically; letting `ort` fall back to its own search risks \
+         picking up an incompatible runtime, which makes it deadlock silently on init \
+         instead of returning an error. Run `just ort-fetch` to bundle ONNX Runtime {}, \
+         or set ORT_DYLIB_PATH to an existing one.",
+        onnxruntime_lib_name(),
+        EXPECTED_ORT_VERSION
+    )
 }
 
 /// Validate a resolved ONNX Runtime library against [`EXPECTED_ORT_VERSION`]
@@ -412,6 +434,12 @@ fn check_ort_dylib_version(path: &std::path::Path, expected: &str) -> Result<(),
 /// against [`EXPECTED_ORT_VERSION`] *before* `ort` touches it, because a
 /// version-mismatched runtime makes `ort` deadlock silently on init rather
 /// than returning a clean error.
+///
+/// Resolving nothing is an error rather than a warning, for the same reason:
+/// handing off to `ort`'s unvalidated default search reintroduces exactly the
+/// silent-deadlock path this function exists to close, and a `spawn_blocking`
+/// thread stuck inside it cannot be cancelled by a timeout. Callers already
+/// degrade gracefully on `Err` (semantic search is disabled).
 #[cfg(all(feature = "embedding", feature = "ort-load-dynamic"))]
 fn prepare_ort_dylib() -> Result<(), EmbeddingError> {
     let env_override = std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from);
@@ -437,13 +465,7 @@ fn prepare_ort_dylib() -> Result<(), EmbeddingError> {
             );
             Ok(())
         }
-        None => {
-            tracing::warn!(
-                "No bundled ONNX Runtime found and ORT_DYLIB_PATH is unset; relying on \
-                 ort's default library search. Set ORT_DYLIB_PATH if initialization fails."
-            );
-            Ok(())
-        }
+        None => Err(EmbeddingError::InitError(no_ort_dylib_error())),
     }
 }
 
@@ -1087,6 +1109,58 @@ mod ort_dylib_tests {
         assert_eq!(resolve_ort_dylib_path(None, Some(&base)), None);
         assert_eq!(resolve_ort_dylib_path(None, None), None);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolves_sibling_lib_dir_when_exe_dir_has_no_bundle() {
+        // Test binaries live in `target/<profile>/deps/` while `just ort-fetch`
+        // installs into `target/<profile>/lib/` — the parent's `lib/` must be
+        // searched, otherwise every integration test that inits embedding falls
+        // through to ort's own search and deadlocks.
+        let root = unique_tmp_dir("ort_resolve_sibling");
+        let deps = root.join("deps");
+        let libdir = root.join("lib");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir_all(&libdir).unwrap();
+        let bundled = libdir.join(onnxruntime_lib_name());
+        std::fs::write(&bundled, b"x").unwrap();
+        assert_eq!(resolve_ort_dylib_path(None, Some(&deps)), Some(bundled));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exe_dir_bundle_wins_over_sibling_lib_dir() {
+        let root = unique_tmp_dir("ort_resolve_sibling_prec");
+        let deps = root.join("deps");
+        std::fs::create_dir_all(deps.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let name = onnxruntime_lib_name();
+        let near = deps.join("lib").join(name);
+        std::fs::write(&near, b"x").unwrap();
+        std::fs::write(root.join("lib").join(name), b"x").unwrap();
+        assert_eq!(
+            resolve_ort_dylib_path(None, Some(&deps)),
+            Some(near),
+            "a library next to the executable must beat the parent's lib/"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_dylib_error_points_at_the_fix() {
+        let err = no_ort_dylib_error();
+        assert!(
+            err.contains("ORT_DYLIB_PATH"),
+            "must name the override env var: {err}"
+        );
+        assert!(
+            err.contains("just ort-fetch"),
+            "must name the command that bundles the runtime: {err}"
+        );
+        assert!(
+            err.contains(EXPECTED_ORT_VERSION),
+            "must name the required runtime version: {err}"
+        );
     }
 
     #[test]
