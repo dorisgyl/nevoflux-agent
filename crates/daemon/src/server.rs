@@ -2315,6 +2315,7 @@ pub async fn start_server(
     let process_config = agent_config.clone();
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
+    let process_available_browsers = available_browsers.clone();
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
     let process_cancellation_registry = cancellation_registry.clone();
@@ -4448,7 +4449,11 @@ pub async fn start_server(
                 }
                 RouteDecision::ProcessMcp { .. } => {
                     // Handle MCP messages
-                    let response_payload = handle_mcp_message(&envelope.payload).await;
+                    let service = crate::mcp_service::McpService::new(
+                        process_services.clone(),
+                        process_available_browsers.clone(),
+                    );
+                    let response_payload = handle_mcp_message(&envelope.payload, &service).await;
                     let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
                         .with_request_id(&request_id);
                     if let Err(e) = process_response_tx.send((identity, response)).await {
@@ -9520,33 +9525,122 @@ async fn handle_artifact_list(
 }
 
 /// Handle MCP channel messages
-async fn handle_mcp_message(payload: &serde_json::Value) -> serde_json::Value {
+/// MCP protocol version reported on the daemon's internal bridge leg.
+///
+/// This is *not* what an MCP client sees: the stdio front-end terminates the
+/// real protocol with rmcp (which negotiates a current revision) and only uses
+/// this leg to fetch and run tools. The browser extension's own `mcp_request`
+/// path is the other caller, and it pins this baseline.
+const BRIDGE_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Handle one `Channel::Mcp` envelope from a proxy (the `--mcp` stdio bridge).
+///
+/// The envelope wraps a JSON-RPC message:
+/// `{type: "mcp_request", payload: {request_id, source, payload: <jsonrpc>}}`.
+/// The reply mirrors that nesting, which is the shape both the stdio front-end
+/// and the browser extension's `mcp_response` unwrap.
+async fn handle_mcp_message(
+    payload: &serde_json::Value,
+    service: &crate::mcp_service::McpService,
+) -> serde_json::Value {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    match msg_type {
-        "mcp_request" => {
-            // TODO: Implement MCP request handling
-            serde_json::json!({
-                "type": "mcp_response",
-                "payload": {
-                    "jsonrpc": "2.0",
-                    "id": payload.get("payload").and_then(|p| p.get("id")).cloned().unwrap_or(serde_json::json!(null)),
-                    "error": {
-                        "code": -32601,
-                        "message": "MCP not yet implemented"
-                    }
-                }
-            })
+    if msg_type != "mcp_request" {
+        return serde_json::json!({
+            "type": "error",
+            "payload": {
+                "code": "UNKNOWN_MCP_TYPE",
+                "message": format!("Unknown MCP message type: {}", msg_type)
+            }
+        });
+    }
+
+    let inner = payload.get("payload");
+    let request_id = inner
+        .and_then(|p| p.get("request_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let rpc = inner
+        .and_then(|p| p.get("payload"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let response = mcp_jsonrpc_response(&rpc, service).await;
+
+    serde_json::json!({
+        "type": "mcp_response",
+        "payload": { "request_id": request_id, "payload": response }
+    })
+}
+
+/// Answer one MCP JSON-RPC request against the daemon's tool implementations.
+async fn mcp_jsonrpc_response(
+    rpc: &serde_json::Value,
+    service: &crate::mcp_service::McpService,
+) -> serde_json::Value {
+    let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = rpc
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let ok = |result: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    let err = |code: i64, message: String| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message }
+        })
+    };
+
+    match method {
+        "initialize" => ok(serde_json::json!({
+            "protocolVersion": BRIDGE_MCP_PROTOCOL_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": "nevoflux-agent",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        })),
+        "tools/list" => {
+            let tools: Vec<serde_json::Value> = service
+                .tools()
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
+                .collect();
+            ok(serde_json::json!({ "tools": tools }))
         }
-        _ => {
-            serde_json::json!({
-                "type": "error",
-                "payload": {
-                    "code": "UNKNOWN_MCP_TYPE",
-                    "message": format!("Unknown MCP message type: {}", msg_type)
-                }
-            })
+        "tools/call" => {
+            let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
+                return err(-32602, "Missing 'name' in tools/call params".to_string());
+            };
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            // A tool that fails is a *result* with isError, not a JSON-RPC
+            // error: the MCP client shows the message to the model so it can
+            // adapt, whereas a protocol error aborts the call.
+            match service.call_tool(name, &arguments).await {
+                Ok(text) => ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false
+                })),
+                Err(message) => ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": message }],
+                    "isError": true
+                })),
+            }
         }
+        // Notifications carry no id; acking with an empty result is harmless
+        // and keeps a client that (incorrectly) expects a reply unblocked.
+        "notifications/initialized" | "ping" => ok(serde_json::json!({})),
+        other => err(-32601, format!("Method not found: {other}")),
     }
 }
 
@@ -13661,5 +13755,170 @@ mod tests {
             active_status["payload"]["data"]["condition"],
             "the task is done"
         );
+    }
+
+    // ---- MCP over the proxy bridge (`Channel::Mcp`) ----------------------
+    //
+    // `handle_mcp_message` used to answer every request with "MCP not yet
+    // implemented"; these cover the JSON-RPC layer that replaced it. Tool
+    // *execution* needs a live browser/computer, so the cases here are the
+    // ones that resolve without one: the protocol shape, and the two error
+    // paths a client can actually trigger.
+
+    fn test_mcp_service() -> crate::mcp_service::McpService {
+        crate::mcp_service::McpService::new(
+            HostServices::new(Arc::new(schedule_test_db())),
+            Arc::new(crate::registry::BrowserRegistry::new()),
+        )
+    }
+
+    /// Wrap a JSON-RPC message the way the stdio front-end does.
+    fn mcp_envelope(method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "mcp_request",
+            "payload": {
+                "request_id": "req-1",
+                "source": { "agent": "test", "session_id": null },
+                "payload": { "jsonrpc": "2.0", "id": 1, "method": method, "params": params }
+            }
+        })
+    }
+
+    /// Unwrap the JSON-RPC reply from the response envelope.
+    fn mcp_reply(envelope: &serde_json::Value) -> serde_json::Value {
+        assert_eq!(envelope["type"], "mcp_response");
+        assert_eq!(envelope["payload"]["request_id"], "req-1");
+        envelope["payload"]["payload"].clone()
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_reports_version_and_identity() {
+        let reply = handle_mcp_message(
+            &mcp_envelope("initialize", serde_json::json!({})),
+            &test_mcp_service(),
+        )
+        .await;
+        let rpc = mcp_reply(&reply);
+
+        assert_eq!(
+            rpc["result"]["protocolVersion"],
+            BRIDGE_MCP_PROTOCOL_VERSION
+        );
+        assert_eq!(rpc["result"]["serverInfo"]["name"], "nevoflux-agent");
+        assert!(rpc["result"]["capabilities"]["tools"].is_object());
+    }
+
+    /// The bug this replaced: the old server advertised 29 tools and could run
+    /// none of them. Everything listed must now be dispatchable.
+    #[tokio::test]
+    async fn mcp_tools_list_advertises_only_dispatchable_tools() {
+        let service = test_mcp_service();
+        let reply =
+            handle_mcp_message(&mcp_envelope("tools/list", serde_json::json!({})), &service).await;
+        let rpc = mcp_reply(&reply);
+
+        let tools = rpc["result"]["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty(), "the catalogue must not be empty");
+        for tool in tools {
+            assert!(tool["name"].is_string(), "each tool needs a name");
+            assert!(
+                tool["inputSchema"].is_object(),
+                "{} must carry a JSON schema",
+                tool["name"]
+            );
+        }
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"browser_navigate"));
+        assert!(
+            !names.contains(&"agent_chat"),
+            "agent_chat has no executor and must not be advertised"
+        );
+    }
+
+    /// A tool failure is a *result* with isError, not a JSON-RPC error — the
+    /// client shows it to the model instead of aborting the call.
+    #[tokio::test]
+    async fn mcp_unknown_tool_is_a_tool_level_error() {
+        let reply = handle_mcp_message(
+            &mcp_envelope(
+                "tools/call",
+                serde_json::json!({ "name": "no_such_tool", "arguments": {} }),
+            ),
+            &test_mcp_service(),
+        )
+        .await;
+        let rpc = mcp_reply(&reply);
+
+        assert!(rpc["error"].is_null(), "must not be a protocol error");
+        assert_eq!(rpc["result"]["isError"], true);
+        assert!(rpc["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no_such_tool"));
+    }
+
+    /// A browser tool with no browser connected must say so, rather than
+    /// hanging or reporting a generic failure.
+    #[tokio::test]
+    async fn mcp_browser_tool_without_a_browser_explains_itself() {
+        let reply = handle_mcp_message(
+            &mcp_envelope(
+                "tools/call",
+                serde_json::json!({ "name": "browser_navigate", "arguments": { "url": "https://example.com" } }),
+            ),
+            &test_mcp_service(),
+        )
+        .await;
+        let rpc = mcp_reply(&reply);
+
+        assert_eq!(rpc["result"]["isError"], true);
+        let text = rpc["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("browser"),
+            "the message should point at the missing browser: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_without_a_name_is_invalid_params() {
+        let reply = handle_mcp_message(
+            &mcp_envelope("tools/call", serde_json::json!({})),
+            &test_mcp_service(),
+        )
+        .await;
+        assert_eq!(mcp_reply(&reply)["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn mcp_unknown_method_is_method_not_found() {
+        let reply = handle_mcp_message(
+            &mcp_envelope("nope/nope", serde_json::json!({})),
+            &test_mcp_service(),
+        )
+        .await;
+        assert_eq!(mcp_reply(&reply)["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn mcp_ping_and_initialized_notification_are_acked() {
+        let service = test_mcp_service();
+        for method in ["ping", "notifications/initialized"] {
+            let reply =
+                handle_mcp_message(&mcp_envelope(method, serde_json::json!({})), &service).await;
+            let rpc = mcp_reply(&reply);
+            assert!(rpc["error"].is_null(), "{method} must not error");
+            assert!(rpc["result"].is_object(), "{method} must return a result");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_non_request_envelope_is_rejected() {
+        let reply = handle_mcp_message(
+            &serde_json::json!({ "type": "something_else", "payload": {} }),
+            &test_mcp_service(),
+        )
+        .await;
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["payload"]["code"], "UNKNOWN_MCP_TYPE");
     }
 }

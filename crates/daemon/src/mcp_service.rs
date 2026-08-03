@@ -1,0 +1,248 @@
+//! Daemon-side execution for MCP `tools/list` and `tools/call`.
+//!
+//! Every MCP front-end the daemon exposes reduces to the same two questions:
+//! *which tools are there* and *run this one*. This module answers both once,
+//! so a front-end only has to speak its transport.
+//!
+//! # Why the catalogue is filtered
+//!
+//! [`nevoflux_mcp::create_tools`] is the published catalogue (name, description,
+//! JSON schema). The thing that actually runs a tool is
+//! [`crate::wasm::mcp_tool_executor::execute_mcp_tool`], whose dispatch table
+//! grew separately and does not cover the catalogue one-for-one: a few computer
+//! tools are spelled differently there, and a few have no implementation at all.
+//! [`McpService::tools`] therefore advertises only what [`McpService::call_tool`]
+//! can dispatch — an MCP client that lists a tool can always call it. Names that
+//! drop out are logged rather than silently vanishing.
+
+use std::sync::Arc;
+
+use nevoflux_llm::providers::acp::mcp_bridge::McpToolBridge;
+use nevoflux_mcp::ToolDefinition;
+
+use crate::registry::BrowserRegistry;
+use crate::wasm::services::HostServices;
+
+/// Map a catalogue tool name to the name the executor dispatches on.
+///
+/// Most names pass through. The `computer_*` family is the exception: the
+/// catalogue uses the agent-facing spelling (`computer_click`) while the
+/// executor matches the controller-facing one (`computer_mouse_click`).
+/// Returns `None` for a catalogue entry with no implementation behind it.
+fn resolve_executor_name(name: &str) -> Option<&'static str> {
+    // Computer tools: catalogue spelling -> executor spelling.
+    let computer = match name {
+        "computer_screenshot" => Some("computer_screenshot"),
+        "computer_mouse_move" => Some("computer_mouse_move"),
+        "computer_type_text" => Some("computer_type_text"),
+        "computer_click" => Some("computer_mouse_click"),
+        "computer_key" => Some("computer_press_key"),
+        "computer_scroll" => Some("computer_mouse_scroll"),
+        "computer_drag" => Some("computer_mouse_drag"),
+        "computer_cursor_position" => Some("computer_mouse_position"),
+        // Advertised by the catalogue but with no executor arm; excluded from
+        // `tools/list` so a client never calls one and gets a surprise.
+        "computer_mouse_down" | "computer_mouse_up" | "computer_hold_key" | "computer_wait" => None,
+        _ => None,
+    };
+    if computer.is_some() {
+        return computer;
+    }
+    if name.starts_with("computer_") {
+        return None;
+    }
+    // Browser tools dispatch by their catalogue name; the executor's own
+    // prefix-stripping map decides whether the name is known.
+    if name.starts_with("browser_") {
+        return BROWSER_TOOLS.iter().find(|t| **t == name).copied();
+    }
+    None
+}
+
+/// Browser tools from the catalogue that the executor's action map covers.
+///
+/// Kept as an explicit list (rather than probing the executor) so an executor
+/// change that drops a mapping shows up as a failing test here, not as a
+/// runtime "unknown tool" reaching an MCP client.
+const BROWSER_TOOLS: &[&str] = &[
+    "browser_navigate",
+    "browser_click",
+    "browser_screenshot",
+    "browser_type",
+    "browser_fill",
+    "browser_get_content",
+    "browser_eval_js",
+    "browser_wait_for",
+    "browser_scroll",
+    "browser_get_element",
+    "browser_query_all",
+    "browser_get_elements",
+    "browser_click_by_id",
+    "browser_fill_by_id",
+    "browser_type_by_id",
+    "browser_get_markdown",
+];
+
+/// Whether a tool needs a connected browser to run.
+fn needs_browser(name: &str) -> bool {
+    name.starts_with("browser_")
+}
+
+/// Executes MCP tool calls against the daemon's own tool implementations.
+///
+/// Cloneable: front-ends hold one per connection, all sharing the same
+/// [`HostServices`].
+#[derive(Clone)]
+pub struct McpService {
+    services: HostServices,
+    browsers: Arc<BrowserRegistry>,
+    tool_bridge: Arc<McpToolBridge>,
+}
+
+impl McpService {
+    /// Build a service over the daemon's host services and browser registry.
+    pub fn new(services: HostServices, browsers: Arc<BrowserRegistry>) -> Self {
+        Self {
+            services,
+            browsers,
+            tool_bridge: Arc::new(McpToolBridge::new()),
+        }
+    }
+
+    /// Tools this daemon advertises, i.e. the catalogue restricted to entries
+    /// [`Self::call_tool`] can dispatch.
+    pub fn tools(&self) -> Vec<ToolDefinition> {
+        let (kept, dropped): (Vec<_>, Vec<_>) = nevoflux_mcp::create_tools()
+            .into_iter()
+            .partition(|t| resolve_executor_name(&t.name).is_some());
+        if !dropped.is_empty() {
+            tracing::debug!(
+                dropped = ?dropped.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                "MCP catalogue entries without an executor are not advertised"
+            );
+        }
+        kept
+    }
+
+    /// Run one tool and return its textual result.
+    ///
+    /// `Err` is a tool-level failure the caller should surface to its client
+    /// (rendered as `isError: true`), not a transport fault.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, String> {
+        let Some(executor_name) = resolve_executor_name(name) else {
+            return Err(format!("Unknown tool: {name}"));
+        };
+
+        // Browser tools run *in* a connected browser, so they have to be
+        // addressed to one. An MCP client (Claude Code, say) is not itself a
+        // browser, so the routing identity comes from the browser registry
+        // rather than from the caller's own connection.
+        let services = if needs_browser(name) {
+            let entry = self.browsers.single().map_err(|e| {
+                format!("Tool '{name}' needs a connected browser, but none is usable: {e}")
+            })?;
+            let mut services = self.services.clone();
+            services.proxy_id = entry.proxy_id;
+            services.client_identity = entry.client_identity;
+            services
+        } else {
+            self.services.clone()
+        };
+
+        crate::wasm::mcp_tool_executor::execute_mcp_tool(
+            executor_name,
+            arguments,
+            &services,
+            &self.tool_bridge,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_catalogue_names_pass_through_unchanged() {
+        for name in BROWSER_TOOLS {
+            assert_eq!(
+                resolve_executor_name(name),
+                Some(*name),
+                "{name} must dispatch under its own name"
+            );
+        }
+    }
+
+    #[test]
+    fn computer_catalogue_names_map_to_executor_spelling() {
+        assert_eq!(
+            resolve_executor_name("computer_click"),
+            Some("computer_mouse_click")
+        );
+        assert_eq!(
+            resolve_executor_name("computer_key"),
+            Some("computer_press_key")
+        );
+        assert_eq!(
+            resolve_executor_name("computer_cursor_position"),
+            Some("computer_mouse_position")
+        );
+        // Pass-through cases still work.
+        assert_eq!(
+            resolve_executor_name("computer_screenshot"),
+            Some("computer_screenshot")
+        );
+    }
+
+    #[test]
+    fn tools_without_an_executor_are_rejected() {
+        for name in [
+            "computer_mouse_down",
+            "computer_mouse_up",
+            "computer_hold_key",
+            "computer_wait",
+            "agent_chat",
+            "definitely_not_a_tool",
+        ] {
+            assert_eq!(resolve_executor_name(name), None, "{name} must not resolve");
+        }
+    }
+
+    /// The guarantee the whole module exists for: everything advertised is
+    /// callable, and nothing callable is missing from the catalogue's schemas.
+    #[test]
+    fn advertised_catalogue_is_exactly_the_dispatchable_subset() {
+        let catalogue = nevoflux_mcp::create_tools();
+        let advertised: Vec<&str> = catalogue
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| resolve_executor_name(n).is_some())
+            .collect();
+
+        for name in BROWSER_TOOLS {
+            assert!(
+                advertised.contains(name),
+                "{name} is dispatchable but missing from the published catalogue"
+            );
+        }
+        assert!(
+            advertised.len() > BROWSER_TOOLS.len(),
+            "computer tools should be advertised too, got {advertised:?}"
+        );
+        assert!(
+            !advertised.contains(&"agent_chat"),
+            "agent_chat has no executor and must not be advertised"
+        );
+    }
+
+    #[test]
+    fn only_browser_tools_require_a_browser() {
+        assert!(needs_browser("browser_navigate"));
+        assert!(!needs_browser("computer_screenshot"));
+    }
+}
