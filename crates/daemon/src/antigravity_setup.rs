@@ -65,7 +65,10 @@ mod tests {
         write_mcp_config("http://127.0.0.1:4242/mcp").unwrap();
         // Overwrite with a new port (daemon restart) — file reflects latest.
         write_mcp_config("http://127.0.0.1:5353/mcp").unwrap();
-        let p = tmp.join("agy-workspace").join(".agents").join("mcp_config.json");
+        let p = tmp
+            .join("agy-workspace")
+            .join(".agents")
+            .join("mcp_config.json");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(

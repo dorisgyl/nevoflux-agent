@@ -24,9 +24,13 @@ const MAX: u64 = 3600;
 /// Returns the [60, 3600] clamped value, or the default 300s if absent or
 /// malformed.
 pub fn extract_next_delay(text: &str) -> Duration {
-    let Some(start) = text.find("```loop-meta") else { return DEFAULT };
+    let Some(start) = text.find("```loop-meta") else {
+        return DEFAULT;
+    };
     let after = &text[start + "```loop-meta".len()..];
-    let Some(end) = after.find("```") else { return DEFAULT };
+    let Some(end) = after.find("```") else {
+        return DEFAULT;
+    };
     let body = after[..end].trim();
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,

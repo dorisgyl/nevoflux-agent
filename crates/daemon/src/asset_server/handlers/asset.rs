@@ -86,9 +86,10 @@ pub async fn handle(
     // extension. The migration recorded a path-based hint; magic-bytes
     // wins so that a JPEG-saved-as-foo.png still serves `image/jpeg`.
     let mime = sniff_mime(&asset.bytes, &name).unwrap_or_else(|| {
-        asset.mime_type.clone().unwrap_or_else(|| {
-            asset_inline::mime_for_path(&name).to_string()
-        })
+        asset
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| asset_inline::mime_for_path(&name).to_string())
     });
 
     serve_with_range(&headers, mime, asset.bytes)

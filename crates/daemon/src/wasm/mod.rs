@@ -3,10 +3,10 @@
 //! This module provides the infrastructure for loading and executing
 //! WebAssembly modules within the NevoFlux daemon.
 
+pub mod antigravity_session;
 pub mod instance;
 pub mod linker;
 pub mod llm;
-pub mod antigravity_session;
 pub mod mcp_http_server;
 pub mod mcp_tool_executor;
 pub mod runtime;

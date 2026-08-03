@@ -143,8 +143,7 @@ mod tests {
         // while the daemon is already running.
         let skill_dir = temp.path().join("demo-after-load");
         std::fs::create_dir_all(&skill_dir).expect("create skill subdir");
-        let mut f =
-            std::fs::File::create(skill_dir.join("SKILL.md")).expect("create SKILL.md");
+        let mut f = std::fs::File::create(skill_dir.join("SKILL.md")).expect("create SKILL.md");
         write!(
             f,
             "---\nname: demo-after-load\ndescription: A skill written after the registry was first loaded.\n---\n\n# Demo\n\nBody.\n"

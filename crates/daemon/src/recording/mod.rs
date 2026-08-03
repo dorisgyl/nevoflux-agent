@@ -13,12 +13,16 @@ pub const RECORDING_TOPIC_PREFIX: &str = "recording:";
 /// Returns `None` for non-recording topics or an empty id.
 pub fn recording_id_from_topic(topic: &str) -> Option<&str> {
     let id = topic.strip_prefix(RECORDING_TOPIC_PREFIX)?;
-    if id.is_empty() { None } else { Some(id) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 struct IngestMsg {
@@ -87,7 +91,10 @@ mod tests {
 
     #[test]
     fn parses_recording_id_from_topic() {
-        assert_eq!(recording_id_from_topic("recording:rec_abc123"), Some("rec_abc123"));
+        assert_eq!(
+            recording_id_from_topic("recording:rec_abc123"),
+            Some("rec_abc123")
+        );
     }
 
     #[test]
@@ -129,7 +136,10 @@ mod tests {
         // not a re-derived path — i.e. the caller controls the path.
         let dir = std::path::Path::new("/custom/recordings");
         let text = "{{NEVOFLUX_RECORDINGS_DIR}}";
-        assert_eq!(expand_recordings_dir_sentinel(text, dir), "/custom/recordings");
+        assert_eq!(
+            expand_recordings_dir_sentinel(text, dir),
+            "/custom/recordings"
+        );
     }
 
     #[tokio::test]
@@ -138,7 +148,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let collector = RecordingCollector::new(dir.path().to_path_buf());
-        collector.ingest("rec_z".into(), json!({"type":"header","recording_id":"rec_z"}));
+        collector.ingest(
+            "rec_z".into(),
+            json!({"type":"header","recording_id":"rec_z"}),
+        );
         collector.ingest("rec_z".into(), json!({"type":"step","action":"click"}));
 
         // Poll until the async writer task has drained both lines. A fixed

@@ -14,7 +14,11 @@ use super::space_souls::{is_valid_container_id, SpaceSoulBindings};
 use crate::wasm::HostServices;
 
 /// Build the `system_response` envelope every command replies with.
-fn respond(request_id: &str, command: &str, result: Result<serde_json::Value, (&str, String)>) -> serde_json::Value {
+fn respond(
+    request_id: &str,
+    command: &str,
+    result: Result<serde_json::Value, (&str, String)>,
+) -> serde_json::Value {
     match result {
         Ok(data) => json!({
             "type": "system_response",
@@ -50,7 +54,10 @@ fn config_dir() -> Option<PathBuf> {
 }
 
 /// `soul.list` — every soul the user can bind or mention.
-pub async fn handle_soul_list(services: &HostServices, params: &serde_json::Value) -> serde_json::Value {
+pub async fn handle_soul_list(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
     let request_id = request_id_of(params);
     let Some(registry) = services.role_registry() else {
         return respond(
@@ -135,7 +142,11 @@ fn avatar_data_uri(slug: &str, avatar: &str) -> Option<String> {
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         other => {
-            tracing::warn!("Soul '{}' has an avatar of unsupported type {:?}", slug, other);
+            tracing::warn!(
+                "Soul '{}' has an avatar of unsupported type {:?}",
+                slug,
+                other
+            );
             return None;
         }
     };
@@ -171,22 +182,27 @@ pub async fn handle_soul_bindings(
             return respond(
                 &request_id,
                 "soul.bindings",
-                Err(("BINDINGS_UNAVAILABLE", format!("Bindings lock poisoned: {}", e))),
+                Err((
+                    "BINDINGS_UNAVAILABLE",
+                    format!("Bindings lock poisoned: {}", e),
+                )),
             )
         }
     };
 
-    respond(
-        &request_id,
-        "soul.bindings",
-        Ok(json!({ "bindings": map })),
-    )
+    respond(&request_id, "soul.bindings", Ok(json!({ "bindings": map })))
 }
 
 /// `soul.bind` — give a container a soul.
-pub async fn handle_soul_bind(services: &HostServices, params: &serde_json::Value) -> serde_json::Value {
+pub async fn handle_soul_bind(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
     let request_id = request_id_of(params);
-    let container = params.get("container").and_then(|c| c.as_str()).unwrap_or("");
+    let container = params
+        .get("container")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
     let slug = params.get("slug").and_then(|s| s.as_str()).unwrap_or("");
 
     if !is_valid_container_id(container) {
@@ -234,7 +250,10 @@ pub async fn handle_soul_unbind(
     params: &serde_json::Value,
 ) -> serde_json::Value {
     let request_id = request_id_of(params);
-    let container = params.get("container").and_then(|c| c.as_str()).unwrap_or("");
+    let container = params
+        .get("container")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
 
     if !is_valid_container_id(container) {
         return respond(
@@ -273,7 +292,10 @@ fn mutate_bindings(
         return respond(
             request_id,
             command,
-            Err(("CONFIG_ERROR", "Could not determine config directory".into())),
+            Err((
+                "CONFIG_ERROR",
+                "Could not determine config directory".into(),
+            )),
         );
     };
 
@@ -283,7 +305,10 @@ fn mutate_bindings(
             return respond(
                 request_id,
                 command,
-                Err(("BINDINGS_UNAVAILABLE", format!("Bindings lock poisoned: {}", e))),
+                Err((
+                    "BINDINGS_UNAVAILABLE",
+                    format!("Bindings lock poisoned: {}", e),
+                )),
             )
         }
     };
@@ -305,7 +330,6 @@ fn mutate_bindings(
     respond(request_id, command, Ok(json!({ "bindings": map })))
 }
 
-
 // ── Authoring commands ─────────────────────────────────────────────
 //
 // The editor never assembles YAML: it sends fields, the daemon writes the file.
@@ -313,7 +337,10 @@ fn mutate_bindings(
 // that can produce that mistake is the one place that is tested.
 
 /// `soul.read` — everything the editor needs to show a soul.
-pub async fn handle_soul_read(services: &HostServices, params: &serde_json::Value) -> serde_json::Value {
+pub async fn handle_soul_read(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
     let request_id = request_id_of(params);
     let slug = params.get("slug").and_then(|s| s.as_str()).unwrap_or("");
 
@@ -441,8 +468,14 @@ pub async fn handle_soul_write(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        tools: params.get("tools").and_then(|v| v.as_str()).map(str::to_string),
-        agents: params.get("agents").and_then(|v| v.as_str()).map(str::to_string),
+        tools: params
+            .get("tools")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        agents: params
+            .get("agents")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     };
 
     if bodies.soul.trim().is_empty() {
@@ -523,7 +556,10 @@ pub async fn handle_soul_set_avatar(
 ) -> serde_json::Value {
     let request_id = request_id_of(params);
     let slug = params.get("slug").and_then(|s| s.as_str()).unwrap_or("");
-    let data_uri = params.get("data_uri").and_then(|d| d.as_str()).unwrap_or("");
+    let data_uri = params
+        .get("data_uri")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
 
     let Some(registry) = services.role_registry() else {
         return respond(
@@ -548,14 +584,20 @@ pub async fn handle_soul_set_avatar(
         return respond(
             &request_id,
             "soul.set_avatar",
-            Err(("WRITE_FAILED", format!("Could not create {}: {}", dir.display(), e))),
+            Err((
+                "WRITE_FAILED",
+                format!("Could not create {}: {}", dir.display(), e),
+            )),
         );
     }
     if let Err(e) = std::fs::write(dir.join(AVATAR_FILE), &bytes) {
         return respond(
             &request_id,
             "soul.set_avatar",
-            Err(("WRITE_FAILED", format!("Could not write {}: {}", AVATAR_FILE, e))),
+            Err((
+                "WRITE_FAILED",
+                format!("Could not write {}: {}", AVATAR_FILE, e),
+            )),
         );
     }
 
@@ -636,7 +678,6 @@ fn rescan(registry: &crate::agent::roles::AgentRoleRegistry) {
         tracing::warn!("Could not reload souls after writing: {}", e);
     }
 }
-
 
 // ── AI Draft ───────────────────────────────────────────────────────
 //
@@ -803,7 +844,11 @@ pub async fn handle_soul_generate(
                     Err(("EMPTY_DRAFT", "The model returned nothing to use.".into())),
                 );
             }
-            respond(&request_id, "soul.generate", Ok(json!({ "content": content })))
+            respond(
+                &request_id,
+                "soul.generate",
+                Ok(json!({ "content": content })),
+            )
         }
         Err(e) => respond(
             &request_id,
@@ -832,10 +877,20 @@ fn build_draft_prompt(
     params: &serde_json::Value,
     target: DraftTarget,
 ) -> String {
-    let field = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+    };
     let target_key = target_field_key(target);
 
-    let mut prompt = format!("Write the {}.\n\n{}\n\n", target_label(target), target.brief());
+    let mut prompt = format!(
+        "Write the {}.\n\n{}\n\n",
+        target_label(target),
+        target.brief()
+    );
 
     let name = field("name");
     let description = field("description");
@@ -964,8 +1019,6 @@ mod tests {
         assert_eq!(err["payload"]["error"]["message"], "nope");
     }
 
-
-
     // ── AI Draft ───────────────────────────────────────────────────────
 
     #[test]
@@ -984,13 +1037,20 @@ mod tests {
     /// personality file would stay there forever.
     #[test]
     fn a_fenced_draft_is_unwrapped() {
-        assert_eq!(strip_code_fence("```
-You are alex.
-```"), "You are alex.");
         assert_eq!(
-            strip_code_fence("```markdown
+            strip_code_fence(
+                "```
 You are alex.
-```"),
+```"
+            ),
+            "You are alex."
+        );
+        assert_eq!(
+            strip_code_fence(
+                "```markdown
+You are alex.
+```"
+            ),
             "You are alex.",
             "the language tag goes too"
         );
@@ -1000,9 +1060,11 @@ You are alex.
     fn an_unfenced_draft_is_left_alone() {
         assert_eq!(strip_code_fence("You are alex."), "You are alex.");
         assert_eq!(
-            strip_code_fence("  You are alex.
+            strip_code_fence(
+                "  You are alex.
 
-"),
+"
+            ),
             "You are alex.",
             "but stray whitespace goes"
         );
@@ -1053,10 +1115,12 @@ fn main() {}
     /// callers may send an array. Both mean the same list.
     #[test]
     fn a_tool_list_reads_from_lines_or_an_array() {
-        let from_lines = string_list(&json!("web_search
+        let from_lines = string_list(&json!(
+            "web_search
   brain_*  
 
-"));
+"
+        ));
         assert_eq!(from_lines, vec!["web_search", "brain_*"]);
 
         let from_array = string_list(&json!(["web_search", "  brain_*  ", ""]));
@@ -1080,7 +1144,10 @@ fn main() {}
     /// user-authored text.
     #[test]
     fn avatar_paths_outside_the_soul_directory_are_refused() {
-        assert_eq!(avatar_data_uri("nonexistent-soul", "../../secrets.png"), None);
+        assert_eq!(
+            avatar_data_uri("nonexistent-soul", "../../secrets.png"),
+            None
+        );
         assert_eq!(avatar_data_uri("nonexistent-soul", "/etc/passwd"), None);
     }
 }

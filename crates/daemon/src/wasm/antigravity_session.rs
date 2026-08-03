@@ -240,7 +240,11 @@ mod tests {
             Some("sys"),
             &[("user", "hi"), ("assistant", "hello"), ("user", "more")],
         );
-        let d = decide(&cached, &message_hashes(&r2.messages), system_hash(&r2.system));
+        let d = decide(
+            &cached,
+            &message_hashes(&r2.messages),
+            system_hash(&r2.system),
+        );
         match d {
             BindDecision::Incremental {
                 prefix_len,
@@ -259,9 +263,16 @@ mod tests {
         // Turn 1: the LAST message is the current user input, enriched at send
         // time (e.g. 361 chars). Committing all-but-last stores only the settled
         // system message — NOT the enriched user msg.
-        let t1 = vec![msg("system", "SYS"), msg("user", "ENRICHED-with-page-context-361")];
+        let t1 = vec![
+            msg("system", "SYS"),
+            msg("user", "ENRICHED-with-page-context-361"),
+        ];
         let committed = stable_commit_hashes(&t1);
-        assert_eq!(committed, message_hashes(&t1[..1]), "only settled history committed");
+        assert_eq!(
+            committed,
+            message_hashes(&t1[..1]),
+            "only settled history committed"
+        );
 
         // Turn 2: that first user message now appears RAW ("记住暗号"), followed by
         // assistant replies + a new enriched current message. The committed prefix
@@ -295,7 +306,11 @@ mod tests {
             &[("user", "HI EDITED"), ("assistant", "hello"), ("user", "x")],
         );
         assert!(matches!(
-            decide(&cached, &message_hashes(&edited.messages), system_hash(&edited.system)),
+            decide(
+                &cached,
+                &message_hashes(&edited.messages),
+                system_hash(&edited.system)
+            ),
             BindDecision::Rebuild
         ));
     }
@@ -309,7 +324,11 @@ mod tests {
             system_hash: system_hash(&r1.system),
         });
         let r2 = req(Some("sys-v2"), &[("user", "hi"), ("user", "again")]);
-        match decide(&cached, &message_hashes(&r2.messages), system_hash(&r2.system)) {
+        match decide(
+            &cached,
+            &message_hashes(&r2.messages),
+            system_hash(&r2.system),
+        ) {
             BindDecision::Incremental { system_changed, .. } => assert!(system_changed),
             BindDecision::Rebuild => panic!("expected incremental"),
         }
@@ -332,7 +351,10 @@ mod tests {
         };
         assert!(t.text.contains("NEW-Q"), "new user msg present: {}", t.text);
         assert!(!t.text.contains("agy-thought"), "assistant delta dropped");
-        assert!(!t.text.contains("<context_update>"), "no system change -> no update");
+        assert!(
+            !t.text.contains("<context_update>"),
+            "no system change -> no update"
+        );
     }
 
     #[test]

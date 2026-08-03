@@ -147,8 +147,14 @@ mod tests {
                 git_ref: None
             }
         );
-        assert_eq!(remote("github:u/r@v1.2.0").git_ref.as_deref(), Some("v1.2.0"));
-        assert_eq!(remote("github:u/r/sub/dir").subdir.as_deref(), Some("sub/dir"));
+        assert_eq!(
+            remote("github:u/r@v1.2.0").git_ref.as_deref(),
+            Some("v1.2.0")
+        );
+        assert_eq!(
+            remote("github:u/r/sub/dir").subdir.as_deref(),
+            Some("sub/dir")
+        );
         let r = remote("github:u/r/sub@main");
         assert_eq!(r.subdir.as_deref(), Some("sub"));
         assert_eq!(r.git_ref.as_deref(), Some("main"));
@@ -223,7 +229,9 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> PackResult<PathBuf> {
         let p = entry.map_err(|e| PackError::Host(e.to_string()))?.path();
         if p.is_dir() {
             if top.is_some() {
-                return Err(PackError::Host("archive has multiple top-level dirs".into()));
+                return Err(PackError::Host(
+                    "archive has multiple top-level dirs".into(),
+                ));
             }
             top = Some(p);
         }
@@ -266,7 +274,9 @@ pub async fn resolve_source(source: &str, data_dir: &Path) -> PackResult<Resolve
         Source::Local(path) => {
             // A path may point at pack.toml or its parent dir.
             let pack_dir = if path.is_file() {
-                path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
             } else {
                 path
             };
@@ -391,8 +401,7 @@ mod core_tests {
             }
             builder.finish().unwrap();
         }
-        let mut gz =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&tar_buf).unwrap();
         gz.finish().unwrap()
     }
@@ -466,8 +475,7 @@ mod core_tests {
         // two zero blocks terminate the archive
         tar_buf.extend(std::iter::repeat(0u8).take(1024));
 
-        let mut gz =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&tar_buf).unwrap();
         gz.finish().unwrap()
     }

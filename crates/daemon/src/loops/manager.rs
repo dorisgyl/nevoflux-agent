@@ -280,9 +280,8 @@ impl LoopManager {
                     let rec = repo.get(req.loop_id.as_ref()).ok().flatten();
                     match rec {
                         Some(rec) if rec.gate_kind != "none" => {
-                            let kind =
-                                crate::loops::types::GateKind::from_db_str(&rec.gate_kind)
-                                    .unwrap_or(crate::loops::types::GateKind::None);
+                            let kind = crate::loops::types::GateKind::from_db_str(&rec.gate_kind)
+                                .unwrap_or(crate::loops::types::GateKind::None);
                             let spec_json = rec
                                 .gate_spec
                                 .as_deref()
@@ -1617,7 +1616,12 @@ mod tests {
             })
             .await
             .unwrap();
-        set_gate(&storage, id.as_ref(), "event", r#"{"path":"type","equals":"go"}"#);
+        set_gate(
+            &storage,
+            id.as_ref(),
+            "event",
+            r#"{"path":"type","equals":"go"}"#,
+        );
 
         // Subscribe before publishing — ephemeral delivery has no replay.
         let skipped_handle = bus
@@ -1682,7 +1686,12 @@ mod tests {
             })
             .await
             .unwrap();
-        set_gate(&storage, id.as_ref(), "event", r#"{"path":"type","equals":"go"}"#);
+        set_gate(
+            &storage,
+            id.as_ref(),
+            "event",
+            r#"{"path":"type","equals":"go"}"#,
+        );
 
         // Payload matches the gate's predicate -> must run.
         bus.publish(BusEvent::ephemeral(

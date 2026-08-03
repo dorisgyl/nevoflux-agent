@@ -163,21 +163,14 @@ impl McpClient {
                         }
                         match serde_json::from_str::<Value>(trimmed) {
                             Ok(msg) => {
-                                if let Some(id) =
-                                    msg.get("id").and_then(|v| v.as_u64())
-                                {
-                                    if let Some(tx) =
-                                        reader_pending.lock().await.remove(&id)
-                                    {
+                                if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
+                                    if let Some(tx) = reader_pending.lock().await.remove(&id) {
                                         // It's fine if the receiver was
                                         // dropped (e.g. caller timed out
                                         // and walked away); just discard.
                                         let _ = tx.send(msg);
                                     } else {
-                                        warn!(
-                                            id,
-                                            "MCP response for unknown / already-resolved id"
-                                        );
+                                        warn!(id, "MCP response for unknown / already-resolved id");
                                     }
                                 } else {
                                     // No id = JSON-RPC notification.
@@ -294,10 +287,8 @@ impl McpClient {
     /// This consumes `self` because the client is unusable after.
     pub async fn shutdown(self) {
         let _ = self.writer_tx.send(WriterCommand::Shutdown).await;
-        let _ =
-            tokio::time::timeout(Duration::from_secs(2), self.writer_handle).await;
-        let _ =
-            tokio::time::timeout(Duration::from_secs(2), self.reader_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.writer_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.reader_handle).await;
     }
 }
 
@@ -335,10 +326,8 @@ mod tests {
                         let req: Value =
                             serde_json::from_str(trimmed).expect("test request must parse");
                         if let Some(resp) = responder(req) {
-                            let s = format!(
-                                "{}\n",
-                                serde_json::to_string(&resp).expect("serialize")
-                            );
+                            let s =
+                                format!("{}\n", serde_json::to_string(&resp).expect("serialize"));
                             if writer.write_all(s.as_bytes()).await.is_err() {
                                 return;
                             }

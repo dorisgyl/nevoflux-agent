@@ -331,8 +331,7 @@ impl GoalManager {
                 let transcript = self.load_transcript(session_id);
                 // ACP evaluator (route B) goes through the one-shot ACP adapter;
                 // direct-API evaluators through the standard path.
-                let result =
-                    evaluate_with_choice(&choice, &rec.condition, &transcript).await;
+                let result = evaluate_with_choice(&choice, &rec.condition, &transcript).await;
                 match result {
                     Ok(v) => v,
                     Err(e) => {

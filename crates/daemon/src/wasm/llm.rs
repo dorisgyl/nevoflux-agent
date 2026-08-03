@@ -3988,10 +3988,7 @@ async fn stream_acp_completion(
         // turn 1 isn't truncated → it can commit → turn 2 can actually go
         // incremental. Also makes `system_hash` reflect the stable pointer, so an
         // unchanged system prompt doesn't spuriously re-send. antigravity-only.
-        antigravity_externalize_system(
-            &mut request,
-            &crate::antigravity_setup::workspace_dir(),
-        );
+        antigravity_externalize_system(&mut request, &crate::antigravity_setup::workspace_dir());
 
         let req_hashes = antigravity_session::message_hashes(&request.messages);
         let req_sys_hash = antigravity_session::system_hash(&request.system);
@@ -4099,12 +4096,9 @@ async fn stream_acp_completion(
                 let acp = providers.get(&provider_key).ok_or_else(|| {
                     DaemonError::InternalError("ACP provider disappeared".to_string())
                 })?;
-                let response_rx = acp
-                    .prompt(session_id.clone(), content)
-                    .await
-                    .map_err(|e| {
-                        DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
-                    })?;
+                let response_rx = acp.prompt(session_id.clone(), content).await.map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+                })?;
                 drop(providers);
 
                 match drive_acp_prompt(response_rx, use_mcp_bridge, 0, &tx, host_services.as_ref())
@@ -4339,9 +4333,7 @@ async fn drive_acp_prompt(
                 // regardless of which tool the ACP agent used.
                 if let Some(services) = host_services {
                     crate::wasm::mcp_tool_executor::record_acp_tool_result(
-                        services,
-                        &tool_name,
-                        &content,
+                        services, &tool_name, &content,
                     );
                 }
             }
@@ -4364,8 +4356,7 @@ async fn drive_acp_prompt(
                         .await;
                 } else {
                     // Direct mode: extract tool calls from the accumulated text.
-                    let (cleaned_text, extracted) =
-                        extract_tool_calls_from_text(&accumulated_text);
+                    let (cleaned_text, extracted) = extract_tool_calls_from_text(&accumulated_text);
 
                     let tool_calls: Vec<LlmToolCall> = extracted
                         .into_iter()
@@ -4379,10 +4370,7 @@ async fn drive_acp_prompt(
                         .collect();
 
                     if !tool_calls.is_empty() {
-                        tracing::info!(
-                            "ACP: extracted {} tool calls from text",
-                            tool_calls.len()
-                        );
+                        tracing::info!("ACP: extracted {} tool calls from text", tool_calls.len());
                         // Send cleaned text (without <tool_call> XML) + tool calls
                         let _ = tx
                             .send(LlmStreamChunk {
@@ -5091,10 +5079,7 @@ mod acp_skill_router_tests {
         // injection path does, so `prefix` matches what would actually have
         // been prepended to `request.system`.
         let body = "BODY LINE ".repeat(5_000); // ~50k chars — well over budget
-        let conventions = vec![(
-            "conv:label".to_string(),
-            "CONVENTION CONTENT".to_string(),
-        )];
+        let conventions = vec![("conv:label".to_string(), "CONVENTION CONTENT".to_string())];
         let (prefix, _cleaned) =
             build_skill_injection("big-skill", "do the thing", &body, &conventions);
         let applied = AppliedSkill {
@@ -5113,7 +5098,10 @@ mod acp_skill_router_tests {
 
         let workspace = tempfile::tempdir().expect("tempdir");
         let ok = skill_file_fallback(&mut request, &applied, workspace.path());
-        assert!(ok, "skill_file_fallback should succeed writing to a temp dir");
+        assert!(
+            ok,
+            "skill_file_fallback should succeed writing to a temp dir"
+        );
 
         // File exists and contains the body + conventions.
         let file_path = workspace
@@ -5147,8 +5135,8 @@ mod acp_skill_router_tests {
     #[test]
     fn antigravity_externalize_system_shrinks_and_versions() {
         use super::{
-            antigravity_externalize_system, ANTIGRAVITY_PROMPT_CHAR_BUDGET, ANTIGRAVITY_SYSTEM_FILE,
-            ANTIGRAVITY_SYSTEM_FILE_THRESHOLD,
+            antigravity_externalize_system, ANTIGRAVITY_PROMPT_CHAR_BUDGET,
+            ANTIGRAVITY_SYSTEM_FILE, ANTIGRAVITY_SYSTEM_FILE_THRESHOLD,
         };
         use crate::wasm::llm::{LlmChatRequest, LlmMessage};
 
@@ -5186,8 +5174,14 @@ mod acp_skill_router_tests {
             system: Some(big_sys.clone()),
             ..Default::default()
         };
-        assert!(antigravity_externalize_system(&mut req_same, workspace.path()));
-        assert_eq!(req_same.system, req.system, "identical system → identical pointer");
+        assert!(antigravity_externalize_system(
+            &mut req_same,
+            workspace.path()
+        ));
+        assert_eq!(
+            req_same.system, req.system,
+            "identical system → identical pointer"
+        );
 
         // Versioned: different system text → different pointer (triggers re-read).
         let mut req_changed = LlmChatRequest {
@@ -5195,7 +5189,10 @@ mod acp_skill_router_tests {
             system: Some(format!("{big_sys} CHANGED")),
             ..Default::default()
         };
-        assert!(antigravity_externalize_system(&mut req_changed, workspace.path()));
+        assert!(antigravity_externalize_system(
+            &mut req_changed,
+            workspace.path()
+        ));
         assert_ne!(
             req_changed.system, req.system,
             "changed system → changed pointer (context_update must fire)"
@@ -5207,7 +5204,10 @@ mod acp_skill_router_tests {
             system: Some("short system".to_string()),
             ..Default::default()
         };
-        assert!(!antigravity_externalize_system(&mut req_small, workspace.path()));
+        assert!(!antigravity_externalize_system(
+            &mut req_small,
+            workspace.path()
+        ));
         assert_eq!(req_small.system.as_deref(), Some("short system"));
     }
 
@@ -5227,11 +5227,15 @@ mod acp_skill_router_tests {
 
         // Realistic shape: base framing, then the Skills catalog (incl. `loop`),
         // then trailing tool/agent prose. Padded past the externalize threshold.
-        let base = format!("BASE FRAMING {}\n", "x".repeat(ANTIGRAVITY_SYSTEM_FILE_THRESHOLD));
+        let base = format!(
+            "BASE FRAMING {}\n",
+            "x".repeat(ANTIGRAVITY_SYSTEM_FILE_THRESHOLD)
+        );
         let skills = "\n\n# Skills\n\nWhen a request matches, you MUST use `skill_load(name)`.\n\n\
              - **loop**: Re-run a prompt on a time/event/DOM trigger.\n\
              - **schedule**: Cron or one-off background jobs.\n";
-        let trailing = "\n\n# NevoFlux Tools\n\nSome tool prose.\n\n# NevoFlux Agents\n\nAgent prose.\n";
+        let trailing =
+            "\n\n# NevoFlux Tools\n\nSome tool prose.\n\n# NevoFlux Agents\n\nAgent prose.\n";
         let sys = format!("{base}{skills}{trailing}");
 
         let mut req = LlmChatRequest {
@@ -5243,21 +5247,39 @@ mod acp_skill_router_tests {
 
         let inline = req.system.clone().expect("system retained");
         // Skills catalog (incl. the loop skill + the skill_load directive) is inline.
-        assert!(inline.contains("# Skills"), "skills heading must stay inline");
+        assert!(
+            inline.contains("# Skills"),
+            "skills heading must stay inline"
+        );
         assert!(inline.contains("**loop**"), "loop skill must stay inline");
-        assert!(inline.contains("skill_load"), "skill_load directive must stay inline");
+        assert!(
+            inline.contains("skill_load"),
+            "skill_load directive must stay inline"
+        );
         // A pointer to the externalized remainder is present.
-        assert!(inline.contains(ANTIGRAVITY_SYSTEM_FILE), "pointer to file present");
+        assert!(
+            inline.contains(ANTIGRAVITY_SYSTEM_FILE),
+            "pointer to file present"
+        );
         // Base framing and trailing prose were externalized OUT of the inline text.
-        assert!(!inline.contains("BASE FRAMING"), "base framing must be externalized");
-        assert!(!inline.contains("NevoFlux Agents"), "trailing prose must be externalized");
+        assert!(
+            !inline.contains("BASE FRAMING"),
+            "base framing must be externalized"
+        );
+        assert!(
+            !inline.contains("NevoFlux Agents"),
+            "trailing prose must be externalized"
+        );
 
         // The file holds the externalized remainder (base + trailing), not the skills.
         let file = workspace.path().join(ANTIGRAVITY_SYSTEM_FILE);
         let body = std::fs::read_to_string(&file).expect("read externalized file");
         assert!(body.contains("BASE FRAMING"), "file has base framing");
         assert!(body.contains("NevoFlux Agents"), "file has trailing prose");
-        assert!(!body.contains("**loop**"), "skills must NOT be duplicated in the file");
+        assert!(
+            !body.contains("**loop**"),
+            "skills must NOT be duplicated in the file"
+        );
     }
 
     #[test]

@@ -119,19 +119,17 @@ pub async fn handle_sse(
     // BroadcastStream errors when the receiver lags. We swallow lag
     // errors and emit comments so the connection stays open; a render
     // tab that misses a cancel signal will see the next one.
-    let stream = BroadcastStream::new(rx).map(
-        |item| -> Result<Event, Infallible> {
-            match item {
-                Ok(RenderControlEvent::Cancel) => Ok(Event::default()
-                    .json_data(serde_json::json!({"type": "cancel"}))
-                    .unwrap_or_else(|_| Event::default().comment("serialize-failed"))),
-                Ok(RenderControlEvent::SeekTo(frame)) => Ok(Event::default()
-                    .json_data(serde_json::json!({"type": "seek_to", "frame": frame}))
-                    .unwrap_or_else(|_| Event::default().comment("serialize-failed"))),
-                Err(_lagged) => Ok(Event::default().comment("lagged")),
-            }
-        },
-    );
+    let stream = BroadcastStream::new(rx).map(|item| -> Result<Event, Infallible> {
+        match item {
+            Ok(RenderControlEvent::Cancel) => Ok(Event::default()
+                .json_data(serde_json::json!({"type": "cancel"}))
+                .unwrap_or_else(|_| Event::default().comment("serialize-failed"))),
+            Ok(RenderControlEvent::SeekTo(frame)) => Ok(Event::default()
+                .json_data(serde_json::json!({"type": "seek_to", "frame": frame}))
+                .unwrap_or_else(|_| Event::default().comment("serialize-failed"))),
+            Err(_lagged) => Ok(Event::default().comment("lagged")),
+        }
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

@@ -87,8 +87,7 @@ entry = "index.html"
         let pdir = pdir.clone();
         let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
-            let host =
-                PackHostImpl::new(paths, db, skills, None, None, handle, "test".into());
+            let host = PackHostImpl::new(paths, db, skills, None, None, handle, "test".into());
             install(&host, &manifest, &manifest_src, &pdir, &opts)
         })
         .await
@@ -118,8 +117,7 @@ entry = "index.html"
         let skills = skills.clone();
         let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
-            let host =
-                PackHostImpl::new(paths, db, skills, None, None, handle, "test".into());
+            let host = PackHostImpl::new(paths, db, skills, None, None, handle, "test".into());
             uninstall(&host, "demo", &UninstallOpts::default())
         })
         .await

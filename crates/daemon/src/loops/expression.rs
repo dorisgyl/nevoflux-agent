@@ -47,8 +47,12 @@ impl TriggerExpr {
     }
 
     fn parse_with_depth(s: &str, depth: u8) -> Result<Self, ParseError> {
-        if depth > 3 { return Err(ParseError::TooDeep); }
-        if s.is_empty() { return Err(ParseError::Empty); }
+        if depth > 3 {
+            return Err(ParseError::TooDeep);
+        }
+        if s.is_empty() {
+            return Err(ParseError::Empty);
+        }
 
         // Catch unbalanced "AND(..." / "OR(..." early so the test for unbalanced parens passes.
         if (s.starts_with("AND(") || s.starts_with("OR(")) && !s.ends_with(')') {
@@ -61,9 +65,15 @@ impl TriggerExpr {
         if let Some(body) = s.strip_prefix("OR(").and_then(|t| t.strip_suffix(')')) {
             return parse_combinator(body, depth + 1).map(TriggerExpr::Or);
         }
-        if let Some(rest) = s.strip_prefix("time:") { return parse_time_atom(rest); }
-        if let Some(rest) = s.strip_prefix("event:") { return parse_event_atom(rest); }
-        if let Some(rest) = s.strip_prefix("state:") { return parse_state_atom(rest); }
+        if let Some(rest) = s.strip_prefix("time:") {
+            return parse_time_atom(rest);
+        }
+        if let Some(rest) = s.strip_prefix("event:") {
+            return parse_event_atom(rest);
+        }
+        if let Some(rest) = s.strip_prefix("state:") {
+            return parse_state_atom(rest);
+        }
         Err(ParseError::UnknownAtom(s.to_string()))
     }
 }
@@ -73,7 +83,10 @@ fn parse_combinator(body: &str, depth: u8) -> Result<Vec<TriggerExpr>, ParseErro
     if parts.len() < 2 {
         return Err(ParseError::CombinatorTooFew(parts.len()));
     }
-    parts.into_iter().map(|p| TriggerExpr::parse_with_depth(p.trim(), depth)).collect()
+    parts
+        .into_iter()
+        .map(|p| TriggerExpr::parse_with_depth(p.trim(), depth))
+        .collect()
 }
 
 fn split_top_level_commas(s: &str) -> Result<Vec<&str>, ParseError> {
@@ -83,20 +96,36 @@ fn split_top_level_commas(s: &str) -> Result<Vec<&str>, ParseError> {
     for (i, ch) in s.char_indices() {
         match ch {
             '(' => depth += 1,
-            ')' => { depth -= 1; if depth < 0 { return Err(ParseError::Unexpected(i, "unbalanced ')'".into())); } }
-            ',' if depth == 0 => { out.push(&s[start..i]); start = i + 1; }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(ParseError::Unexpected(i, "unbalanced ')'".into()));
+                }
+            }
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
             _ => {}
         }
     }
-    if depth != 0 { return Err(ParseError::Unexpected(s.len(), "unbalanced '('".into())); }
+    if depth != 0 {
+        return Err(ParseError::Unexpected(s.len(), "unbalanced '('".into()));
+    }
     out.push(&s[start..]);
     Ok(out)
 }
 
 fn parse_time_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
-    if rest == "dynamic" { return Ok(TriggerExpr::TimeDynamic); }
+    if rest == "dynamic" {
+        return Ok(TriggerExpr::TimeDynamic);
+    }
     parse_duration(rest).map(|d| {
-        let rounded = if d < Duration::from_secs(60) { Duration::from_secs(60) } else { d };
+        let rounded = if d < Duration::from_secs(60) {
+            Duration::from_secs(60)
+        } else {
+            d
+        };
         TriggerExpr::Time(rounded)
     })
 }
@@ -104,7 +133,8 @@ fn parse_time_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
 fn parse_duration(s: &str) -> Result<Duration, ParseError> {
     let mut iter = s.char_indices();
     // Last char_indices entry gives the byte offset of the final char.
-    let (last_idx, unit_ch) = iter.next_back()
+    let (last_idx, unit_ch) = iter
+        .next_back()
         .ok_or_else(|| ParseError::BadDuration(s.into()))?;
     if last_idx == 0 {
         // Single-char input like "5" — no number prefix.
@@ -112,7 +142,9 @@ fn parse_duration(s: &str) -> Result<Duration, ParseError> {
     }
     let num = &s[..last_idx];
     let n: u64 = num.parse().map_err(|_| ParseError::BadDuration(s.into()))?;
-    if n == 0 { return Err(ParseError::BadDuration(s.into())); }
+    if n == 0 {
+        return Err(ParseError::BadDuration(s.into()));
+    }
     let secs = match unit_ch {
         's' => n,
         'm' => n * 60,
@@ -131,18 +163,31 @@ fn parse_event_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
 }
 
 fn parse_state_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
-    let after_tab = rest.strip_prefix("tab=")
+    let after_tab = rest
+        .strip_prefix("tab=")
         .ok_or_else(|| ParseError::MalformedState("expected 'tab='".into()))?;
-    let (tab_str, rest) = after_tab.split_once(':')
+    let (tab_str, rest) = after_tab
+        .split_once(':')
         .ok_or_else(|| ParseError::MalformedState("expected ':' after tab=…".into()))?;
-    let tab = if tab_str == "current" { TabRef::Current }
-              else { TabRef::Id(tab_str.parse().map_err(|_| ParseError::MalformedState(format!("bad tab id: {tab_str}")))?) };
-    let selector = rest.strip_suffix(":change")
+    let tab = if tab_str == "current" {
+        TabRef::Current
+    } else {
+        TabRef::Id(
+            tab_str
+                .parse()
+                .map_err(|_| ParseError::MalformedState(format!("bad tab id: {tab_str}")))?,
+        )
+    };
+    let selector = rest
+        .strip_suffix(":change")
         .ok_or_else(|| ParseError::MalformedState("state atom must end with ':change'".into()))?;
     if selector.is_empty() {
         return Err(ParseError::MalformedState("empty selector".into()));
     }
-    Ok(TriggerExpr::State { tab, selector: selector.to_string() })
+    Ok(TriggerExpr::State {
+        tab,
+        selector: selector.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -155,18 +200,30 @@ mod tests {
 
     #[test]
     fn time_seconds_round_up_to_minute() {
-        assert_eq!(parse("time:30s").unwrap(), TriggerExpr::Time(Duration::from_secs(60)));
+        assert_eq!(
+            parse("time:30s").unwrap(),
+            TriggerExpr::Time(Duration::from_secs(60))
+        );
     }
 
     #[test]
     fn time_minutes_exact() {
-        assert_eq!(parse("time:5m").unwrap(), TriggerExpr::Time(Duration::from_secs(300)));
+        assert_eq!(
+            parse("time:5m").unwrap(),
+            TriggerExpr::Time(Duration::from_secs(300))
+        );
     }
 
     #[test]
     fn time_hours_and_days() {
-        assert_eq!(parse("time:2h").unwrap(), TriggerExpr::Time(Duration::from_secs(7200)));
-        assert_eq!(parse("time:1d").unwrap(), TriggerExpr::Time(Duration::from_secs(86400)));
+        assert_eq!(
+            parse("time:2h").unwrap(),
+            TriggerExpr::Time(Duration::from_secs(7200))
+        );
+        assert_eq!(
+            parse("time:1d").unwrap(),
+            TriggerExpr::Time(Duration::from_secs(86400))
+        );
     }
 
     #[test]
@@ -201,7 +258,10 @@ mod tests {
     fn state_current_tab() {
         assert_eq!(
             parse("state:tab=current:.chat-list:change").unwrap(),
-            TriggerExpr::State { tab: TabRef::Current, selector: ".chat-list".into() }
+            TriggerExpr::State {
+                tab: TabRef::Current,
+                selector: ".chat-list".into()
+            }
         );
     }
 
@@ -209,7 +269,10 @@ mod tests {
     fn state_numeric_tab() {
         assert_eq!(
             parse("state:tab=42:#root .item:change").unwrap(),
-            TriggerExpr::State { tab: TabRef::Id(42), selector: "#root .item".into() }
+            TriggerExpr::State {
+                tab: TabRef::Id(42),
+                selector: "#root .item".into()
+            }
         );
     }
 

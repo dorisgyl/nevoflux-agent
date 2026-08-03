@@ -88,11 +88,7 @@ pub fn maybe_resize(payload_b64: &str, stage_w: u32, stage_h: u32) -> (String, R
 /// original bytes). This shape lets paths that already have raw bytes
 /// from disk (e.g., `promote_image_local_files_to_attachments`) avoid
 /// a base64 round-trip on multi-megabyte images.
-pub fn maybe_resize_bytes(
-    bytes: &[u8],
-    stage_w: u32,
-    stage_h: u32,
-) -> (Vec<u8>, ResizeOutcome) {
+pub fn maybe_resize_bytes(bytes: &[u8], stage_w: u32, stage_h: u32) -> (Vec<u8>, ResizeOutcome) {
     let original_bytes = bytes.len();
 
     // Sniff format from magic bytes.
@@ -120,7 +116,10 @@ pub fn maybe_resize_bytes(
     if !oversize_dims && !oversize_bytes {
         return (
             Vec::new(),
-            ResizeOutcome::AlreadySmall { dims: (w, h), bytes: original_bytes },
+            ResizeOutcome::AlreadySmall {
+                dims: (w, h),
+                bytes: original_bytes,
+            },
         );
     }
 
@@ -153,14 +152,19 @@ pub fn maybe_resize_bytes(
     if let Err(e) = encode_result {
         return (
             Vec::new(),
-            ResizeOutcome::EncodeFailed { reason: e.to_string() },
+            ResizeOutcome::EncodeFailed {
+                reason: e.to_string(),
+            },
         );
     }
     let new_bytes = out.len();
     if new_bytes >= original_bytes {
         return (
             Vec::new(),
-            ResizeOutcome::AlreadySmall { dims: (w, h), bytes: original_bytes },
+            ResizeOutcome::AlreadySmall {
+                dims: (w, h),
+                bytes: original_bytes,
+            },
         );
     }
     (
@@ -195,9 +199,8 @@ mod tests {
     use image::{ImageBuffer, Rgb};
 
     fn solid_rgb_jpeg(w: u32, h: u32) -> String {
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(w, h, |x, y| {
-            Rgb([(x % 256) as u8, (y % 256) as u8, 128])
-        });
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(w, h, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
         let mut buf = Vec::new();
         DynamicImage::ImageRgb8(img)
             .write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)
@@ -221,8 +224,12 @@ mod tests {
     /// photographic content. Uses wrapping arithmetic throughout to
     /// avoid u32 overflow at large dimensions.
     fn noisy_rgb_at(x: u32, y: u32) -> Rgb<u8> {
-        let r = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503)) as u8;
-        let g = y.wrapping_mul(2246822519).wrapping_add(x.wrapping_mul(16807)) as u8;
+        let r = x
+            .wrapping_mul(2654435761)
+            .wrapping_add(y.wrapping_mul(40503)) as u8;
+        let g = y
+            .wrapping_mul(2246822519)
+            .wrapping_add(x.wrapping_mul(16807)) as u8;
         let b = (x ^ y).wrapping_mul(1597334677) as u8;
         Rgb([r, g, b])
     }
@@ -265,11 +272,28 @@ mod tests {
         let (out, outcome) = maybe_resize(&b64, 1080, 1920);
         assert_ne!(out, b64);
         match outcome {
-            ResizeOutcome::Resized { from, to, original_bytes, new_bytes, format } => {
+            ResizeOutcome::Resized {
+                from,
+                to,
+                original_bytes,
+                new_bytes,
+                format,
+            } => {
                 assert_eq!(from, (4000, 6000));
-                assert!(to.0 <= 1920 && to.1 <= 1920, "to {:?} should fit in stage_max box", to);
-                assert!(to.0 == 1920 || to.1 == 1920, "one side should equal stage_max: {:?}", to);
-                assert!(new_bytes < original_bytes, "should shrink, got {new_bytes} >= {original_bytes}");
+                assert!(
+                    to.0 <= 1920 && to.1 <= 1920,
+                    "to {:?} should fit in stage_max box",
+                    to
+                );
+                assert!(
+                    to.0 == 1920 || to.1 == 1920,
+                    "one side should equal stage_max: {:?}",
+                    to
+                );
+                assert!(
+                    new_bytes < original_bytes,
+                    "should shrink, got {new_bytes} >= {original_bytes}"
+                );
                 assert_eq!(format, ImageFormat::Jpeg, "opaque should stay JPEG");
             }
             other => panic!("expected Resized, got {other:?}"),
@@ -301,10 +325,14 @@ mod tests {
         let original_bytes = STANDARD.decode(&b64).unwrap().len();
         let (_out, outcome) = maybe_resize(&b64, 1080, 1920);
         match outcome {
-            ResizeOutcome::Resized { format, new_bytes, .. } => {
+            ResizeOutcome::Resized {
+                format, new_bytes, ..
+            } => {
                 assert_eq!(format, ImageFormat::Jpeg, "opaque PNG → JPEG");
-                assert!(new_bytes < original_bytes / 5,
-                    "JPEG should be much smaller ({new_bytes} vs {original_bytes})");
+                assert!(
+                    new_bytes < original_bytes / 5,
+                    "JPEG should be much smaller ({new_bytes} vs {original_bytes})"
+                );
             }
             other => panic!("expected Resized, got {other:?}"),
         }
@@ -326,12 +354,24 @@ mod tests {
         // Stage 1920×1920: dims 1500×1500 fit. Byte trigger fires alone.
         let (_out, outcome) = maybe_resize(&b64, 1920, 1920);
         match outcome {
-            ResizeOutcome::Resized { from, to, new_bytes, format, .. } => {
+            ResizeOutcome::Resized {
+                from,
+                to,
+                new_bytes,
+                format,
+                ..
+            } => {
                 assert_eq!(from, (1500, 1500));
-                assert_eq!(to, (1500, 1500), "dims preserved when only byte trigger fires");
+                assert_eq!(
+                    to,
+                    (1500, 1500),
+                    "dims preserved when only byte trigger fires"
+                );
                 assert_eq!(format, ImageFormat::Jpeg, "opaque oversize PNG → JPEG");
-                assert!(new_bytes < raw_size / 2,
-                    "PNG→JPEG should shrink ≥2×, got {new_bytes} vs {raw_size}");
+                assert!(
+                    new_bytes < raw_size / 2,
+                    "PNG→JPEG should shrink ≥2×, got {new_bytes} vs {raw_size}"
+                );
             }
             other => panic!("expected Resized (byte trigger), got {other:?}"),
         }
@@ -382,8 +422,10 @@ mod tests {
             ResizeOutcome::Resized { to, .. } => {
                 let aspect_in = 8000.0_f32 / 2000.0;
                 let aspect_out = to.0 as f32 / to.1 as f32;
-                assert!((aspect_in - aspect_out).abs() < 0.01,
-                    "aspect ratio drift: {aspect_in} vs {aspect_out} (to={to:?})");
+                assert!(
+                    (aspect_in - aspect_out).abs() < 0.01,
+                    "aspect ratio drift: {aspect_in} vs {aspect_out} (to={to:?})"
+                );
                 assert_eq!(to.0, 1920);
             }
             other => panic!("expected Resized, got {other:?}"),
@@ -400,13 +442,21 @@ mod tests {
         let original_bytes = STANDARD.decode(&b64).unwrap().len();
         let (_out, outcome) = maybe_resize(&b64, 1920, 1080);
         match outcome {
-            ResizeOutcome::Resized { from, to, new_bytes, format, .. } => {
+            ResizeOutcome::Resized {
+                from,
+                to,
+                new_bytes,
+                format,
+                ..
+            } => {
                 assert_eq!(from, (2816, 1536));
                 assert!(to.0 <= 1920 && to.1 <= 1920, "should fit stage_max: {to:?}");
                 assert_eq!(format, ImageFormat::Jpeg, "opaque photo PNG → JPEG");
                 // Use division to avoid u32/u64 multiplication concerns.
-                assert!(new_bytes < original_bytes / 5,
-                    "should be ≥5× smaller, got {new_bytes} vs {original_bytes}");
+                assert!(
+                    new_bytes < original_bytes / 5,
+                    "should be ≥5× smaller, got {new_bytes} vs {original_bytes}"
+                );
             }
             other => panic!("expected Resized for realistic case, got {other:?}"),
         }

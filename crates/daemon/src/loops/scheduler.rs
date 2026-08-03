@@ -29,7 +29,9 @@ pub struct TriggerScheduler {
 }
 
 impl TriggerScheduler {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Schedule a recurring time-based fire. Returns a subscription id.
     /// Pass the id to `unsubscribe` to stop the schedule.
@@ -162,10 +164,20 @@ impl TriggerScheduler {
 
     /// Unsubscribe a previously-issued subscription. Idempotent — no-op if id is unknown.
     pub fn unsubscribe(&self, sub_id: &str) {
-        if let Some(c) = self.cancels.write().expect("scheduler poisoned").remove(sub_id) {
+        if let Some(c) = self
+            .cancels
+            .write()
+            .expect("scheduler poisoned")
+            .remove(sub_id)
+        {
             c.cancel();
         }
-        if let Some(h) = self.handles.write().expect("scheduler poisoned").remove(sub_id) {
+        if let Some(h) = self
+            .handles
+            .write()
+            .expect("scheduler poisoned")
+            .remove(sub_id)
+        {
             h.abort();
         }
     }
@@ -184,11 +196,7 @@ mod tests {
     async fn fires_every_interval() {
         let sched = TriggerScheduler::new();
         let (tx, mut rx) = mpsc::channel(8);
-        let _sub = sched.schedule_time(
-            LoopId("abc".into()),
-            Duration::from_secs(60),
-            tx,
-        );
+        let _sub = sched.schedule_time(LoopId("abc".into()), Duration::from_secs(60), tx);
 
         // No fire before the interval has elapsed.
         assert!(rx.try_recv().is_err());
@@ -213,11 +221,7 @@ mod tests {
     async fn unsubscribe_stops_fires() {
         let sched = TriggerScheduler::new();
         let (tx, mut rx) = mpsc::channel(8);
-        let sub = sched.schedule_time(
-            LoopId("a".into()),
-            Duration::from_secs(60),
-            tx,
-        );
+        let sub = sched.schedule_time(LoopId("a".into()), Duration::from_secs(60), tx);
         assert_eq!(sched.active_count(), 1);
 
         sched.unsubscribe(&sub);
@@ -225,7 +229,9 @@ mod tests {
 
         // Give the spawned task a chance to notice the cancel.
         tokio::time::advance(Duration::from_secs(120)).await;
-        for _ in 0..10 { tokio::task::yield_now().await; }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
 
         assert!(rx.try_recv().is_err(), "no fires after unsubscribe");
     }
@@ -272,23 +278,22 @@ mod tests {
         let sched = TriggerScheduler::new();
         let (tx, mut rx) = mpsc::channel(8);
 
-        let sub = sched.schedule_event(
-            LoopId("a".into()),
-            "ui:test:click".into(),
-            bus.clone(),
-            tx,
-        ).expect("schedule_event");
+        let sub = sched
+            .schedule_event(LoopId("a".into()), "ui:test:click".into(), bus.clone(), tx)
+            .expect("schedule_event");
 
         bus.publish(BusEvent::ephemeral(
             "ui:test:click",
             serde_json::json!({}),
             PublisherIdentity::Internal,
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            rx.recv(),
-        ).await.expect("event fire").expect("fire request");
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event fire")
+            .expect("fire request");
         assert_eq!(r.loop_id.as_ref(), "a");
         assert_eq!(r.fire_reason, "event:ui:test:click");
 
@@ -311,24 +316,23 @@ mod tests {
         let sched = TriggerScheduler::new();
         let (tx, mut rx) = mpsc::channel(8);
 
-        let sub = sched.schedule_event(
-            LoopId("a".into()),
-            "ui:test:click".into(),
-            bus.clone(),
-            tx,
-        ).expect("schedule_event");
+        let sub = sched
+            .schedule_event(LoopId("a".into()), "ui:test:click".into(), bus.clone(), tx)
+            .expect("schedule_event");
 
         let payload = serde_json::json!({"kind": "click", "count": 3});
         bus.publish(BusEvent::ephemeral(
             "ui:test:click",
             payload.clone(),
             PublisherIdentity::Internal,
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            rx.recv(),
-        ).await.expect("event fire").expect("fire request");
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event fire")
+            .expect("fire request");
         assert_eq!(r.event_payload, Some(payload));
 
         sched.unsubscribe(&sub);
@@ -344,23 +348,22 @@ mod tests {
         let sched = TriggerScheduler::new();
         let (tx, mut rx) = mpsc::channel(8);
 
-        sched.schedule_event(
-            LoopId("a".into()),
-            "ui:tab:*:click".into(),
-            bus.clone(),
-            tx,
-        ).expect("schedule_event with wildcard");
+        sched
+            .schedule_event(LoopId("a".into()), "ui:tab:*:click".into(), bus.clone(), tx)
+            .expect("schedule_event with wildcard");
 
         bus.publish(BusEvent::ephemeral(
             "ui:tab:42:click",
             serde_json::json!({}),
             PublisherIdentity::Internal,
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            rx.recv(),
-        ).await.expect("event fire").expect("fire request");
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event fire")
+            .expect("fire request");
         assert_eq!(r.loop_id.as_ref(), "a");
         assert!(r.fire_reason.starts_with("event:ui:tab"));
     }

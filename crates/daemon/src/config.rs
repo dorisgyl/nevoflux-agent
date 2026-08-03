@@ -636,11 +636,9 @@ impl LlmConfig {
             "gemini-cli" | "gemini_cli" => {
                 self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
             }
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => self
-                .antigravity
-                .api_key
-                .as_deref()
-                .or(Some("antigravity")),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.api_key.as_deref().or(Some("antigravity"))
+            }
             "gemini" => self.gemini.api_key.as_deref(),
             "groq" => self.groq.api_key.as_deref(),
             "ollama" => self.ollama.api_key.as_deref().or(Some("ollama-local")),
@@ -789,9 +787,7 @@ impl LlmConfig {
             "openrouter" => self.openrouter.use_streaming,
             "claude-code" | "claude_code" => self.claude_code.use_streaming,
             "gemini-cli" | "gemini_cli" => self.gemini_cli.use_streaming,
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.use_streaming
-            }
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => self.antigravity.use_streaming,
             "gemini" => self.gemini.use_streaming,
             "groq" => self.groq.use_streaming,
             "ollama" => self.ollama.use_streaming,

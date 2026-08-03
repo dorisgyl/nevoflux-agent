@@ -224,10 +224,7 @@ async fn run_reindex<P>(
         tokio::task::yield_now().await;
     }
 
-    info!(
-        total,
-        completed, failed, "memory reindex finished"
-    );
+    info!(total, completed, failed, "memory reindex finished");
     let _ = tx.send(ReindexProgress {
         total,
         completed,
@@ -276,10 +273,7 @@ mod tests {
         struct PanicEmbedder;
         #[async_trait::async_trait]
         impl EmbeddingProvider for PanicEmbedder {
-            async fn embed(
-                &self,
-                _text: &str,
-            ) -> Result<Vec<f32>, nevoflux_llm::EmbeddingError> {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, nevoflux_llm::EmbeddingError> {
                 panic!("embedder must not be called when there's nothing to do");
             }
             async fn embed_batch(
@@ -333,10 +327,7 @@ mod tests {
         struct StubEmbedder;
         #[async_trait::async_trait]
         impl EmbeddingProvider for StubEmbedder {
-            async fn embed(
-                &self,
-                _text: &str,
-            ) -> Result<Vec<f32>, nevoflux_llm::EmbeddingError> {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, nevoflux_llm::EmbeddingError> {
                 Ok(vec![0.42; 4])
             }
             async fn embed_batch(

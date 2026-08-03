@@ -432,7 +432,9 @@ impl CanvasVideoService {
         // bytes branch of asset_resize avoids the encode/decode round-trip
         // we used to pay before assets moved out of artifacts.files.
         let raw_bytes = STANDARD.decode(payload_b64.as_bytes()).map_err(|e| {
-            DaemonError::InvalidRequest(format!("canvas_attach_asset: payload not valid base64: {e}"))
+            DaemonError::InvalidRequest(format!(
+                "canvas_attach_asset: payload not valid base64: {e}"
+            ))
         })?;
 
         // Downscale oversized images BEFORE storage. Without this, a
@@ -693,9 +695,9 @@ impl CanvasVideoService {
         job_id: &str,
     ) -> tokio::sync::broadcast::Receiver<RenderControlEvent> {
         let mut guard = self.render_controls.lock().await;
-        let tx = guard.entry(job_id.to_string()).or_insert_with(|| {
-            tokio::sync::broadcast::channel::<RenderControlEvent>(32).0
-        });
+        let tx = guard
+            .entry(job_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel::<RenderControlEvent>(32).0);
         tx.subscribe()
     }
 
@@ -710,7 +712,6 @@ impl CanvasVideoService {
             let _ = tx.send(event);
         }
     }
-
 
     async fn send_signal(&self, job_id: &str, sig: FrameSignal) {
         if let Some(tx) = self.signal_senders.lock().await.get(job_id) {
@@ -1277,16 +1278,15 @@ mod p3_load_tests {
         // AssetServer a handle to the same in-memory SQLite the
         // CanvasVideoService writes to.
         let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
-        let server = crate::asset_server::AssetServer::start(
-            crate::asset_server::AssetServerConfig {
+        let server =
+            crate::asset_server::AssetServer::start(crate::asset_server::AssetServerConfig {
                 bearer_token: "phase2-bearer".into(),
                 session_id: "phase2-session".into(),
                 storage: Some(db_arc),
                 ..Default::default()
-            },
-        )
-        .await
-        .expect("AssetServer should boot for phase2 test");
+            })
+            .await
+            .expect("AssetServer should boot for phase2 test");
         svc.set_asset_server(server.clone());
 
         let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
@@ -1391,16 +1391,15 @@ mod p3_load_tests {
             .unwrap();
 
         let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
-        let server = crate::asset_server::AssetServer::start(
-            crate::asset_server::AssetServerConfig {
+        let server =
+            crate::asset_server::AssetServer::start(crate::asset_server::AssetServerConfig {
                 bearer_token: "phase2-bearer".into(),
                 session_id: "phase2-session".into(),
                 storage: Some(db_arc),
                 ..Default::default()
-            },
-        )
-        .await
-        .expect("AssetServer should boot");
+            })
+            .await
+            .expect("AssetServer should boot");
         svc.set_asset_server(server.clone());
 
         let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
@@ -1430,16 +1429,15 @@ mod p3_load_tests {
         write_fixture(&svc, id);
 
         let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
-        let server = crate::asset_server::AssetServer::start(
-            crate::asset_server::AssetServerConfig {
+        let server =
+            crate::asset_server::AssetServer::start(crate::asset_server::AssetServerConfig {
                 bearer_token: "phase2-bearer".into(),
                 session_id: "phase2-session".into(),
                 storage: Some(db_arc),
                 ..Default::default()
-            },
-        )
-        .await
-        .expect("AssetServer should boot");
+            })
+            .await
+            .expect("AssetServer should boot");
         svc.set_asset_server(server.clone());
 
         let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
@@ -1459,7 +1457,10 @@ mod p3_load_tests {
         let bytes = resp.bytes().await.unwrap();
         // First 8 bytes match the PNG signature — proves the asset GET
         // handler decoded the base64 entry into raw bytes.
-        assert_eq!(&bytes[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
     }
 }
 

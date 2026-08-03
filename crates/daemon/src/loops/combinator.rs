@@ -10,7 +10,10 @@ use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum CombinatorState {
-    And { needed: usize, fired: HashSet<usize> },
+    And {
+        needed: usize,
+        fired: HashSet<usize>,
+    },
     Or,
 }
 

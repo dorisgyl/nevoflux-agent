@@ -147,8 +147,8 @@ async fn recording_session_trace_contract() {
     // -----------------------------------------------------------------------
     // Read the file and parse every line
     // -----------------------------------------------------------------------
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
 
     let lines: Vec<&str> = content.lines().collect();
 
@@ -189,21 +189,14 @@ async fn recording_session_trace_contract() {
             json!(expected_i),
             "step {idx} (0-based): expected i={expected_i}, got: {step}"
         );
-        assert_eq!(
-            step["type"], "step",
-            "line {}: expected type=step",
-            idx + 1
-        );
+        assert_eq!(step["type"], "step", "line {}: expected type=step", idx + 1);
     }
 
     // -----------------------------------------------------------------------
     // Step i=1 (normal fill) — value preserved, ephemeral eN selector stripped
     // -----------------------------------------------------------------------
     let fill_normal = &parsed[1];
-    assert_eq!(
-        fill_normal["action"], "fill",
-        "step 1 must be action=fill"
-    );
+    assert_eq!(fill_normal["action"], "fill", "step 1 must be action=fill");
     assert_eq!(
         fill_normal["value"], "user@example.com",
         "step 1: normal fill value must be preserved"
@@ -226,10 +219,7 @@ async fn recording_session_trace_contract() {
     // Step i=2 (secret fill) — value must be null on disk
     // -----------------------------------------------------------------------
     let fill_secret = &parsed[2];
-    assert_eq!(
-        fill_secret["action"], "fill",
-        "step 2 must be action=fill"
-    );
+    assert_eq!(fill_secret["action"], "fill", "step 2 must be action=fill");
     assert!(
         fill_secret["value"].is_null(),
         "step 2 (redacted): value must be null on disk; got: {}",

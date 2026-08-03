@@ -185,7 +185,10 @@ pub fn override_from_metadata(
     match serde_json::from_value::<SoulOverride>(raw.clone()) {
         Ok(pin) => Some(pin),
         Err(e) => {
-            tracing::warn!("Ignoring unreadable soul_override in session metadata: {}", e);
+            tracing::warn!(
+                "Ignoring unreadable soul_override in session metadata: {}",
+                e
+            );
             None
         }
     }
@@ -330,7 +333,11 @@ mod tests {
             &registry,
         );
 
-        assert_eq!(r.slug.as_deref(), Some("research"), "the new container's own soul");
+        assert_eq!(
+            r.slug.as_deref(),
+            Some("research"),
+            "the new container's own soul"
+        );
         assert_eq!(r.action, OverrideAction::Clear);
     }
 
@@ -416,7 +423,13 @@ mod tests {
         let registry = registry_with(&[("research", "alex")], tmp.path());
         let bindings = bindings_of(&[("firefox-container-1", "research")]);
 
-        let r = resolve(Mention::None, None, "firefox-container-1", &bindings, &registry);
+        let r = resolve(
+            Mention::None,
+            None,
+            "firefox-container-1",
+            &bindings,
+            &registry,
+        );
 
         assert_eq!(r.slug.as_deref(), Some("research"));
         assert_eq!(r.action, OverrideAction::Keep);
@@ -442,7 +455,13 @@ mod tests {
         let registry = registry_with(&[("research", "alex")], tmp.path());
         let bindings = bindings_of(&[("firefox-container-1", "deleted-soul")]);
 
-        let r = resolve(Mention::None, None, "firefox-container-1", &bindings, &registry);
+        let r = resolve(
+            Mention::None,
+            None,
+            "firefox-container-1",
+            &bindings,
+            &registry,
+        );
 
         assert_eq!(r.slug, None);
         assert_eq!(r.action, OverrideAction::Keep);
@@ -463,7 +482,11 @@ mod tests {
             &registry,
         );
 
-        assert_eq!(r.slug.as_deref(), Some("research"), "falls through to the binding");
+        assert_eq!(
+            r.slug.as_deref(),
+            Some("research"),
+            "falls through to the binding"
+        );
         assert_eq!(r.action, OverrideAction::Keep);
     }
 
@@ -475,7 +498,13 @@ mod tests {
         let registry = registry_with(&[("research", "alex")], tmp.path());
         let bindings = bindings_of(&[]);
 
-        let r = resolve(Mention::Soul("alex"), None, "firefox-default", &bindings, &registry);
+        let r = resolve(
+            Mention::Soul("alex"),
+            None,
+            "firefox-default",
+            &bindings,
+            &registry,
+        );
 
         assert_eq!(r.slug.as_deref(), Some("research"), "resolved to the slug");
     }

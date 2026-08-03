@@ -69,8 +69,8 @@ mod tests {
         // The portal strips the uuid before looking for the code, so that no
         // part of a uuid can be mistaken for one.
         let rest = block.replace(found.as_str(), " ");
-        let code = regex::Regex::new(r"(?i)\b[0-9A-Z]-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}\b")
-            .unwrap();
+        let code =
+            regex::Regex::new(r"(?i)\b[0-9A-Z]-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}\b").unwrap();
         assert_eq!(
             code.find(&rest)
                 .expect("no pairing code in the block")
@@ -92,9 +92,8 @@ mod tests {
     fn a_trailing_slash_on_the_portal_base_does_not_double_up() {
         let block = render(&id(), "https://portal.nevoflux.app/", "chat", "read-only");
         assert!(!block.contains("app//connect"));
-        assert!(block.contains(
-            "https://portal.nevoflux.app/connect/2f1c4a90-7b3e-4d1a-9c58-0e6a2b7d4f31"
-        ));
+        assert!(block
+            .contains("https://portal.nevoflux.app/connect/2f1c4a90-7b3e-4d1a-9c58-0e6a2b7d4f31"));
     }
 
     #[test]
@@ -112,8 +111,8 @@ mod tests {
         let found = uuid_re.find(&block).expect("no uuid").as_str().to_string();
         assert_eq!(found, real.channel_id);
         let rest = block.replace(&found, " ");
-        let code = regex::Regex::new(r"(?i)\b[0-9A-Z]-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}\b")
-            .unwrap();
+        let code =
+            regex::Regex::new(r"(?i)\b[0-9A-Z]-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}\b").unwrap();
         assert_eq!(
             code.find(&rest).expect("no pairing code").as_str(),
             real.pairing_code

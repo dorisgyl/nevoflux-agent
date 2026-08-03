@@ -190,10 +190,16 @@ impl RoleSource {
 
     /// Assemble a role from its compiled-in `(filename, content)` pairs.
     fn from_embedded(files: &[(String, String)]) -> Result<Self, String> {
-        let find = |name: &str| files.iter().find(|(f, _)| f == name).map(|(_, c)| c.clone());
+        let find = |name: &str| {
+            files
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, c)| c.clone())
+        };
 
         Ok(Self {
-            identity_raw: find(IDENTITY_FILE).ok_or_else(|| format!("Missing {}", IDENTITY_FILE))?,
+            identity_raw: find(IDENTITY_FILE)
+                .ok_or_else(|| format!("Missing {}", IDENTITY_FILE))?,
             soul: find(SOUL_FILE).ok_or_else(|| format!("Missing {}", SOUL_FILE))?,
             tools: find(TOOLS_FILE),
             agents: find(AGENTS_FILE),
@@ -349,7 +355,8 @@ impl AgentRoleDefinition {
     /// save, so they round-trip through here rather than being reset to defaults.
     pub fn into_metadata(self) -> AgentRoleMetadata {
         let allowed_tools = self.allowed_tools_list();
-        let tools = matches!(self.tools_config, Some(ToolsConfig::None)).then(|| "none".to_string());
+        let tools =
+            matches!(self.tools_config, Some(ToolsConfig::None)).then(|| "none".to_string());
         AgentRoleMetadata {
             name: self.name,
             kind: self.kind,
@@ -546,7 +553,12 @@ impl AgentRoleRegistry {
             return Some(slug.clone());
         }
         // Not scanned (or scanned before the role appeared): probe by slug.
-        if self.user_dir.join(name_or_slug).join(IDENTITY_FILE).exists() {
+        if self
+            .user_dir
+            .join(name_or_slug)
+            .join(IDENTITY_FILE)
+            .exists()
+        {
             return Some(name_or_slug.to_string());
         }
         if self.builtin.iter().any(|(slug, _)| slug == name_or_slug) {
@@ -767,7 +779,11 @@ fn migrate_flat_roles(dir: &Path) {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let Some(slug) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(slug) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
 
@@ -801,13 +817,13 @@ fn migrate_one_flat_role(path: &Path, target: &Path) -> Result<(), String> {
 
     let identity = format!("{d}\n{yaml}\n{d}\n", d = FRONTMATTER_DELIMITER, yaml = yaml);
     std::fs::write(target.join(IDENTITY_FILE), identity).map_err(|e| e.to_string())?;
-    std::fs::write(target.join(SOUL_FILE), format!("{}\n", body.trim())).map_err(|e| e.to_string())?;
+    std::fs::write(target.join(SOUL_FILE), format!("{}\n", body.trim()))
+        .map_err(|e| e.to_string())?;
 
     // Rename rather than delete: the original stays recoverable.
     std::fs::rename(path, path.with_extension("md.bak")).map_err(|e| e.to_string())?;
     Ok(())
 }
-
 
 // ── Authoring ──────────────────────────────────────────────────────
 //
@@ -836,7 +852,11 @@ pub fn slug_from_name(name: &str, taken: &[String]) -> Result<String, String> {
             last_was_dash = true;
         }
     }
-    let base = slug.trim_matches('-').chars().take(MAX_NAME_LEN).collect::<String>();
+    let base = slug
+        .trim_matches('-')
+        .chars()
+        .take(MAX_NAME_LEN)
+        .collect::<String>();
     let base = base.trim_matches('-').to_string();
 
     if base.is_empty() {
@@ -855,7 +875,10 @@ pub fn slug_from_name(name: &str, taken: &[String]) -> Result<String, String> {
             return Ok(candidate);
         }
     }
-    Err(format!("Too many souls already named something like '{}'", base))
+    Err(format!(
+        "Too many souls already named something like '{}'",
+        base
+    ))
 }
 
 /// Whether `slug` is a name this daemon will create a directory for.
@@ -949,7 +972,8 @@ impl AgentRoleRegistry {
         }
 
         let dir = self.user_role_dir(slug);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
 
         let identity = format!(
             "{d}\n{yaml}{d}\n\n{body}\n",
@@ -982,7 +1006,8 @@ impl AgentRoleRegistry {
         if !dir.exists() {
             return Ok(());
         }
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("Could not delete {}: {}", dir.display(), e))
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Could not delete {}: {}", dir.display(), e))
     }
 }
 
@@ -1165,7 +1190,8 @@ Content
             ..Default::default()
         };
 
-        let def = AgentRoleDefinition::from_parts("restricted", meta, RoleBodies::default()).unwrap();
+        let def =
+            AgentRoleDefinition::from_parts("restricted", meta, RoleBodies::default()).unwrap();
         assert_eq!(
             def.tools_config,
             Some(ToolsConfig::Allow(vec![
@@ -1522,7 +1548,10 @@ Always add tests.
         assert_eq!(count, 1, "Only the non-conflicting role should survive");
         assert_eq!(registry.list()[0].slug, "unaffected");
         assert!(registry.slug_for_name("alex").is_none());
-        assert_eq!(registry.slug_for_name("nova").as_deref(), Some("unaffected"));
+        assert_eq!(
+            registry.slug_for_name("nova").as_deref(),
+            Some("unaffected")
+        );
     }
 
     /// A user role may deliberately take a built-in's name; that is an override,
@@ -1551,7 +1580,10 @@ Always add tests.
 
         // Both slugs stay listed; the shared name resolves to the user's role.
         assert_eq!(registry.list().len(), 2);
-        assert_eq!(registry.slug_for_name("helper").as_deref(), Some("my-helper"));
+        assert_eq!(
+            registry.slug_for_name("helper").as_deref(),
+            Some("my-helper")
+        );
         assert_eq!(registry.get("helper").unwrap().description, "Mine");
         // The built-in remains reachable by its own slug.
         assert_eq!(
@@ -1593,7 +1625,10 @@ Always add tests.
         assert_eq!(registry.get("mine").unwrap().description, "Mine");
         // ...and the name index still points at it, so `@researcher` in the UI
         // resolves to the user's role before any lookup happens.
-        assert_eq!(registry.slug_for_name("researcher").as_deref(), Some("mine"));
+        assert_eq!(
+            registry.slug_for_name("researcher").as_deref(),
+            Some("mine")
+        );
     }
 
     /// Subagent spawn passes a role name; bindings and whitelists pass a slug.
@@ -1760,8 +1795,11 @@ Always add tests.
         assert!(!helper.is_soul());
 
         // The summaries carry kind too, so callers can filter without a full load.
-        let by_slug: std::collections::HashMap<_, _> =
-            registry.list().into_iter().map(|s| (s.slug, s.kind)).collect();
+        let by_slug: std::collections::HashMap<_, _> = registry
+            .list()
+            .into_iter()
+            .map(|s| (s.slug, s.kind))
+            .collect();
         assert_eq!(by_slug["mine"], "soul");
         assert_eq!(by_slug["helper"], "subagent");
     }
@@ -1822,7 +1860,10 @@ Always add tests.
         // The directory is untouched and no backup was made.
         assert!(user_dir.join("foo.md").exists());
         assert!(!user_dir.join("foo.md.bak").exists());
-        assert_eq!(registry.get("foo").unwrap().description, "The directory one");
+        assert_eq!(
+            registry.get("foo").unwrap().description,
+            "The directory one"
+        );
     }
 
     /// A file that cannot be split is left exactly where it is.
@@ -1842,14 +1883,16 @@ Always add tests.
         assert!(!user_dir.join("bad.md.bak").exists());
     }
 
-
     // ── Authoring ──────────────────────────────────────────────────────
 
     #[test]
     fn slug_from_name_is_safe_to_put_on_a_filesystem() {
         assert_eq!(slug_from_name("My Soul!", &[]).unwrap(), "my-soul");
         assert_eq!(slug_from_name("alex", &[]).unwrap(), "alex");
-        assert_eq!(slug_from_name("  Research   Copilot  ", &[]).unwrap(), "research-copilot");
+        assert_eq!(
+            slug_from_name("  Research   Copilot  ", &[]).unwrap(),
+            "research-copilot"
+        );
         assert_eq!(
             slug_from_name("A---B", &[]).unwrap(),
             "a-b",
@@ -1884,7 +1927,16 @@ Always add tests.
         assert!(is_valid_slug("alex"));
         assert!(is_valid_slug("my-soul-2"));
 
-        for bad in ["", "-alex", "alex-", "Alex", "my soul", "../evil", "a/b", "a".repeat(33).as_str()] {
+        for bad in [
+            "",
+            "-alex",
+            "alex-",
+            "Alex",
+            "my soul",
+            "../evil",
+            "a/b",
+            "a".repeat(33).as_str(),
+        ] {
             assert!(!is_valid_slug(bad), "'{}' should not be a valid slug", bad);
         }
     }
@@ -1953,7 +2005,14 @@ Always add tests.
             ..Default::default()
         };
         registry
-            .write_role("research", &meta, &RoleBodies { soul: "Hi.".into(), ..Default::default() })
+            .write_role(
+                "research",
+                &meta,
+                &RoleBodies {
+                    soul: "Hi.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
 
         let raw = std::fs::read_to_string(user_dir.join("research").join(IDENTITY_FILE)).unwrap();
@@ -1969,7 +2028,10 @@ Always add tests.
         let user_dir = temp_dir.path().join("user");
         let registry = AgentRoleRegistry::with_builtin_sources(user_dir.clone(), Vec::new());
 
-        let meta = AgentRoleMetadata { name: "alex".into(), ..Default::default() };
+        let meta = AgentRoleMetadata {
+            name: "alex".into(),
+            ..Default::default()
+        };
         let with_tools = RoleBodies {
             soul: "Hi.".into(),
             tools: Some("Some guidance.".into()),
@@ -1978,7 +2040,11 @@ Always add tests.
         registry.write_role("research", &meta, &with_tools).unwrap();
         assert!(user_dir.join("research").join(TOOLS_FILE).exists());
 
-        let without = RoleBodies { soul: "Hi.".into(), tools: Some("   ".into()), ..Default::default() };
+        let without = RoleBodies {
+            soul: "Hi.".into(),
+            tools: Some("   ".into()),
+            ..Default::default()
+        };
         registry.write_role("research", &meta, &without).unwrap();
         assert!(
             !user_dir.join("research").join(TOOLS_FILE).exists(),
@@ -1991,10 +2057,15 @@ Always add tests.
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("user");
         let registry = AgentRoleRegistry::with_builtin_sources(user_dir.clone(), Vec::new());
-        let meta = AgentRoleMetadata { name: "alex".into(), ..Default::default() };
+        let meta = AgentRoleMetadata {
+            name: "alex".into(),
+            ..Default::default()
+        };
 
         for bad in ["../evil", "a/b", "UPPER", ""] {
-            assert!(registry.write_role(bad, &meta, &RoleBodies::default()).is_err());
+            assert!(registry
+                .write_role(bad, &meta, &RoleBodies::default())
+                .is_err());
         }
         assert!(
             !user_dir.exists() || std::fs::read_dir(&user_dir).unwrap().next().is_none(),
@@ -2008,8 +2079,13 @@ Always add tests.
         let registry =
             AgentRoleRegistry::with_builtin_sources(temp_dir.path().join("user"), Vec::new());
 
-        let bad = AgentRoleMetadata { name: "two words".into(), ..Default::default() };
-        assert!(registry.write_role("research", &bad, &RoleBodies::default()).is_err());
+        let bad = AgentRoleMetadata {
+            name: "two words".into(),
+            ..Default::default()
+        };
+        assert!(registry
+            .write_role("research", &bad, &RoleBodies::default())
+            .is_err());
     }
 
     /// `@name` has to mean one thing.
@@ -2028,11 +2104,25 @@ Always add tests.
         let registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
         registry.scan().unwrap();
 
-        let clash = AgentRoleMetadata { name: "alex".into(), ..Default::default() };
+        let clash = AgentRoleMetadata {
+            name: "alex".into(),
+            ..Default::default()
+        };
         let err = registry
-            .write_role("second", &clash, &RoleBodies { soul: "Hi.".into(), ..Default::default() })
+            .write_role(
+                "second",
+                &clash,
+                &RoleBodies {
+                    soul: "Hi.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap_err();
-        assert!(err.contains("alex"), "the message should name the clash: {}", err);
+        assert!(
+            err.contains("alex"),
+            "the message should name the clash: {}",
+            err
+        );
     }
 
     /// Renaming a soul is not a clash with itself.
@@ -2057,7 +2147,14 @@ Always add tests.
             ..Default::default()
         };
         assert!(registry
-            .write_role("research", &same, &RoleBodies { soul: "New prompt.".into(), ..Default::default() })
+            .write_role(
+                "research",
+                &same,
+                &RoleBodies {
+                    soul: "New prompt.".into(),
+                    ..Default::default()
+                }
+            )
             .is_ok());
     }
 
@@ -2081,7 +2178,14 @@ Always add tests.
             ..Default::default()
         };
         registry
-            .write_role("researcher", &meta, &RoleBodies { soul: "My prompt.".into(), ..Default::default() })
+            .write_role(
+                "researcher",
+                &meta,
+                &RoleBodies {
+                    soul: "My prompt.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         registry.scan().unwrap();
 
@@ -2104,9 +2208,20 @@ Always add tests.
         )];
         let registry = AgentRoleRegistry::with_builtin_sources(user_dir, builtin);
 
-        let meta = AgentRoleMetadata { name: "researcher".into(), description: "Mine".into(), ..Default::default() };
+        let meta = AgentRoleMetadata {
+            name: "researcher".into(),
+            description: "Mine".into(),
+            ..Default::default()
+        };
         registry
-            .write_role("researcher", &meta, &RoleBodies { soul: "Mine.".into(), ..Default::default() })
+            .write_role(
+                "researcher",
+                &meta,
+                &RoleBodies {
+                    soul: "Mine.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         registry.scan().unwrap();
         assert_eq!(registry.get("researcher").unwrap().description, "Mine");
@@ -2126,15 +2241,28 @@ Always add tests.
         let user_dir = temp_dir.path().join("user");
         let registry = AgentRoleRegistry::with_builtin_sources(user_dir.clone(), Vec::new());
 
-        let meta = AgentRoleMetadata { name: "alex".into(), ..Default::default() };
+        let meta = AgentRoleMetadata {
+            name: "alex".into(),
+            ..Default::default()
+        };
         registry
-            .write_role("research", &meta, &RoleBodies { soul: "Hi.".into(), ..Default::default() })
+            .write_role(
+                "research",
+                &meta,
+                &RoleBodies {
+                    soul: "Hi.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert!(user_dir.join("research").exists());
 
         registry.delete_role("research").unwrap();
         assert!(!user_dir.join("research").exists());
-        assert!(registry.delete_role("research").is_ok(), "deleting twice is not an error");
+        assert!(
+            registry.delete_role("research").is_ok(),
+            "deleting twice is not an error"
+        );
     }
 
     #[test]
@@ -2155,9 +2283,19 @@ Always add tests.
         registry.scan().unwrap();
         assert!(registry.list().is_empty());
 
-        let meta = AgentRoleMetadata { name: "alex".into(), ..Default::default() };
+        let meta = AgentRoleMetadata {
+            name: "alex".into(),
+            ..Default::default()
+        };
         registry
-            .write_role("research", &meta, &RoleBodies { soul: "Hi.".into(), ..Default::default() })
+            .write_role(
+                "research",
+                &meta,
+                &RoleBodies {
+                    soul: "Hi.".into(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         registry.scan().unwrap();
 
@@ -2205,7 +2343,11 @@ Always add tests.
                 .unwrap_or_else(|e| panic!("Built-in role '{}' failed to parse: {}", slug, e));
 
             assert_eq!(meta.name, slug, "Name mismatch for {}", slug);
-            assert!(!meta.description.is_empty(), "Description empty for {}", slug);
+            assert!(
+                !meta.description.is_empty(),
+                "Description empty for {}",
+                slug
+            );
             assert_eq!(meta.mode, mode, "Mode mismatch for {}", slug);
             assert_eq!(
                 meta.max_iterations, max_iter,
@@ -2243,7 +2385,9 @@ Always add tests.
         for (slug, files) in nevoflux_builtin_wasm::BUILTIN_AGENT_ROLES {
             for required in [IDENTITY_FILE, SOUL_FILE] {
                 assert!(
-                    files.iter().any(|(f, c)| *f == required && !c.trim().is_empty()),
+                    files
+                        .iter()
+                        .any(|(f, c)| *f == required && !c.trim().is_empty()),
                     "Built-in role '{}' is missing a non-empty {}",
                     slug,
                     required
@@ -2267,7 +2411,11 @@ Always add tests.
 
         let names: Vec<String> = registry.list().into_iter().map(|s| s.name).collect();
         for expected in ["explorer", "researcher", "worker", "reader"] {
-            assert!(names.contains(&expected.to_string()), "Missing {}", expected);
+            assert!(
+                names.contains(&expected.to_string()),
+                "Missing {}",
+                expected
+            );
 
             // L2 load must work too, not just the L1 summary.
             let def = registry.get(expected).unwrap();

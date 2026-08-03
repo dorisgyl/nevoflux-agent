@@ -78,12 +78,7 @@ impl UploadInbox {
     /// If a waiter is parked, the bytes are forwarded to it and the slot
     /// is removed. Otherwise the bytes are parked until a waiter shows up
     /// (subject to TTL).
-    pub fn deliver(
-        &self,
-        request_id: &str,
-        bytes: Bytes,
-        ttl: Duration,
-    ) -> Result<(), InboxError> {
+    pub fn deliver(&self, request_id: &str, bytes: Bytes, ttl: Duration) -> Result<(), InboxError> {
         match self.inner.remove(request_id) {
             Some((_, Pending::Waiter(tx, _))) => {
                 tx.send(bytes).map_err(|_| InboxError::ChannelClosed {
@@ -207,8 +202,11 @@ mod tests {
         let inbox = Arc::new(UploadInbox::new());
         let inbox_clone = inbox.clone();
 
-        let waiter =
-            tokio::spawn(async move { inbox_clone.await_request("R2", Duration::from_secs(2)).await });
+        let waiter = tokio::spawn(async move {
+            inbox_clone
+                .await_request("R2", Duration::from_secs(2))
+                .await
+        });
 
         // Yield so the waiter parks first.
         tokio::time::sleep(Duration::from_millis(50)).await;

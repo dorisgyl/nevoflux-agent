@@ -289,15 +289,12 @@ pub async fn init_brain(
             match state {
                 SupervisorState::Running { .. } => return Ok::<(), InitError>(()),
                 SupervisorState::Failed { reason } => {
-                    return Err(format!(
-                        "gbrain supervisor entered Failed during init: {reason}"
-                    )
-                    .into());
+                    return Err(
+                        format!("gbrain supervisor entered Failed during init: {reason}").into(),
+                    );
                 }
                 SupervisorState::Shutdown => {
-                    return Err(
-                        "gbrain supervisor entered Shutdown during init".into()
-                    );
+                    return Err("gbrain supervisor entered Shutdown during init".into());
                 }
                 // Starting / Restarting — keep waiting.
                 SupervisorState::Starting | SupervisorState::Restarting { .. } => {}
@@ -315,9 +312,10 @@ pub async fn init_brain(
 
     // Send the MCP initialize handshake. The supervisor exposes a
     // convenience wrapper that also fires `notifications/initialized`.
-    let _init_resp = supervisor.initialize().await.map_err(|e| -> InitError {
-        format!("MCP initialize failed: {e}").into()
-    })?;
+    let _init_resp = supervisor
+        .initialize()
+        .await
+        .map_err(|e| -> InitError { format!("MCP initialize failed: {e}").into() })?;
     tracing::info!("gbrain MCP initialize OK");
 
     // Build the engine. The supervisor implements `McpToolCaller`

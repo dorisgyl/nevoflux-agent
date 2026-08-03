@@ -142,7 +142,11 @@ mod tests {
     #[test]
     fn an_incomplete_file_is_corrupt_too() {
         let p = tmp("partial");
-        std::fs::write(&p, br#"{"channel_id":"x","pairing_code":"","session_id":"s"}"#).unwrap();
+        std::fs::write(
+            &p,
+            br#"{"channel_id":"x","pairing_code":"","session_id":"s"}"#,
+        )
+        .unwrap();
         assert!(matches!(
             load_or_generate(&p).unwrap_err(),
             IdentityError::Corrupt(_)

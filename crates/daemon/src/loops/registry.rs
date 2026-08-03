@@ -14,10 +14,15 @@ pub struct LoopRegistry {
 }
 
 impl LoopRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn insert(&self, runtime: LoopRuntime) {
-        self.inner.write().expect("registry poisoned").insert(runtime.id.clone(), runtime);
+        self.inner
+            .write()
+            .expect("registry poisoned")
+            .insert(runtime.id.clone(), runtime);
     }
 
     pub fn remove(&self, id: &LoopId) -> Option<LoopRuntime> {
@@ -25,18 +30,28 @@ impl LoopRegistry {
     }
 
     pub fn contains(&self, id: &LoopId) -> bool {
-        self.inner.read().expect("registry poisoned").contains_key(id)
+        self.inner
+            .read()
+            .expect("registry poisoned")
+            .contains_key(id)
     }
 
     pub fn ids(&self) -> Vec<LoopId> {
-        self.inner.read().expect("registry poisoned").keys().cloned().collect()
+        self.inner
+            .read()
+            .expect("registry poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn len(&self) -> usize {
         self.inner.read().expect("registry poisoned").len()
     }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Apply a mutation while holding the write lock briefly.
     /// Returns `None` if the loop is not in the registry.
@@ -44,7 +59,11 @@ impl LoopRegistry {
     where
         F: FnOnce(&mut LoopRuntime) -> R,
     {
-        self.inner.write().expect("registry poisoned").get_mut(id).map(f)
+        self.inner
+            .write()
+            .expect("registry poisoned")
+            .get_mut(id)
+            .map(f)
     }
 }
 

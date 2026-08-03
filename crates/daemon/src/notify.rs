@@ -82,8 +82,7 @@ mod tests {
             )
             .expect("subscribe should succeed");
 
-        publish_user_notification(&bus, Some("Reminder"), "drink water", "notify_user", None)
-            .await;
+        publish_user_notification(&bus, Some("Reminder"), "drink water", "notify_user", None).await;
 
         let ev = handle.rx.try_recv().expect("expected a buffered event");
         assert_eq!(ev.topic, "ui:notification:agent");

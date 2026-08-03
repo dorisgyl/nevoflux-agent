@@ -56,7 +56,10 @@ async fn mcp_handler(
 ) -> impl IntoResponse {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    let params = req
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let body = match method {
         "initialize" => rpc_ok(
@@ -121,7 +124,10 @@ async fn acp_handler(
 ) -> impl IntoResponse {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    let params = req
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let body = match method {
         "initialize" => rpc_ok(

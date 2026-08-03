@@ -289,8 +289,7 @@ impl CanvasShareService {
         let entry_name = "main.html".to_string();
         let mut files_map = std::collections::HashMap::new();
         files_map.insert(entry_name.clone(), content_str.clone());
-        let files_json = serde_json::to_string(&files_map)
-            .unwrap_or_else(|_| "{}".to_string());
+        let files_json = serde_json::to_string(&files_map).unwrap_or_else(|_| "{}".to_string());
 
         self.storage.database().with_connection(|conn| {
             let session_id_db =
@@ -595,13 +594,11 @@ mod tests {
         let assets = asset_repo.list_all("share-fixture").unwrap();
         assert!(!assets.is_empty(), "fixture must have a composition asset");
 
-        let mut files: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for a in &assets {
             files.insert(format!("assets/{}", a.name), STANDARD.encode(&a.bytes));
         }
-        let inlined =
-            crate::canvas_video::asset_inline::inline_assets(&row.content, &files);
+        let inlined = crate::canvas_video::asset_inline::inline_assets(&row.content, &files);
         assert!(
             inlined.contains("data:image/png;base64,"),
             "shared content must inline assets as data: URIs.\n got: {inlined}"

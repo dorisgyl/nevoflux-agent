@@ -88,8 +88,7 @@ impl SoulWatcher {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
                             for path in &event.paths {
-                                if let Some(change) =
-                                    SoulDirChange::classify(path, &soul_dir_clone)
+                                if let Some(change) = SoulDirChange::classify(path, &soul_dir_clone)
                                 {
                                     let _ = tx.blocking_send(change);
                                 }

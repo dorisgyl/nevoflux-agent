@@ -226,7 +226,10 @@ async fn antigravity_incremental_fastpath_hits_after_appended_message() {
                 bound_id, session_id,
                 "must reuse turn 1's session id — no new_session() for turn 2"
             );
-            assert_eq!(prefix_len, 2, "prefix_len must equal turn 1's message count");
+            assert_eq!(
+                prefix_len, 2,
+                "prefix_len must equal turn 1's message count"
+            );
             assert!(
                 !system_changed,
                 "identical system prompt must not trigger a context_update"

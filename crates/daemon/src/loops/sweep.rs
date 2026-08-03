@@ -39,9 +39,7 @@ pub fn run_startup_sweep(db: &Database) -> Result<(), nevoflux_storage::error::S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nevoflux_storage::models::{
-        CreateSessionParams, IterationStatus, LoopRecord, LoopState,
-    };
+    use nevoflux_storage::models::{CreateSessionParams, IterationStatus, LoopRecord, LoopState};
     use nevoflux_storage::Storage;
 
     #[test]
@@ -73,7 +71,8 @@ mod tests {
             verify_check: None,
         })
         .unwrap();
-        repo.insert_iteration("x", 1, 0, IterationStatus::Running).unwrap();
+        repo.insert_iteration("x", 1, 0, IterationStatus::Running)
+            .unwrap();
 
         run_startup_sweep(storage.database()).unwrap();
 
@@ -88,12 +87,7 @@ mod tests {
                 conn.query_row(
                     "SELECT status, error_message FROM loop_iterations WHERE loop_id = ?1",
                     rusqlite::params!["x"],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                        ))
-                    },
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .map_err(nevoflux_storage::error::StorageError::from)
             })

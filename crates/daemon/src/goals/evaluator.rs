@@ -670,8 +670,9 @@ mod tests {
     #[test]
     fn for_goal_explicit_acp_provider_is_acp() {
         // A streaming-only ACP provider (claude-code) is is_acp for degraded judging.
-        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
-            .expect("resolves");
+        let choice =
+            resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
+                .expect("resolves");
         assert!(choice.is_acp);
         assert_eq!(choice.provider, "claude-code");
     }
@@ -681,8 +682,9 @@ mod tests {
         // A streaming-only ACP provider (claude-code) has no registered connection
         // in unit tests, so the ACP route errors with "not connected" — proving
         // evaluate_with_choice routed it to evaluate_via_acp, not direct `evaluate`.
-        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
-            .expect("resolves");
+        let choice =
+            resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
+                .expect("resolves");
         let err = evaluate_with_choice(&choice, "some condition", &[])
             .await
             .unwrap_err();

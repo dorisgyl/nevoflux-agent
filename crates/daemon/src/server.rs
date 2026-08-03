@@ -5708,44 +5708,38 @@ async fn handle_chat_message_streaming(
             }
         }
 
-        let payload = match crate::session::clear::clear_session_contents(
-            session_manager,
-            &session_id,
-        )
-        .await
-        {
-            Ok(out) => {
-                // `session_id` is what `PortalGateway::project` filters on. Without
-                // it the M2 tap fans this out and the session filter drops it, and
-                // the phone never hears that its transcript is gone.
-                serde_json::json!({
-                    "type": "session_cleared",
-                    "payload": {
-                        "session_id": session_id,
-                        "messages": out.messages,
-                        "artifacts": out.artifacts,
-                    }
-                })
-            }
-            Err(e) => {
-                // No `session_cleared` on failure. Three surfaces consistently
-                // holding the old contents is recoverable; a cleared screen over
-                // a full database is not visible to anyone until something the
-                // user thought was deleted turns up in a later answer.
-                error!(
-                    "clear failed for session {}: {}",
-                    session_id, e
-                );
-                serde_json::json!({
-                    "type": "error",
-                    "payload": {
-                        "code": "CLEAR_FAILED",
-                        "message": e.to_string(),
-                        "recoverable": true
-                    }
-                })
-            }
-        };
+        let payload =
+            match crate::session::clear::clear_session_contents(session_manager, &session_id).await
+            {
+                Ok(out) => {
+                    // `session_id` is what `PortalGateway::project` filters on. Without
+                    // it the M2 tap fans this out and the session filter drops it, and
+                    // the phone never hears that its transcript is gone.
+                    serde_json::json!({
+                        "type": "session_cleared",
+                        "payload": {
+                            "session_id": session_id,
+                            "messages": out.messages,
+                            "artifacts": out.artifacts,
+                        }
+                    })
+                }
+                Err(e) => {
+                    // No `session_cleared` on failure. Three surfaces consistently
+                    // holding the old contents is recoverable; a cleared screen over
+                    // a full database is not visible to anyone until something the
+                    // user thought was deleted turns up in a later answer.
+                    error!("clear failed for session {}: {}", session_id, e);
+                    serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CLEAR_FAILED",
+                            "message": e.to_string(),
+                            "recoverable": true
+                        }
+                    })
+                }
+            };
         let response =
             DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
         if let Err(e) = response_tx.send((identity, response)).await {

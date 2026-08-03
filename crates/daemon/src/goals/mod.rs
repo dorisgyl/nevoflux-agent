@@ -27,9 +27,7 @@ pub mod events;
 pub mod manager;
 pub mod tools;
 
-pub use evaluator::{
-    evaluate, evaluate_with_choice, resolve_evaluator, EvaluatorChoice, Verdict,
-};
+pub use evaluator::{evaluate, evaluate_with_choice, resolve_evaluator, EvaluatorChoice, Verdict};
 pub use events::GoalEvents;
 pub use manager::GoalManager;
 pub use tools::execute_goal_tool;

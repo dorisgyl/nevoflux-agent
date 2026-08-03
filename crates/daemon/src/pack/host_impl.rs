@@ -219,8 +219,7 @@ impl PackHost for PackHostImpl {
     }
     fn upsert_artifact(&self, spec: &ArtifactSpec) -> PackResult<()> {
         use nevoflux_storage::{ArtifactRepository, CreateArtifactParams};
-        let files: std::collections::HashMap<String, String> =
-            spec.files.iter().cloned().collect();
+        let files: std::collections::HashMap<String, String> = spec.files.iter().cloned().collect();
         let params = CreateArtifactParams::new_orphan(
             &spec.artifact_id,
             &spec.artifact_id,

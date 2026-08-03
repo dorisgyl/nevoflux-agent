@@ -328,9 +328,8 @@ impl SessionBrowserBindings {
 /// Process-global session→browser bindings, set once at startup by whoever
 /// creates them. Mirrors [`CURRENT_BROWSER_REGISTRY`]. Unset on the desktop,
 /// where the chat path then skips the lookup entirely.
-pub static CURRENT_SESSION_BINDINGS: std::sync::OnceLock<
-    std::sync::Arc<SessionBrowserBindings>,
-> = std::sync::OnceLock::new();
+pub static CURRENT_SESSION_BINDINGS: std::sync::OnceLock<std::sync::Arc<SessionBrowserBindings>> =
+    std::sync::OnceLock::new();
 
 /// Role a connecting proxy declares in its registration frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

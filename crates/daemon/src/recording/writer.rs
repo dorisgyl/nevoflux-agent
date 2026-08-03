@@ -70,9 +70,12 @@ mod tests {
     fn writes_header_then_indexed_steps() {
         let dir = tmp();
         let mut w = RecordingWriter::open(&dir, "rec_x").unwrap();
-        w.write_line(json!({"type":"header","recording_id":"rec_x"})).unwrap();
-        w.write_line(json!({"type":"step","action":"click"})).unwrap();
-        w.write_line(json!({"type":"step","action":"fill","value":"a"})).unwrap();
+        w.write_line(json!({"type":"header","recording_id":"rec_x"}))
+            .unwrap();
+        w.write_line(json!({"type":"step","action":"click"}))
+            .unwrap();
+        w.write_line(json!({"type":"step","action":"fill","value":"a"}))
+            .unwrap();
 
         let content = std::fs::read_to_string(dir.join("rec_x.jsonl")).unwrap();
         let lines: Vec<_> = content.lines().collect();
@@ -115,7 +118,8 @@ mod tests {
 
         // next_i must not have advanced — non-objects are not counted as steps.
         // Write a real step afterwards and confirm it gets i=1 (not 5).
-        w.write_line(json!({"type":"step","action":"click"})).unwrap();
+        w.write_line(json!({"type":"step","action":"click"}))
+            .unwrap();
         let content2 = std::fs::read_to_string(dir.join("rec_nonobj.jsonl")).unwrap();
         let lines2: Vec<_> = content2.lines().collect();
         let step: Value = serde_json::from_str(lines2[4]).unwrap();
@@ -126,7 +130,8 @@ mod tests {
     fn redacted_step_persists_null_value() {
         let dir = tmp();
         let mut w = RecordingWriter::open(&dir, "rec_y").unwrap();
-        w.write_line(json!({"type":"step","value":"hunter2","redacted":true})).unwrap();
+        w.write_line(json!({"type":"step","value":"hunter2","redacted":true}))
+            .unwrap();
         let content = std::fs::read_to_string(dir.join("rec_y.jsonl")).unwrap();
         let s: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert!(s["value"].is_null());
