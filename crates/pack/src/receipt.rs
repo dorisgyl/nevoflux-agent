@@ -73,7 +73,10 @@ mod tests {
             installed_at: "2026-06-09T00:00:00Z".into(),
             nevoflux_version: Version::new(0, 3, 0),
             paths_source: PathsSource::Daemon,
-            files: vec![FileReceipt { path: "/cfg/skills/a.md".into(), sha256: "ab".into() }],
+            files: vec![FileReceipt {
+                path: "/cfg/skills/a.md".into(),
+                sha256: "ab".into(),
+            }],
             artifacts: vec!["demo-dashboard".into()],
             seeded_pages: vec!["demo/cv".into()],
             imported_sources: vec!["demo".into()],

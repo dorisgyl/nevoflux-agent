@@ -64,6 +64,9 @@ mod tests {
         let cfg = build_config(PathBuf::from("."));
         let present = cfg.env.iter().any(|(k, _)| k == "MCP_TOOL_TIMEOUT")
             || std::env::var_os("MCP_TOOL_TIMEOUT").is_some();
-        assert!(present, "claude ACP config must ensure MCP_TOOL_TIMEOUT is set");
+        assert!(
+            present,
+            "claude ACP config must ensure MCP_TOOL_TIMEOUT is set"
+        );
     }
 }

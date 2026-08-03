@@ -4,11 +4,11 @@
 
 pub mod capability;
 pub mod error;
-pub mod paths;
-pub mod manifest;
-pub mod receipt;
 pub mod host;
 pub mod lifecycle;
+pub mod manifest;
+pub mod paths;
+pub mod receipt;
 
 pub use host::PackHost;
 pub use manifest::Manifest;

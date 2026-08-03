@@ -18,8 +18,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn read_fixture(name: &str) -> String {
-    std::fs::read_to_string(fixture(name))
-        .unwrap_or_else(|e| panic!("missing fixture {name}: {e}"))
+    std::fs::read_to_string(fixture(name)).unwrap_or_else(|e| panic!("missing fixture {name}: {e}"))
 }
 
 fn parse_anthropic_response(name: &str) -> AnthropicResponse {
@@ -59,11 +58,7 @@ fn conversation_a_turn3_synthesizes_final_answer() {
     let openai = anthropic_to_openai_response(resp);
     assert_eq!(openai.choices[0].finish_reason, "stop");
     assert!(openai.choices[0].message.tool_calls.is_none());
-    let content = openai.choices[0]
-        .message
-        .content
-        .as_deref()
-        .unwrap_or("");
+    let content = openai.choices[0].message.content.as_deref().unwrap_or("");
     assert!(
         content.contains("35"),
         "final answer should reference 35; got: {content}"
@@ -97,10 +92,7 @@ fn conversation_a_request_roundtrip_preserves_history() {
             tool_use.get("id").and_then(|v| v.as_str()),
             Some("call_c4f5d6696cae4b8d8e55ff80")
         );
-        assert_eq!(
-            tool_use.get("name").and_then(|v| v.as_str()),
-            Some("add")
-        );
+        assert_eq!(tool_use.get("name").and_then(|v| v.as_str()), Some("add"));
         // Arguments string "{\"a\":3,\"b\":4}" must have been parsed into a JSON object.
         let input = tool_use
             .get("input")
@@ -150,7 +142,11 @@ fn conversation_b_parallel_tool_use() {
     let openai = anthropic_to_openai_response(resp);
     assert_eq!(openai.choices[0].finish_reason, "tool_calls");
     let tcs = openai.choices[0].message.tool_calls.as_ref().unwrap();
-    assert_eq!(tcs.len(), 2, "expected 2 parallel tool calls (Tokyo + Paris)");
+    assert_eq!(
+        tcs.len(),
+        2,
+        "expected 2 parallel tool calls (Tokyo + Paris)"
+    );
     assert!(tcs.iter().all(|tc| tc.function.name == "get_weather"));
     // Both tool calls should have valid JSON arguments
     let cities: Vec<String> = tcs
@@ -205,7 +201,10 @@ fn conversation_c_streaming_turn1_translates_tool_use() {
     for (event_type, data) in &events {
         all_chunks.extend(translator.translate_event(event_type, data));
     }
-    assert!(translator.is_done(), "translator should have seen message_stop");
+    assert!(
+        translator.is_done(),
+        "translator should have seen message_stop"
+    );
 
     // Should have at least one tool_calls delta with name "add".
     let tc_chunks: Vec<_> = all_chunks

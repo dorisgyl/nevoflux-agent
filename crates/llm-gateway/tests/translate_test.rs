@@ -126,7 +126,10 @@ fn test_streaming_no_tool_translation() {
     for (event_type, data) in &events {
         all_chunks.extend(translator.translate_event(event_type, data));
     }
-    assert!(translator.is_done(), "translator should have seen message_stop");
+    assert!(
+        translator.is_done(),
+        "translator should have seen message_stop"
+    );
 
     // role chunk
     assert!(
@@ -142,7 +145,10 @@ fn test_streaming_no_tool_translation() {
         .filter_map(|c| c.choices[0].delta.content.clone())
         .collect();
     for d in ["1", "2", "3", "4", "5"] {
-        assert!(text.contains(d), "expected '{d}' in concatenated text, got {text:?}");
+        assert!(
+            text.contains(d),
+            "expected '{d}' in concatenated text, got {text:?}"
+        );
     }
 
     // final chunk has finish_reason=stop
@@ -151,7 +157,10 @@ fn test_streaming_no_tool_translation() {
         .rev()
         .find(|c| c.choices[0].finish_reason.is_some())
         .expect("expected a finish chunk");
-    assert_eq!(last_finish.choices[0].finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        last_finish.choices[0].finish_reason.as_deref(),
+        Some("stop")
+    );
 }
 
 #[test]
@@ -180,10 +189,7 @@ fn test_streaming_tool_use_translation() {
     assert!(!tc_chunks.is_empty(), "expected tool_calls chunks");
     let first_tc = &tc_chunks[0].choices[0].delta.tool_calls.as_ref().unwrap()[0];
     assert_eq!(
-        first_tc
-            .function
-            .as_ref()
-            .and_then(|f| f.name.as_deref()),
+        first_tc.function.as_ref().and_then(|f| f.name.as_deref()),
         Some("get_weather")
     );
 
@@ -200,8 +206,9 @@ fn test_streaming_tool_use_translation() {
     }
     assert!(!by_idx.is_empty(), "expected at least one tool call index");
     for (idx, args) in &by_idx {
-        let parsed: Value = serde_json::from_str(args)
-            .unwrap_or_else(|e| panic!("tool_call[{idx}] arguments not valid JSON: {e} -- {args:?}"));
+        let parsed: Value = serde_json::from_str(args).unwrap_or_else(|e| {
+            panic!("tool_call[{idx}] arguments not valid JSON: {e} -- {args:?}")
+        });
         assert!(
             parsed.get("city").and_then(|v| v.as_str()).is_some(),
             "tool_call[{idx}] missing city: {parsed}"

@@ -219,7 +219,6 @@ impl McpToolBridge {
             .insert(tool_name.to_string());
     }
 
-
     /// Request permission for a tool call. Returns the user's decision.
     /// Low-risk (read-only) tools are auto-approved.
     /// If the tool is already always-allowed, returns AllowAlways immediately.
@@ -232,10 +231,7 @@ impl McpToolBridge {
         // Tier-based auto-approve: same classifier the native gate uses, so the
         // ACP path honors the "Agent execution" setting instead of a fixed
         // read-only-only list.
-        if nevoflux_protocol::tier_auto_approves(
-            tool_name,
-            *self.execution_tier.read().unwrap(),
-        ) {
+        if nevoflux_protocol::tier_auto_approves(tool_name, *self.execution_tier.read().unwrap()) {
             return PermissionResponse::AllowOnce;
         }
 

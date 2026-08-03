@@ -45,12 +45,11 @@ async fn embeddings_handler_returns_512_dim_zero_padded() {
         EmbedKind, EmbeddingConfig, EmbeddingProvider, FastEmbedProvider,
     };
 
-    let provider = tokio::task::spawn_blocking(|| {
-        FastEmbedProvider::new(EmbeddingConfig::default())
-    })
-    .await
-    .expect("spawn_blocking join")
-    .expect("FastEmbedProvider::new");
+    let provider =
+        tokio::task::spawn_blocking(|| FastEmbedProvider::new(EmbeddingConfig::default()))
+            .await
+            .expect("spawn_blocking join")
+            .expect("FastEmbedProvider::new");
 
     let vectors = provider
         .embed_batch_kind(EmbedKind::Passage, &["test".to_string()])

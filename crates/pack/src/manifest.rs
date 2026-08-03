@@ -111,7 +111,10 @@ impl Manifest {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         {
-            return Err(format!("invalid pack.name '{}': must match [a-z0-9-]+", self.pack.name));
+            return Err(format!(
+                "invalid pack.name '{}': must match [a-z0-9-]+",
+                self.pack.name
+            ));
         }
         // protocol supported
         if !SUPPORTED_PROTOCOLS.contains(&self.pack.protocol.as_str()) {
@@ -172,7 +175,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_protocol() {
         let src = MINIMAL.replace("pack-protocol/0.1", "pack-protocol/9.9");
-        assert!(Manifest::parse(&src).unwrap_err().contains("unsupported protocol"));
+        assert!(Manifest::parse(&src)
+            .unwrap_err()
+            .contains("unsupported protocol"));
     }
 
     #[test]

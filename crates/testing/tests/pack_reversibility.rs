@@ -44,7 +44,11 @@ fn fixture(with_seed: bool, with_dashboard: bool) -> (String, tempfile::TempDir)
     }
     if with_dashboard {
         fs::create_dir_all(root.join("components/canvas-app/dist")).unwrap();
-        fs::write(root.join("components/canvas-app/dist/index.html"), "<html></html>").unwrap();
+        fs::write(
+            root.join("components/canvas-app/dist/index.html"),
+            "<html></html>",
+        )
+        .unwrap();
         man.push_str(
             "[components.dashboard]\nartifact_id=\"demo-dashboard\"\ncontent_type=\"project\"\nfiles_from=\"components/canvas-app/dist\"\nentry=\"index.html\"\n",
         );

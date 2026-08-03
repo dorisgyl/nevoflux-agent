@@ -189,8 +189,8 @@ async fn test_antigravity_acp_basic_prompt() {
 /// real antigravity-acp adapter. Run with `-- --nocapture` to eyeball the turn.
 #[tokio::test]
 async fn test_antigravity_acp_model_via_set_config_option() {
-    use std::sync::{Arc, Mutex};
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
     if !antigravity_acp_available() {
         eprintln!("SKIP: antigravity-acp not installed");
@@ -291,10 +291,7 @@ async fn test_antigravity_acp_near_budget_prompt_no_enametoolong() {
     );
     let session_id = provider.new_session().await.expect("new_session");
     let mut rx = provider
-        .prompt(
-            session_id,
-            vec![ContentBlock::Text(TextContent::new(big))],
-        )
+        .prompt(session_id, vec![ContentBlock::Text(TextContent::new(big))])
         .await
         .expect("prompt");
 
@@ -309,7 +306,10 @@ async fn test_antigravity_acp_near_budget_prompt_no_enametoolong() {
             _ => {}
         }
     }
-    assert!(got_complete, "near-budget prompt must spawn agy and complete");
+    assert!(
+        got_complete,
+        "near-budget prompt must spawn agy and complete"
+    );
     provider.shutdown().await;
 }
 

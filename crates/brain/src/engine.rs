@@ -48,11 +48,8 @@ pub trait BrainEngine: Send + Sync {
     async fn sync(&self) -> BrainResult<SyncReport>;
 
     /// Export a snapshot for sharing (used by M5 sharing flow).
-    async fn export_snapshot(
-        &self,
-        sel: Selection,
-        rules: StripRules,
-    ) -> BrainResult<NbrainBundle>;
+    async fn export_snapshot(&self, sel: Selection, rules: StripRules)
+        -> BrainResult<NbrainBundle>;
 
     /// Import a snapshot produced by [`Self::export_snapshot`].
     async fn import_snapshot(

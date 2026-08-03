@@ -47,7 +47,9 @@ pub fn validate(
     // manifest is untrusted; reject traversal on every platform.
     let mut check_source = |raw: &str| {
         if normalize_rel(raw).is_err() {
-            v.push(Violation::PathTraversal { raw: raw.to_string() });
+            v.push(Violation::PathTraversal {
+                raw: raw.to_string(),
+            });
         }
     };
     if let Some(s) = &manifest.components.skills {
@@ -73,26 +75,40 @@ pub fn validate(
     // convention is `<pack-name>-dashboard`; require the `<pack-name>` prefix.
     if let Some(d) = &manifest.components.dashboard {
         if !d.artifact_id.starts_with(&manifest.pack.name) {
-            v.push(Violation::ArtifactIdNotNamespaced { id: d.artifact_id.clone() });
+            v.push(Violation::ArtifactIdNotNamespaced {
+                id: d.artifact_id.clone(),
+            });
         }
     }
 
     // (4) seed/knowledge/protected slugs must be inside the namespace.
     for s in &manifest.components.seed {
         if !in_namespace(&s.slug, &ns) {
-            v.push(Violation::SlugOutsideNamespace { slug: s.slug.clone(), ns: ns.clone() });
+            v.push(Violation::SlugOutsideNamespace {
+                slug: s.slug.clone(),
+                ns: ns.clone(),
+            });
         }
     }
     if let Some(k) = &manifest.components.knowledge {
-        let source = k.source_name.clone().unwrap_or_else(|| manifest.pack.name.clone());
+        let source = k
+            .source_name
+            .clone()
+            .unwrap_or_else(|| manifest.pack.name.clone());
         if !in_namespace(&source, &ns) {
-            v.push(Violation::SlugOutsideNamespace { slug: source, ns: ns.clone() });
+            v.push(Violation::SlugOutsideNamespace {
+                slug: source,
+                ns: ns.clone(),
+            });
         }
     }
     if let Some(p) = &manifest.components.protected {
         for slug in p.slugs.iter().chain(p.prefixes.iter()) {
             if !in_namespace(slug, &ns) {
-                v.push(Violation::SlugOutsideNamespace { slug: slug.clone(), ns: ns.clone() });
+                v.push(Violation::SlugOutsideNamespace {
+                    slug: slug.clone(),
+                    ns: ns.clone(),
+                });
             }
         }
     }
@@ -103,11 +119,17 @@ pub fn validate(
         let covered = protected.slugs.iter().any(|x| x == &s.slug)
             || protected.prefixes.iter().any(|pre| s.slug.starts_with(pre));
         if !covered {
-            v.push(Violation::SeedNotProtected { slug: s.slug.clone() });
+            v.push(Violation::SeedNotProtected {
+                slug: s.slug.clone(),
+            });
         }
     }
 
-    if v.is_empty() { Ok(()) } else { Err(v) }
+    if v.is_empty() {
+        Ok(())
+    } else {
+        Err(v)
+    }
 }
 
 /// True if `slug` equals the namespace or sits under `<ns>/`.
@@ -191,11 +213,11 @@ mod tests {
 
     #[test]
     fn seed_not_protected_is_rejected() {
-        let (m, raw) = manifest(
-            "[[components.seed]]\nslug=\"demo/cv\"\nfrom=\"seed/cv.md\"\n",
-        );
+        let (m, raw) = manifest("[[components.seed]]\nslug=\"demo/cv\"\nfrom=\"seed/cv.md\"\n");
         let errs = validate(&m, &paths(), &raw).unwrap_err();
-        assert!(errs.contains(&Violation::SeedNotProtected { slug: "demo/cv".into() }));
+        assert!(errs.contains(&Violation::SeedNotProtected {
+            slug: "demo/cv".into()
+        }));
     }
 
     #[test]
@@ -214,7 +236,9 @@ mod tests {
     fn path_traversal_is_rejected() {
         let (m, raw) = manifest("[components.skills]\ndir=\"../../etc\"\n");
         let errs = validate(&m, &paths(), &raw).unwrap_err();
-        assert!(errs.contains(&Violation::PathTraversal { raw: "../../etc".into() }));
+        assert!(errs.contains(&Violation::PathTraversal {
+            raw: "../../etc".into()
+        }));
     }
 
     #[test]
@@ -252,7 +276,9 @@ mod tests {
             "[components.dashboard]\nartifact_id=\"evil-dashboard\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\n",
         );
         let errs = validate(&m, &paths(), &raw).unwrap_err();
-        assert!(errs.contains(&Violation::ArtifactIdNotNamespaced { id: "evil-dashboard".into() }));
+        assert!(errs.contains(&Violation::ArtifactIdNotNamespaced {
+            id: "evil-dashboard".into()
+        }));
 
         let (m, raw) = manifest(
             "[components.dashboard]\nartifact_id=\"demo-dashboard\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\n",

@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::capability;
 use crate::error::{PackError, PackResult};
-use crate::host::{
-    ArtifactSpec, PackHost, PackPhase, PackProgress, PackUnlock, PhaseStatus,
-};
+use crate::host::{ArtifactSpec, PackHost, PackPhase, PackProgress, PackUnlock, PhaseStatus};
 use crate::manifest::{Manifest, UnlockSpec};
 use crate::receipt::{PathsSource, Receipt, RECEIPT_VERSION};
 
@@ -32,7 +30,12 @@ struct Applied {
 }
 
 fn emit(host: &dyn PackHost, phase: PackPhase, status: PhaseStatus, pct: u8, log: &str) {
-    host.report(PackProgress { phase, status, progress_pct: pct, log: log.to_string() });
+    host.report(PackProgress {
+        phase,
+        status,
+        progress_pct: pct,
+        log: log.to_string(),
+    });
 }
 
 /// Install a pack whose source lives at `pack_dir` (the directory containing
@@ -47,7 +50,13 @@ pub fn install(
     let paths = host.resolved_paths().clone();
 
     // Phase 1: compat
-    emit(host, PackPhase::Compat, PhaseStatus::Running, 5, "checking compatibility");
+    emit(
+        host,
+        PackPhase::Compat,
+        PhaseStatus::Running,
+        5,
+        "checking compatibility",
+    );
     if manifest.pack.min_nevoflux > paths.version {
         return Err(PackError::Compat(format!(
             "pack needs nevoflux >= {}, daemon is {}",
@@ -56,11 +65,23 @@ pub fn install(
     }
 
     // Phase 2: capability
-    emit(host, PackPhase::Capability, PhaseStatus::Running, 10, "capability check");
+    emit(
+        host,
+        PackPhase::Capability,
+        PhaseStatus::Running,
+        10,
+        "capability check",
+    );
     capability::validate(manifest, &paths, raw_toml).map_err(PackError::Capability)?;
 
     // Phase 3: idempotency
-    emit(host, PackPhase::Idempotency, PhaseStatus::Running, 15, "checking existing install");
+    emit(
+        host,
+        PackPhase::Idempotency,
+        PhaseStatus::Running,
+        15,
+        "checking existing install",
+    );
     if let Some(existing) = host.read_receipt(&manifest.pack.name)? {
         if existing.version == manifest.pack.version && !opts.force {
             return Err(PackError::AlreadyInstalled {
@@ -99,14 +120,34 @@ pub fn install(
 
     if let Err(e) = result {
         rollback(host, &applied);
-        emit(host, PackPhase::Commit, PhaseStatus::RolledBack, 100, &format!("rolled back: {e}"));
-        return Err(PackError::RolledBack { reason: e.to_string() });
+        emit(
+            host,
+            PackPhase::Commit,
+            PhaseStatus::RolledBack,
+            100,
+            &format!("rolled back: {e}"),
+        );
+        return Err(PackError::RolledBack {
+            reason: e.to_string(),
+        });
     }
 
     // Phase 8: activate (non-fatal)
-    emit(host, PackPhase::Activate, PhaseStatus::Running, 90, "reloading skills");
+    emit(
+        host,
+        PackPhase::Activate,
+        PhaseStatus::Running,
+        90,
+        "reloading skills",
+    );
     if let Err(e) = host.reload_skills() {
-        emit(host, PackPhase::Activate, PhaseStatus::Failed, 90, &format!("reload warning: {e}"));
+        emit(
+            host,
+            PackPhase::Activate,
+            PhaseStatus::Failed,
+            90,
+            &format!("reload warning: {e}"),
+        );
     }
 
     // Phase 9: commit
@@ -123,7 +164,13 @@ fn place_phase(
     receipt: &mut Receipt,
     applied: &mut Applied,
 ) -> PackResult<()> {
-    emit(host, PackPhase::Place, PhaseStatus::Running, 30, "placing files");
+    emit(
+        host,
+        PackPhase::Place,
+        PhaseStatus::Running,
+        30,
+        "placing files",
+    );
     // Skills: flatten one level from pack_dir/<skills.dir> into skills_dir.
     if let Some(s) = &manifest.components.skills {
         let src_root = pack_dir.join(&s.dir);
@@ -144,7 +191,9 @@ fn place_phase(
         for f in &ct.files {
             let src = pack_dir.join(f);
             let bytes = read_nonsymlink_file(&src)?;
-            let base = Path::new(f).file_name().ok_or_else(|| PackError::Manifest(format!("bad canvas-tool path {f}")))?;
+            let base = Path::new(f)
+                .file_name()
+                .ok_or_else(|| PackError::Manifest(format!("bad canvas-tool path {f}")))?;
             let dest = paths.canvas_tools_dir.join(base);
             // Defense-in-depth: writes must stay under the canvas-tools root.
             assert_under(&dest, &paths.canvas_tools_dir)?;
@@ -222,7 +271,13 @@ fn seed_phase(
     receipt: &mut Receipt,
     applied: &mut Applied,
 ) -> PackResult<()> {
-    emit(host, PackPhase::Seed, PhaseStatus::Running, 50, "seeding pages");
+    emit(
+        host,
+        PackPhase::Seed,
+        PhaseStatus::Running,
+        50,
+        "seeding pages",
+    );
     // Emit incremental progress through the loop so the install's progress
     // stream stays live during a large seed (hundreds of gbrain round-trips).
     // Without this the only Seed frame is the 50% above; the long silent gap
@@ -262,14 +317,23 @@ fn knowledge_phase(
     applied: &mut Applied,
 ) -> PackResult<()> {
     if let Some(k) = &manifest.components.knowledge {
-        emit(host, PackPhase::Knowledge, PhaseStatus::Running, 65, "importing knowledge");
+        emit(
+            host,
+            PackPhase::Knowledge,
+            PhaseStatus::Running,
+            65,
+            "importing knowledge",
+        );
         let bytes = read_nonsymlink_file(&pack_dir.join(&k.from))
             .map_err(|e| PackError::Host(format!("knowledge {}: {e}", k.from)))?;
         let unlock = match &k.unlock {
             UnlockSpec::Key { key } => PackUnlock::KeyHex(key.clone()),
             UnlockSpec::Password { password } => PackUnlock::Password(password.clone()),
         };
-        let source = k.source_name.clone().unwrap_or_else(|| manifest.pack.name.clone());
+        let source = k
+            .source_name
+            .clone()
+            .unwrap_or_else(|| manifest.pack.name.clone());
         host.import_source(&source, &bytes, &unlock)?;
         applied.sources.push(source.clone());
         receipt.imported_sources.push(source);
@@ -285,7 +349,13 @@ fn artifact_phase(
     applied: &mut Applied,
 ) -> PackResult<()> {
     if let Some(d) = &manifest.components.dashboard {
-        emit(host, PackPhase::Artifact, PhaseStatus::Running, 80, "inserting dashboard");
+        emit(
+            host,
+            PackPhase::Artifact,
+            PhaseStatus::Running,
+            80,
+            "inserting dashboard",
+        );
         let files = read_dir_flat(&pack_dir.join(&d.files_from))?
             .into_iter()
             .map(|(rel, bytes)| (rel, String::from_utf8_lossy(&bytes).into_owned()))

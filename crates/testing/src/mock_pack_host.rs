@@ -29,7 +29,10 @@ pub struct MockPackHost {
 
 impl MockPackHost {
     pub fn new(paths: ResolvedPaths) -> Self {
-        Self { paths, state: RefCell::new(State::default()) }
+        Self {
+            paths,
+            state: RefCell::new(State::default()),
+        }
     }
 
     pub fn file_count(&self) -> usize {
@@ -49,7 +52,10 @@ impl MockPackHost {
     }
     /// Pre-seed a user page (simulates user data the pack must not touch).
     pub fn seed_user_page(&self, slug: &str, body: &str) {
-        self.state.borrow_mut().pages.insert(slug.into(), body.into());
+        self.state
+            .borrow_mut()
+            .pages
+            .insert(slug.into(), body.into());
     }
 }
 
@@ -59,8 +65,14 @@ impl PackHost for MockPackHost {
     }
 
     fn place_file(&self, dest: &Path, bytes: &[u8]) -> PackResult<FileReceipt> {
-        self.state.borrow_mut().files.insert(dest.to_path_buf(), bytes.to_vec());
-        Ok(FileReceipt { path: dest.to_path_buf(), sha256: Receipt::sha256_hex(bytes) })
+        self.state
+            .borrow_mut()
+            .files
+            .insert(dest.to_path_buf(), bytes.to_vec());
+        Ok(FileReceipt {
+            path: dest.to_path_buf(),
+            sha256: Receipt::sha256_hex(bytes),
+        })
     }
     fn remove_file(&self, path: &Path) -> PackResult<()> {
         self.state.borrow_mut().files.remove(path);
@@ -70,7 +82,10 @@ impl PackHost for MockPackHost {
         Ok(self.state.borrow().pages.contains_key(slug))
     }
     fn put_page(&self, slug: &str, body: &str) -> PackResult<()> {
-        self.state.borrow_mut().pages.insert(slug.into(), body.into());
+        self.state
+            .borrow_mut()
+            .pages
+            .insert(slug.into(), body.into());
         Ok(())
     }
     fn delete_page(&self, slug: &str) -> PackResult<()> {
@@ -84,14 +99,20 @@ impl PackHost for MockPackHost {
         _unlock: &PackUnlock,
     ) -> PackResult<ImportOutcome> {
         self.state.borrow_mut().sources.insert(source_name.into());
-        Ok(ImportOutcome { source_name: source_name.into(), pages_imported: 1 })
+        Ok(ImportOutcome {
+            source_name: source_name.into(),
+            pages_imported: 1,
+        })
     }
     fn remove_source(&self, source_name: &str) -> PackResult<()> {
         self.state.borrow_mut().sources.remove(source_name);
         Ok(())
     }
     fn upsert_artifact(&self, spec: &ArtifactSpec) -> PackResult<()> {
-        self.state.borrow_mut().artifacts.insert(spec.artifact_id.clone());
+        self.state
+            .borrow_mut()
+            .artifacts
+            .insert(spec.artifact_id.clone());
         Ok(())
     }
     fn remove_artifact(&self, id: &str) -> PackResult<()> {
@@ -99,13 +120,18 @@ impl PackHost for MockPackHost {
         Ok(())
     }
     fn reload_skills(&self) -> PackResult<ReloadReport> {
-        Ok(ReloadReport { loaded: self.state.borrow().files.len() })
+        Ok(ReloadReport {
+            loaded: self.state.borrow().files.len(),
+        })
     }
     fn read_receipt(&self, pack: &str) -> PackResult<Option<Receipt>> {
         Ok(self.state.borrow().receipts.get(pack).cloned())
     }
     fn write_receipt(&self, pack: &str, receipt: &Receipt) -> PackResult<()> {
-        self.state.borrow_mut().receipts.insert(pack.into(), receipt.clone());
+        self.state
+            .borrow_mut()
+            .receipts
+            .insert(pack.into(), receipt.clone());
         Ok(())
     }
     fn delete_receipt(&self, pack: &str) -> PackResult<()> {

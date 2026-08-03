@@ -135,10 +135,8 @@ pub enum EmbedKind {
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Generate an embedding vector for a single text.
-    #[deprecated(
-        note = "use `embed_kind` with explicit EmbedKind. \
-        See docs/plans/2026-05-24-knowledge-base-spike-plan.md 附录 B."
-    )]
+    #[deprecated(note = "use `embed_kind` with explicit EmbedKind. \
+        See docs/plans/2026-05-24-knowledge-base-spike-plan.md 附录 B.")]
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
 
     /// Generate embedding vectors for a batch of texts.
@@ -155,11 +153,7 @@ pub trait EmbeddingProvider: Send + Sync {
     /// method and **ignores** `kind`. This preserves backward compatibility
     /// for existing providers; #002 will give [`FastEmbedProvider`] a real
     /// kind-aware override.
-    async fn embed_kind(
-        &self,
-        _kind: EmbedKind,
-        text: &str,
-    ) -> Result<Vec<f32>, EmbeddingError> {
+    async fn embed_kind(&self, _kind: EmbedKind, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         #[allow(deprecated)]
         self.embed(text).await
     }
@@ -559,11 +553,7 @@ impl EmbeddingProvider for FastEmbedProvider {
         self.embed_batch_kind(EmbedKind::Passage, texts).await
     }
 
-    async fn embed_kind(
-        &self,
-        kind: EmbedKind,
-        text: &str,
-    ) -> Result<Vec<f32>, EmbeddingError> {
+    async fn embed_kind(&self, kind: EmbedKind, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let model = Arc::clone(&self.model);
         let prefix = kind_prefix(kind);
         let prefixed = format!("{prefix}{text}");

@@ -362,8 +362,7 @@ impl DaemonClient {
         // Daemon responses (e.g. a >1 MB artifact.get) travel the local socket,
         // not Firefox's 1 MB native-messaging boundary, so allow the larger
         // socket frame size here. The proxy re-chunks for stdout downstream.
-        let envelope: DaemonEnvelope =
-            read_message_capped(reader, MAX_SOCKET_MESSAGE_SIZE).await?;
+        let envelope: DaemonEnvelope = read_message_capped(reader, MAX_SOCKET_MESSAGE_SIZE).await?;
         Ok(envelope)
     }
 

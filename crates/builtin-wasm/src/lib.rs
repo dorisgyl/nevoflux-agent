@@ -65,28 +65,46 @@ pub const BUILTIN_AGENT_ROLES: &[(&str, &[(&str, &str)])] = &[
     (
         "explorer",
         &[
-            ("IDENTITY.md", include_str!("../prompts/agents/explorer/IDENTITY.md")),
-            ("SOUL.md", include_str!("../prompts/agents/explorer/SOUL.md")),
+            (
+                "IDENTITY.md",
+                include_str!("../prompts/agents/explorer/IDENTITY.md"),
+            ),
+            (
+                "SOUL.md",
+                include_str!("../prompts/agents/explorer/SOUL.md"),
+            ),
         ],
     ),
     (
         "reader",
         &[
-            ("IDENTITY.md", include_str!("../prompts/agents/reader/IDENTITY.md")),
+            (
+                "IDENTITY.md",
+                include_str!("../prompts/agents/reader/IDENTITY.md"),
+            ),
             ("SOUL.md", include_str!("../prompts/agents/reader/SOUL.md")),
         ],
     ),
     (
         "researcher",
         &[
-            ("IDENTITY.md", include_str!("../prompts/agents/researcher/IDENTITY.md")),
-            ("SOUL.md", include_str!("../prompts/agents/researcher/SOUL.md")),
+            (
+                "IDENTITY.md",
+                include_str!("../prompts/agents/researcher/IDENTITY.md"),
+            ),
+            (
+                "SOUL.md",
+                include_str!("../prompts/agents/researcher/SOUL.md"),
+            ),
         ],
     ),
     (
         "worker",
         &[
-            ("IDENTITY.md", include_str!("../prompts/agents/worker/IDENTITY.md")),
+            (
+                "IDENTITY.md",
+                include_str!("../prompts/agents/worker/IDENTITY.md"),
+            ),
             ("SOUL.md", include_str!("../prompts/agents/worker/SOUL.md")),
         ],
     ),

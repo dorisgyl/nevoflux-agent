@@ -139,9 +139,7 @@ fn openai_body_kinds_match_variants() {
             "upstream_client_error",
         ),
         (
-            GatewayError::UpstreamUnreachable {
-                detail: "x".into(),
-            },
+            GatewayError::UpstreamUnreachable { detail: "x".into() },
             "upstream_unreachable",
         ),
         (
@@ -151,9 +149,7 @@ fn openai_body_kinds_match_variants() {
             "upstream_timeout",
         ),
         (
-            GatewayError::Internal {
-                detail: "x".into(),
-            },
+            GatewayError::Internal { detail: "x".into() },
             "internal_error",
         ),
     ];

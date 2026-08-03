@@ -433,10 +433,8 @@ fn openai_assistant_to_anthropic_content(
     }
     if let Some(tcs) = tool_calls {
         for tc in tcs {
-            let input: Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Object(
-                    serde_json::Map::new(),
-                ));
+            let input: Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or(Value::Object(serde_json::Map::new()));
             blocks.push(serde_json::json!({
                 "type": "tool_use",
                 "id": tc.id,
@@ -606,23 +604,20 @@ impl StreamTranslator {
         match event_type {
             "message_start" => {
                 // Pull the upstream message id if we can.
-                if let Some(mid) = data
-                    .pointer("/message/id")
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(mid) = data.pointer("/message/id").and_then(|v| v.as_str()) {
                     self.id = format!("chatcmpl-{mid}");
                 }
-                if let Some(m) = data
-                    .pointer("/message/model")
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(m) = data.pointer("/message/model").and_then(|v| v.as_str()) {
                     self.model = m.to_string();
                 }
                 if !self.role_emitted {
-                    chunks.push(self.make_chunk(OpenAIDelta {
-                        role: Some("assistant".to_string()),
-                        ..Default::default()
-                    }, None));
+                    chunks.push(self.make_chunk(
+                        OpenAIDelta {
+                            role: Some("assistant".to_string()),
+                            ..Default::default()
+                        },
+                        None,
+                    ));
                     self.role_emitted = true;
                 }
             }
@@ -638,28 +633,42 @@ impl StreamTranslator {
                         let oai_index = self.tool_use_count;
                         self.tool_use_count += 1;
                         self.blocks.insert(idx, ActiveBlock::ToolUse { oai_index });
-                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         // Emit role chunk if we somehow missed it.
                         if !self.role_emitted {
-                            chunks.push(self.make_chunk(OpenAIDelta {
-                                role: Some("assistant".to_string()),
-                                ..Default::default()
-                            }, None));
+                            chunks.push(self.make_chunk(
+                                OpenAIDelta {
+                                    role: Some("assistant".to_string()),
+                                    ..Default::default()
+                                },
+                                None,
+                            ));
                             self.role_emitted = true;
                         }
-                        chunks.push(self.make_chunk(OpenAIDelta {
-                            tool_calls: Some(vec![OpenAIToolCallDelta {
-                                index: oai_index,
-                                id: Some(id),
-                                kind: Some("function".to_string()),
-                                function: Some(OpenAIToolCallFunctionDelta {
-                                    name: Some(name),
-                                    arguments: Some(String::new()),
-                                }),
-                            }]),
-                            ..Default::default()
-                        }, None));
+                        chunks.push(self.make_chunk(
+                            OpenAIDelta {
+                                tool_calls: Some(vec![OpenAIToolCallDelta {
+                                    index: oai_index,
+                                    id: Some(id),
+                                    kind: Some("function".to_string()),
+                                    function: Some(OpenAIToolCallFunctionDelta {
+                                        name: Some(name),
+                                        arguments: Some(String::new()),
+                                    }),
+                                }]),
+                                ..Default::default()
+                            },
+                            None,
+                        ));
                     }
                     "thinking" => {
                         self.blocks.insert(idx, ActiveBlock::Thinking);
@@ -678,29 +687,33 @@ impl StreamTranslator {
                     (Some(ActiveBlock::Text), "text_delta") => {
                         if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
-                                chunks.push(self.make_chunk(OpenAIDelta {
-                                    content: Some(text.to_string()),
-                                    ..Default::default()
-                                }, None));
+                                chunks.push(self.make_chunk(
+                                    OpenAIDelta {
+                                        content: Some(text.to_string()),
+                                        ..Default::default()
+                                    },
+                                    None,
+                                ));
                             }
                         }
                     }
                     (Some(ActiveBlock::ToolUse { oai_index }), "input_json_delta") => {
-                        if let Some(partial) =
-                            delta.get("partial_json").and_then(|v| v.as_str())
-                        {
-                            chunks.push(self.make_chunk(OpenAIDelta {
-                                tool_calls: Some(vec![OpenAIToolCallDelta {
-                                    index: oai_index,
-                                    id: None,
-                                    kind: None,
-                                    function: Some(OpenAIToolCallFunctionDelta {
-                                        name: None,
-                                        arguments: Some(partial.to_string()),
-                                    }),
-                                }]),
-                                ..Default::default()
-                            }, None));
+                        if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                            chunks.push(self.make_chunk(
+                                OpenAIDelta {
+                                    tool_calls: Some(vec![OpenAIToolCallDelta {
+                                        index: oai_index,
+                                        id: None,
+                                        kind: None,
+                                        function: Some(OpenAIToolCallFunctionDelta {
+                                            name: None,
+                                            arguments: Some(partial.to_string()),
+                                        }),
+                                    }]),
+                                    ..Default::default()
+                                },
+                                None,
+                            ));
                         }
                     }
                     // Drop thinking_delta / signature_delta / unknown deltas.
@@ -712,26 +725,20 @@ impl StreamTranslator {
                 self.blocks.remove(&idx);
             }
             "message_delta" => {
-                if let Some(sr) = data
-                    .pointer("/delta/stop_reason")
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(sr) = data.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
                     self.finish_reason = Some(map_stop_reason(Some(sr)).to_string());
                 }
             }
             "message_stop" => {
                 self.done = true;
                 // Decide a finish reason if upstream never sent one.
-                let fr = self
-                    .finish_reason
-                    .clone()
-                    .unwrap_or_else(|| {
-                        if self.tool_use_count > 0 {
-                            "tool_calls".to_string()
-                        } else {
-                            "stop".to_string()
-                        }
-                    });
+                let fr = self.finish_reason.clone().unwrap_or_else(|| {
+                    if self.tool_use_count > 0 {
+                        "tool_calls".to_string()
+                    } else {
+                        "stop".to_string()
+                    }
+                });
                 chunks.push(self.make_chunk(OpenAIDelta::default(), Some(fr)));
             }
             _ => {
@@ -741,11 +748,7 @@ impl StreamTranslator {
         chunks
     }
 
-    fn make_chunk(
-        &self,
-        delta: OpenAIDelta,
-        finish_reason: Option<String>,
-    ) -> OpenAIChatChunk {
+    fn make_chunk(&self, delta: OpenAIDelta, finish_reason: Option<String>) -> OpenAIChatChunk {
         OpenAIChatChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",

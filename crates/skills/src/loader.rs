@@ -381,8 +381,7 @@ fn unique_backup_path(dir: &Path) -> PathBuf {
 /// existing skills to `skills.bak[-N]` first, then recording the applied
 /// fingerprint. Returns the number of files installed.
 pub fn replace_user_skills_with_bundled() -> std::result::Result<usize, String> {
-    let source =
-        bundled_skills_dir().ok_or_else(|| "No bundled skills to apply".to_string())?;
+    let source = bundled_skills_dir().ok_or_else(|| "No bundled skills to apply".to_string())?;
     let target = nevoflux_user_skills_dir()
         .ok_or_else(|| "Cannot determine user skills directory".to_string())?;
 
@@ -392,8 +391,13 @@ pub fn replace_user_skills_with_bundled() -> std::result::Result<usize, String> 
             .map_err(|e| format!("Failed to back up skills to {}: {}", backup.display(), e))?;
         tracing::info!("Backed up existing skills to {}", backup.display());
     }
-    std::fs::create_dir_all(&target)
-        .map_err(|e| format!("Failed to create skills directory {}: {}", target.display(), e))?;
+    std::fs::create_dir_all(&target).map_err(|e| {
+        format!(
+            "Failed to create skills directory {}: {}",
+            target.display(),
+            e
+        )
+    })?;
 
     let mut installed = 0;
     copy_dir_recursive(&source, &target, &mut installed)?;
@@ -757,7 +761,11 @@ Content for {}.
 
         // Adding a file changes the fingerprint.
         create_skill_file(root, "extra", "x");
-        assert_ne!(fp2, fingerprint_dir(root), "new file must change fingerprint");
+        assert_ne!(
+            fp2,
+            fingerprint_dir(root),
+            "new file must change fingerprint"
+        );
     }
 
     #[test]

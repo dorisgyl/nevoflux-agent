@@ -45,7 +45,11 @@ fn write_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root: &Path = dir.path();
     fs::create_dir_all(root.join("components/skills/demo-evaluate")).unwrap();
-    fs::write(root.join("components/skills/demo-evaluate/SKILL.md"), "# eval").unwrap();
+    fs::write(
+        root.join("components/skills/demo-evaluate/SKILL.md"),
+        "# eval",
+    )
+    .unwrap();
     fs::create_dir_all(root.join("components/seed")).unwrap();
     fs::write(root.join("components/seed/cv.md"), "# cv template").unwrap();
     dir
@@ -56,7 +60,11 @@ fn install_places_files_and_seeds() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
 
     let receipt = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
@@ -72,7 +80,11 @@ fn install_seed_is_idempotent_against_existing_user_page() {
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
     host.seed_user_page("demo/cv", "USER EDITED");
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
 
     let receipt = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
@@ -85,11 +97,18 @@ fn duplicate_install_same_version_is_rejected() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
     let err = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap_err();
-    assert!(matches!(err, nevoflux_pack::PackError::AlreadyInstalled { .. }));
+    assert!(matches!(
+        err,
+        nevoflux_pack::PackError::AlreadyInstalled { .. }
+    ));
 }
 
 use nevoflux_pack::lifecycle::{uninstall, UninstallOpts};
@@ -99,15 +118,25 @@ fn uninstall_removes_pack_files_but_keeps_seed_by_default() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let iopts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
     assert_eq!(host.file_count(), 1);
 
     uninstall(&host, "demo", &UninstallOpts::default()).unwrap();
 
     assert_eq!(host.file_count(), 0, "pack files removed");
-    assert!(host.has_page("demo/cv"), "seed/user data preserved by default");
-    assert!(host.read_receipt("demo").unwrap().is_none(), "receipt deleted");
+    assert!(
+        host.has_page("demo/cv"),
+        "seed/user data preserved by default"
+    );
+    assert!(
+        host.read_receipt("demo").unwrap().is_none(),
+        "receipt deleted"
+    );
 }
 
 #[test]
@@ -115,10 +144,22 @@ fn purge_data_removes_seed_pages() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let iopts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
 
-    uninstall(&host, "demo", &UninstallOpts { purge_data: true, force: false }).unwrap();
+    uninstall(
+        &host,
+        "demo",
+        &UninstallOpts {
+            purge_data: true,
+            force: false,
+        },
+    )
+    .unwrap();
 
     assert!(!host.has_page("demo/cv"), "seed removed with --purge-data");
 }
@@ -156,10 +197,18 @@ unlock = { password = "x" }
 "#;
     let m = Manifest::parse(man).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "t".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "t".into(),
+        ..Default::default()
+    };
 
     let receipt = install(&host, &m, man, dir.path(), &opts).unwrap();
-    assert_eq!(host.source_count(), 1, "ReadOnly source registered on install");
+    assert_eq!(
+        host.source_count(),
+        1,
+        "ReadOnly source registered on install"
+    );
     assert_eq!(receipt.imported_sources, vec!["kbpack".to_string()]);
 
     uninstall(&host, "kbpack", &UninstallOpts::default()).unwrap();
@@ -173,7 +222,11 @@ fn update_refreshes_files_keeps_user_data() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let iopts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
 
     // Simulate the user editing their seeded page.
@@ -201,7 +254,11 @@ fn install_skips_symlinks_in_skills_dir() {
     let root: &Path = dir.path();
     // One legit skill file...
     fs::create_dir_all(root.join("components/skills/demo-evaluate")).unwrap();
-    fs::write(root.join("components/skills/demo-evaluate/SKILL.md"), "# eval").unwrap();
+    fs::write(
+        root.join("components/skills/demo-evaluate/SKILL.md"),
+        "# eval",
+    )
+    .unwrap();
     fs::create_dir_all(root.join("components/seed")).unwrap();
     fs::write(root.join("components/seed/cv.md"), "# cv template").unwrap();
     // ...plus a malicious top-level symlink to an absolute path outside the pack.
@@ -213,11 +270,19 @@ fn install_skips_symlinks_in_skills_dir() {
 
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
     // Only the one legit SKILL.md should have been placed; symlinks skipped.
-    assert_eq!(host.file_count(), 1, "symlinks must be skipped, only real file placed");
+    assert_eq!(
+        host.file_count(),
+        1,
+        "symlinks must be skipped, only real file placed"
+    );
 }
 
 /// M1: a failed update must not leave a receipt that references deleted files.
@@ -228,15 +293,23 @@ fn failed_update_does_not_leave_stale_receipt() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
+    let iopts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
-    assert!(host.read_receipt("demo").unwrap().is_some(), "installed receipt present");
+    assert!(
+        host.read_receipt("demo").unwrap().is_some(),
+        "installed receipt present"
+    );
 
     // Bump version but point skills.dir at a directory that does NOT exist on
     // disk, so the fresh install fails during the place phase.
-    let broken = MANIFEST
-        .replace("0.1.0", "0.2.0")
-        .replace("dir = \"components/skills\"", "dir = \"components/does-not-exist\"");
+    let broken = MANIFEST.replace("0.1.0", "0.2.0").replace(
+        "dir = \"components/skills\"",
+        "dir = \"components/does-not-exist\"",
+    );
     let m2 = Manifest::parse(&broken).unwrap();
     let err = update(&host, &m2, &broken, dir.path(), "2026-06-10T00:00:00Z").unwrap_err();
     assert!(matches!(err, nevoflux_pack::PackError::RolledBack { .. }));

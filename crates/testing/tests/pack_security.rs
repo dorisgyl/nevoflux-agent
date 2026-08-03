@@ -33,7 +33,9 @@ fn manifest(extra: &str) -> (Manifest, String) {
 }
 
 fn has_traversal(errs: &[Violation], raw: &str) -> bool {
-    errs.contains(&Violation::PathTraversal { raw: raw.to_string() })
+    errs.contains(&Violation::PathTraversal {
+        raw: raw.to_string(),
+    })
 }
 
 // --- C1/C3: source-path traversal across every manifest-supplied path. ---
@@ -120,7 +122,9 @@ fn dashboard_artifact_id_must_be_namespaced() {
     );
     let errs = capability::validate(&m, &paths(), &raw).unwrap_err();
     assert!(
-        errs.contains(&Violation::ArtifactIdNotNamespaced { id: "evil-dashboard".into() }),
+        errs.contains(&Violation::ArtifactIdNotNamespaced {
+            id: "evil-dashboard".into()
+        }),
         "artifact id not prefixed by pack name must be rejected, got {errs:?}"
     );
 }
@@ -165,7 +169,11 @@ fn seed_from_symlink_is_rejected() {
         [components.protected]\nprefixes=[\"demo/\"]\n";
     let m = Manifest::parse(man).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "t".into(), ..Default::default() };
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "t".into(),
+        ..Default::default()
+    };
 
     let err = install(&host, &m, man, root, &opts).unwrap_err();
     // Install rolls back on the seed read error; the secret must not be seeded.

@@ -99,8 +99,12 @@ mod tests {
         );
 
         // Empty / "default" → no config option (agy keeps its own default).
-        assert!(build_config("default", PathBuf::from(".")).config_options.is_empty());
-        assert!(build_config("", PathBuf::from(".")).config_options.is_empty());
+        assert!(build_config("default", PathBuf::from("."))
+            .config_options
+            .is_empty());
+        assert!(build_config("", PathBuf::from("."))
+            .config_options
+            .is_empty());
     }
 
     #[test]

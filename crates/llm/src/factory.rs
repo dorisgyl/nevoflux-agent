@@ -65,9 +65,7 @@ impl FromStr for ProviderType {
             "gemini-cli" | "gemini_cli" => Ok(ProviderType::GeminiCli),
             "kimi-agent" | "kimi_agent" | "kimi" => Ok(ProviderType::KimiAgent),
             "openclaw" | "open_claw" | "open-claw" => Ok(ProviderType::OpenClaw),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                Ok(ProviderType::Antigravity)
-            }
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => Ok(ProviderType::Antigravity),
             _ => Err(format!("Unknown provider: {}", s)),
         }
     }

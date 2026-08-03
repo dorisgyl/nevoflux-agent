@@ -49,9 +49,7 @@ struct LlmProviderCreds {
 /// pluck out `[llm.<provider>]`. Returns `None` when the file is missing
 /// or the section is empty / api_key is unset — caller skips the test.
 fn read_provider(provider: &str, default_base_url: &str) -> Option<LlmProviderCreds> {
-    let cfg_path: PathBuf = dirs::config_dir()?
-        .join("nevoflux")
-        .join("config.toml");
+    let cfg_path: PathBuf = dirs::config_dir()?.join("nevoflux").join("config.toml");
     let raw = std::fs::read_to_string(&cfg_path)
         .map_err(|e| {
             eprintln!(
@@ -119,11 +117,7 @@ fn build_config(api_key: String, base_url: String, model_remap: String) -> Gatew
     }
 }
 
-async fn run_chat_completion(
-    provider_label: &str,
-    creds: LlmProviderCreds,
-    test_model: &str,
-) {
+async fn run_chat_completion(provider_label: &str, creds: LlmProviderCreds, test_model: &str) {
     eprintln!(
         "[{label}] api_key_len={akl} base_url={bu} model_in_config={mic} test_model_remap_to={tm}",
         label = provider_label,
@@ -187,7 +181,10 @@ async fn run_chat_completion(
         !content.is_empty(),
         "{provider_label}: choices[0].message.content should be non-empty, got: {body}"
     );
-    eprintln!("[{provider_label}] response content (truncated): {}", &content[..content.len().min(120)]);
+    eprintln!(
+        "[{provider_label}] response content (truncated): {}",
+        &content[..content.len().min(120)]
+    );
 
     handle.shutdown().await;
     eprintln!("[{provider_label}] OK");
