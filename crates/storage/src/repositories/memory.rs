@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_embedding_blob_conversion() {
-        let original = vec![1.0f32, -2.5, 3.14159, 0.0, -0.00001];
+        let original = vec![1.0f32, -2.5, std::f32::consts::PI, 0.0, -0.00001];
         let blob = embedding_to_blob(&original);
         let converted = blob_to_embedding(&blob);
 

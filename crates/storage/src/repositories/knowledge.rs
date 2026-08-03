@@ -1413,7 +1413,7 @@ mod tests {
     fn test_create_with_embedding() {
         let storage = Storage::open_in_memory().unwrap();
 
-        let embedding = vec![1.0_f32, -2.5, 3.14159, 0.0, -0.00001];
+        let embedding = vec![1.0_f32, -2.5, std::f32::consts::PI, 0.0, -0.00001];
         let created = storage
             .knowledge()
             .create(CreateKnowledgeParams {
