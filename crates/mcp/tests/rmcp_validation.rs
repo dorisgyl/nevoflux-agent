@@ -1,13 +1,12 @@
 //! RMCP Integration Validation Tests
 //!
 //! This file validates the feasibility of migrating from our custom MCP client
-//! to the official rmcp SDK (version 0.14).
+//! to the official rmcp SDK (version 3.1).
 
 use nevoflux_mcp::ToolDefinition;
-use rmcp::model::{Annotated, CallToolRequestParams, RawContent, ServerCapabilities, Tool};
+use rmcp::model::{CallToolRequestParams, ContentBlock, ServerCapabilities, Tool};
 use rmcp::service::ServiceExt;
 use rmcp::transport::TokioChildProcess;
-use std::sync::Arc;
 
 /// Test that rmcp types can be constructed and used.
 #[test]
@@ -28,17 +27,8 @@ fn test_tool_construction() {
     .cloned()
     .unwrap();
 
-    // rmcp 0.14 requires all fields
-    let tool = Tool {
-        name: "read_file".into(),
-        description: Some("Read a file".into()),
-        input_schema: Arc::new(schema),
-        annotations: None,
-        icons: None,
-        meta: None,
-        output_schema: None,
-        title: None,
-    };
+    // rmcp 3.x model types are `#[non_exhaustive]`: construct via the builder.
+    let tool = Tool::new("read_file", "Read a file", schema);
 
     assert_eq!(tool.name.to_string(), "read_file");
     assert!(tool.description.is_some());
@@ -52,12 +42,7 @@ fn test_call_tool_params() {
         .cloned()
         .unwrap();
 
-    let params = CallToolRequestParams {
-        name: "read_file".into(),
-        arguments: Some(args),
-        meta: None,
-        task: None,
-    };
+    let params = CallToolRequestParams::new("read_file").with_arguments(args);
 
     assert_eq!(params.name.to_string(), "read_file");
     assert!(params.arguments.is_some());
@@ -84,9 +69,9 @@ async fn test_transport_construction() {
 /// Test content types for tool results using helper methods.
 #[test]
 fn test_content_types() {
-    // Use the helper method to create text content
-    let content: Annotated<RawContent> = Annotated::text("file contents");
-    assert!(matches!(content.raw, RawContent::Text(_)));
+    // rmcp 3.x flattened `Annotated<RawContent>` into a single `ContentBlock`.
+    let content = ContentBlock::text("file contents");
+    assert!(matches!(content, ContentBlock::Text(_)));
 }
 
 /// Test conversion from rmcp Tool to our ToolDefinition
@@ -102,16 +87,7 @@ fn test_rmcp_to_our_tool_definition() {
     .cloned()
     .unwrap();
 
-    let rmcp_tool = Tool {
-        name: "read_file".into(),
-        description: Some("Read a file".into()),
-        input_schema: Arc::new(schema),
-        annotations: None,
-        icons: None,
-        meta: None,
-        output_schema: None,
-        title: None,
-    };
+    let rmcp_tool = Tool::new("read_file", "Read a file", schema);
 
     // Convert to our ToolDefinition
     let our_tool = ToolDefinition {
@@ -143,22 +119,15 @@ fn test_our_tool_definition_to_rmcp() {
     };
 
     // Convert to rmcp Tool
-    let rmcp_tool = Tool {
-        name: our_tool.name.clone().into(),
-        description: Some(our_tool.description.clone().into()),
-        input_schema: Arc::new(
-            our_tool
-                .input_schema
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        ),
-        annotations: None,
-        icons: None,
-        meta: None,
-        output_schema: None,
-        title: None,
-    };
+    let rmcp_tool = Tool::new(
+        our_tool.name.clone(),
+        our_tool.description.clone(),
+        our_tool
+            .input_schema
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
 
     assert_eq!(rmcp_tool.name.to_string(), our_tool.name);
 }
@@ -184,7 +153,8 @@ fn test_api_differences() {
     // 2. rmcp uses typed params (CallToolRequestParams)
     // 3. rmcp uses tokio::process::Command directly
     // 4. rmcp Tool has more fields (icons, meta, output_schema, title)
-    // 5. rmcp uses Annotated<RawContent> for content items
+    // 5. rmcp uses a flat `ContentBlock` enum for content items
+    // 6. rmcp 3.x model types are `#[non_exhaustive]`; use builders, not literals
 }
 
 /// Integration test with a real MCP server.

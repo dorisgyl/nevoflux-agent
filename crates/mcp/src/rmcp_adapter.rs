@@ -20,14 +20,15 @@ use crate::types::{
     ToolResultContent,
 };
 use async_trait::async_trait;
+use rmcp::model::ServerPeerInfo;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, RawContent, ResourceContents, Tool as RmcpTool,
+    CallToolRequestParams, CallToolResult, ContentBlock, ReadResourceRequestParams,
+    ResourceContents, Tool as RmcpTool,
 };
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::RwLock;
 
 // ============================================================================
@@ -63,50 +64,49 @@ impl From<&RmcpTool> for ToolDefinition {
 /// Convert our ToolDefinition to rmcp Tool.
 impl From<ToolDefinition> for RmcpTool {
     fn from(tool: ToolDefinition) -> Self {
-        RmcpTool {
-            name: tool.name.into(),
-            description: Some(tool.description.into()),
-            input_schema: Arc::new(tool.input_schema.as_object().cloned().unwrap_or_default()),
-            annotations: None,
-            icons: None,
-            meta: None,
-            output_schema: None,
-            title: None,
-        }
+        RmcpTool::new(
+            tool.name,
+            tool.description,
+            tool.input_schema.as_object().cloned().unwrap_or_default(),
+        )
     }
 }
 
-/// Extract text from rmcp Content (Annotated<RawContent>).
+/// Extract text from an rmcp content block.
 #[allow(dead_code)]
-fn content_to_text(content: &Content) -> Option<String> {
-    match &content.raw {
-        RawContent::Text(text) => Some(text.text.clone()),
-        RawContent::Image(img) => Some(format!("[Image: {}]", img.mime_type)),
-        RawContent::Audio(audio) => Some(format!("[Audio: {}]", audio.mime_type)),
-        RawContent::Resource(res) => match &res.resource {
+fn content_to_text(content: &ContentBlock) -> Option<String> {
+    match content {
+        ContentBlock::Text(text) => Some(text.text.clone()),
+        ContentBlock::Image(img) => Some(format!("[Image: {}]", img.mime_type)),
+        ContentBlock::Audio(audio) => Some(format!("[Audio: {}]", audio.mime_type)),
+        ContentBlock::Resource(res) => match &res.resource {
             ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
             ResourceContents::BlobResourceContents { blob, .. } => {
                 Some(format!("[Blob: {} bytes]", blob.len()))
             }
+            _ => None,
         },
-        RawContent::ResourceLink(link) => Some(format!("[Resource: {}]", link.uri)),
+        ContentBlock::ResourceLink(link) => Some(format!("[Resource: {}]", link.uri)),
+        // `ContentBlock` is `#[non_exhaustive]`: a future block kind we don't
+        // model yet degrades to "no text" rather than failing the call.
+        _ => None,
     }
 }
 
-/// Convert rmcp Content to our ToolResultContent.
-fn content_to_tool_result_content(content: &Content) -> ToolResultContent {
-    match &content.raw {
-        RawContent::Text(text) => ToolResultContent::Text {
+/// Convert an rmcp content block to our ToolResultContent.
+fn content_to_tool_result_content(content: &ContentBlock) -> ToolResultContent {
+    match content {
+        ContentBlock::Text(text) => ToolResultContent::Text {
             text: text.text.clone(),
         },
-        RawContent::Image(img) => ToolResultContent::Image {
+        ContentBlock::Image(img) => ToolResultContent::Image {
             data: img.data.clone(),
             mime_type: img.mime_type.clone(),
         },
-        RawContent::Audio(audio) => ToolResultContent::Text {
+        ContentBlock::Audio(audio) => ToolResultContent::Text {
             text: format!("[Audio: {}]", audio.mime_type),
         },
-        RawContent::Resource(res) => match &res.resource {
+        ContentBlock::Resource(res) => match &res.resource {
             ResourceContents::TextResourceContents {
                 uri,
                 mime_type,
@@ -124,12 +124,69 @@ fn content_to_tool_result_content(content: &Content) -> ToolResultContent {
                     text: None,
                 }
             }
+            // `ResourceContents` is `#[non_exhaustive]`.
+            _ => ToolResultContent::Text {
+                text: "[Unsupported resource contents]".to_string(),
+            },
         },
-        RawContent::ResourceLink(link) => ToolResultContent::Resource {
+        ContentBlock::ResourceLink(link) => ToolResultContent::Resource {
             uri: link.uri.to_string(),
             mime_type: link.mime_type.as_ref().map(|m| m.to_string()),
             text: link.description.as_ref().map(|d| d.to_string()),
         },
+        // See `content_to_text`: unknown block kinds surface as a placeholder
+        // instead of being silently dropped.
+        _ => ToolResultContent::Text {
+            text: "[Unsupported content block]".to_string(),
+        },
+    }
+}
+
+/// Extract our [`ServerInfo`] from a negotiated rmcp peer info.
+///
+/// rmcp 3.x makes the implementation identity optional (`server/discover`
+/// responses are not required to carry it), so a server that withholds it
+/// still yields a record with the negotiated protocol version rather than
+/// dropping the whole thing.
+fn peer_server_info(peer: &ServerPeerInfo) -> ServerInfo {
+    ServerInfo {
+        name: peer
+            .server_info
+            .as_ref()
+            .map(|i| i.name.to_string())
+            .unwrap_or_default(),
+        version: peer
+            .server_info
+            .as_ref()
+            .map(|i| i.version.to_string())
+            .unwrap_or_default(),
+        protocol_version: Some(peer.protocol_version.to_string()),
+    }
+}
+
+/// Extract our [`ServerCapabilities`] from a negotiated rmcp peer info.
+fn peer_capabilities(peer: &ServerPeerInfo) -> ServerCapabilities {
+    ServerCapabilities {
+        tools: peer
+            .capabilities
+            .tools
+            .as_ref()
+            .map(|_| crate::types::ToolsCapability {
+                list_changed: false,
+            }),
+        resources: peer.capabilities.resources.as_ref().map(|r| {
+            crate::types::ResourcesCapability {
+                list_changed: false,
+                subscribe: r.subscribe.unwrap_or(false),
+            }
+        }),
+        prompts: peer
+            .capabilities
+            .prompts
+            .as_ref()
+            .map(|_| crate::types::PromptsCapability {
+                list_changed: false,
+            }),
     }
 }
 
@@ -281,35 +338,10 @@ impl RmcpClient {
             }
         };
 
-        // Extract server info from initialization
-        // peer_info returns InitializeResult which has server_info field
-        let server_info = service.peer_info().map(|result| ServerInfo {
-            name: result.server_info.name.to_string(),
-            version: result.server_info.version.to_string(),
-            protocol_version: Some(result.protocol_version.to_string()),
-        });
-
-        // Extract capabilities from InitializeResult
-        let capabilities = service.peer_info().map(|result| ServerCapabilities {
-            tools: result
-                .capabilities
-                .tools
-                .as_ref()
-                .map(|_| crate::types::ToolsCapability {
-                    list_changed: false,
-                }),
-            resources: result.capabilities.resources.as_ref().map(|r| {
-                crate::types::ResourcesCapability {
-                    list_changed: false,
-                    subscribe: r.subscribe.unwrap_or(false),
-                }
-            }),
-            prompts: result.capabilities.prompts.as_ref().map(|_| {
-                crate::types::PromptsCapability {
-                    list_changed: false,
-                }
-            }),
-        });
+        // Extract server info and capabilities from the negotiated peer info.
+        let peer = service.peer_info();
+        let server_info = peer.as_deref().map(peer_server_info);
+        let capabilities = peer.as_deref().map(peer_capabilities);
 
         Ok(Self {
             service: Arc::new(RwLock::new(Some(service))),
@@ -335,32 +367,9 @@ impl RmcpClient {
             .await
             .map_err(|e| McpError::ConnectionFailed(format!("HTTP/SSE connect failed: {:?}", e)))?;
 
-        let server_info = service.peer_info().map(|result| ServerInfo {
-            name: result.server_info.name.to_string(),
-            version: result.server_info.version.to_string(),
-            protocol_version: Some(result.protocol_version.to_string()),
-        });
-
-        let capabilities = service.peer_info().map(|result| ServerCapabilities {
-            tools: result
-                .capabilities
-                .tools
-                .as_ref()
-                .map(|_| crate::types::ToolsCapability {
-                    list_changed: false,
-                }),
-            resources: result.capabilities.resources.as_ref().map(|r| {
-                crate::types::ResourcesCapability {
-                    list_changed: false,
-                    subscribe: r.subscribe.unwrap_or(false),
-                }
-            }),
-            prompts: result.capabilities.prompts.as_ref().map(|_| {
-                crate::types::PromptsCapability {
-                    list_changed: false,
-                }
-            }),
-        });
+        let peer = service.peer_info();
+        let server_info = peer.as_deref().map(peer_server_info);
+        let capabilities = peer.as_deref().map(peer_capabilities);
 
         tracing::info!(url = %url, "Connected to MCP server via HTTP/SSE");
 
@@ -415,12 +424,10 @@ impl RmcpClient {
         let service_guard = self.service.read().await;
         let service = service_guard.as_ref().ok_or(McpError::NotInitialized)?;
 
-        let params = CallToolRequestParams {
-            name: name.to_string().into(),
-            arguments: arguments.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
+        let mut params = CallToolRequestParams::new(name.to_string());
+        if let Some(args) = arguments.as_object().cloned() {
+            params = params.with_arguments(args);
+        }
 
         let result = service
             .call_tool(params)
@@ -452,10 +459,10 @@ impl RmcpClient {
             .resources
             .iter()
             .map(|r| Resource {
-                uri: r.raw.uri.to_string(),
-                name: r.raw.name.to_string(),
-                description: r.raw.description.as_ref().map(|d| d.to_string()),
-                mime_type: r.raw.mime_type.as_ref().map(|m| m.to_string()),
+                uri: r.uri.to_string(),
+                name: r.name.to_string(),
+                description: r.description.as_ref().map(|d| d.to_string()),
+                mime_type: r.mime_type.as_ref().map(|m| m.to_string()),
             })
             .collect())
     }
@@ -465,10 +472,7 @@ impl RmcpClient {
         let service_guard = self.service.read().await;
         let service = service_guard.as_ref().ok_or(McpError::NotInitialized)?;
 
-        let params = rmcp::model::ReadResourceRequestParams {
-            uri: uri.to_string(),
-            meta: None,
-        };
+        let params = ReadResourceRequestParams::new(uri);
 
         let result = service
             .read_resource(params)
@@ -508,6 +512,11 @@ impl RmcpClient {
                 text: None,
                 blob: Some(blob.clone()),
             }),
+            // `ResourceContents` is `#[non_exhaustive]`: report a variant we
+            // don't model rather than failing to compile on the next rmcp bump.
+            other => Err(McpError::UnexpectedResponse(format!(
+                "Unsupported resource contents variant: {other:?}"
+            ))),
         }
     }
 
@@ -570,7 +579,6 @@ impl McpClientBackend for RmcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::Annotated;
 
     #[test]
     fn test_rmcp_tool_to_tool_definition() {
@@ -584,16 +592,7 @@ mod tests {
         .cloned()
         .unwrap();
 
-        let rmcp_tool = RmcpTool {
-            name: "read_file".into(),
-            description: Some("Read a file from disk".into()),
-            input_schema: Arc::new(schema),
-            annotations: None,
-            icons: None,
-            meta: None,
-            output_schema: None,
-            title: None,
-        };
+        let rmcp_tool = RmcpTool::new("read_file", "Read a file from disk", schema);
 
         let tool_def: ToolDefinition = rmcp_tool.into();
 
@@ -627,12 +626,7 @@ mod tests {
 
     #[test]
     fn test_call_tool_result_to_tool_result() {
-        let rmcp_result = CallToolResult {
-            content: vec![Annotated::text("File contents here")],
-            is_error: Some(false),
-            meta: None,
-            structured_content: None,
-        };
+        let rmcp_result = CallToolResult::success(vec![ContentBlock::text("File contents here")]);
 
         let tool_result: ToolResult = rmcp_result.into();
 
@@ -648,12 +642,7 @@ mod tests {
 
     #[test]
     fn test_call_tool_result_error() {
-        let rmcp_result = CallToolResult {
-            content: vec![Annotated::text("Error: File not found")],
-            is_error: Some(true),
-            meta: None,
-            structured_content: None,
-        };
+        let rmcp_result = CallToolResult::error(vec![ContentBlock::text("Error: File not found")]);
 
         let tool_result: ToolResult = rmcp_result.into();
 
@@ -689,7 +678,7 @@ mod tests {
     #[test]
     fn test_content_to_text() {
         // Text content
-        let text_content = Annotated::text("Hello, world!");
+        let text_content = ContentBlock::text("Hello, world!");
         assert_eq!(
             content_to_text(&text_content),
             Some("Hello, world!".to_string())
@@ -698,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_content_to_tool_result_content_text() {
-        let content = Annotated::text("Some text");
+        let content = ContentBlock::text("Some text");
         let result = content_to_tool_result_content(&content);
         match result {
             ToolResultContent::Text { text } => assert_eq!(text, "Some text"),
