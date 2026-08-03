@@ -3,7 +3,7 @@
 //! These tests verify the MCP tool definitions and protocol handling
 //! across the full stack.
 
-use nevoflux_mcp::{create_tools, JsonRpcRequest, McpServer, McpServerConfig, PROTOCOL_VERSION};
+use nevoflux_mcp::create_tools;
 
 // ============================================================================
 // Tool Definition Tests
@@ -302,31 +302,12 @@ fn test_computer_type_text_schema() {
 }
 
 // ============================================================================
-// MCP Server Integration Tests
+// Tool Catalogue Tests
+//
+// These cover the published catalogue (`create_tools`). Serving it over MCP is
+// covered end-to-end in `crates/mcp/tests/rmcp_server_e2e.rs`, and the mapping
+// from catalogue entry to a daemon executor in `nevoflux_daemon::mcp_service`.
 // ============================================================================
-
-#[test]
-fn test_mcp_server_with_all_tools() {
-    let mut server = McpServer::new();
-    let tools = create_tools();
-
-    // Register all tools
-    for tool in tools {
-        server.register_tool(tool);
-    }
-
-    // Verify all tools are registered (29 total: 16 browser + 1 agent + 12 computer)
-    assert_eq!(server.tools().len(), 29);
-
-    // List tools via JSON-RPC
-    let request = JsonRpcRequest::with_id(1, "tools/list", None);
-    let response = server.handle_request(&request);
-
-    assert!(response.is_success());
-    let result = response.result.unwrap();
-    let listed_tools = result["tools"].as_array().unwrap();
-    assert_eq!(listed_tools.len(), 29);
-}
 
 #[test]
 fn test_mcp_server_tool_categories() {
@@ -349,109 +330,6 @@ fn test_mcp_server_tool_categories() {
     assert_eq!(agent_tools.len(), 1, "Expected 1 agent tool");
     assert_eq!(computer_tools.len(), 12, "Expected 12 computer tools");
 }
-
-#[test]
-fn test_mcp_protocol_version() {
-    // Verify protocol version is set correctly
-    assert!(!PROTOCOL_VERSION.is_empty());
-
-    let server = McpServer::new();
-    let info = server.server_info();
-    assert_eq!(info.protocol_version.as_ref().unwrap(), PROTOCOL_VERSION);
-}
-
-#[test]
-fn test_mcp_server_initialize_with_tools() {
-    let mut server = McpServer::new();
-    let tools = create_tools();
-    for tool in tools {
-        server.register_tool(tool);
-    }
-
-    // Send initialize request
-    let request = JsonRpcRequest::with_id(1, "initialize", None);
-    let response = server.handle_request(&request);
-
-    assert!(response.is_success());
-    let result = response.result.unwrap();
-
-    // Verify capabilities indicate tools are available
-    let capabilities = &result["capabilities"];
-    assert!(capabilities["tools"].is_object());
-}
-
-#[test]
-fn test_mcp_tools_call_browser_navigate() {
-    let mut server = McpServer::new();
-    server.register_tool(
-        create_tools()
-            .into_iter()
-            .find(|t| t.name == "browser_navigate")
-            .unwrap(),
-    );
-
-    // Call the tool
-    let request = JsonRpcRequest::with_id(
-        2,
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "browser_navigate",
-            "arguments": {
-                "url": "https://example.com"
-            }
-        })),
-    );
-    let response = server.handle_request(&request);
-
-    // Tool execution returns success (with isError since not implemented)
-    assert!(response.is_success());
-    let result = response.result.unwrap();
-    // Tool exists but execution is not implemented
-    assert!(result["isError"].as_bool().unwrap());
-}
-
-#[test]
-fn test_mcp_tools_call_agent_chat() {
-    let mut server = McpServer::new();
-    server.register_tool(
-        create_tools()
-            .into_iter()
-            .find(|t| t.name == "agent_chat")
-            .unwrap(),
-    );
-
-    // Call the tool
-    let request = JsonRpcRequest::with_id(
-        3,
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "agent_chat",
-            "arguments": {
-                "message": "Hello, agent!"
-            }
-        })),
-    );
-    let response = server.handle_request(&request);
-
-    assert!(response.is_success());
-}
-
-#[test]
-fn test_mcp_server_custom_config() {
-    let config = McpServerConfig {
-        name: "test-mcp-server".to_string(),
-        version: "1.0.0-test".to_string(),
-    };
-    let server = McpServer::with_config(config);
-
-    let info = server.server_info();
-    assert_eq!(info.name, "test-mcp-server");
-    assert_eq!(info.version, "1.0.0-test");
-}
-
-// ============================================================================
-// Tool Definition Validation Tests
-// ============================================================================
 
 #[test]
 fn test_all_tools_have_properties() {
@@ -511,105 +389,4 @@ fn test_tool_descriptions_are_meaningful() {
             tool.name
         );
     }
-}
-
-// ============================================================================
-// Integration with Full Tool Set
-// ============================================================================
-
-#[test]
-fn test_full_mcp_workflow() {
-    // Create server and register all tools
-    let mut server = McpServer::new();
-    for tool in create_tools() {
-        server.register_tool(tool);
-    }
-
-    // Step 1: Initialize
-    let init_request = JsonRpcRequest::with_id(1, "initialize", None);
-    let init_response = server.handle_request(&init_request);
-    assert!(init_response.is_success());
-
-    // Step 2: List tools
-    let list_request = JsonRpcRequest::with_id(2, "tools/list", None);
-    let list_response = server.handle_request(&list_request);
-    assert!(list_response.is_success());
-
-    let result = list_response.result.unwrap();
-    let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 29);
-
-    // Step 3: Verify each tool is callable (though not implemented)
-    let tool_names = [
-        // Browser tools (16)
-        "browser_navigate",
-        "browser_click",
-        "browser_screenshot",
-        "browser_type",
-        "browser_fill",
-        "browser_get_content",
-        "browser_eval_js",
-        "browser_wait_for",
-        "browser_scroll",
-        "browser_get_element",
-        "browser_query_all",
-        "browser_snapshot",
-        "browser_click_by_id",
-        "browser_fill_by_id",
-        "browser_type_by_id",
-        "browser_get_markdown",
-        // Agent tools (1)
-        "agent_chat",
-        // Computer tools (12)
-        "computer_screenshot",
-        "computer_mouse_move",
-        "computer_type_text",
-        "computer_click",
-        "computer_key",
-        "computer_scroll",
-        "computer_drag",
-        "computer_cursor_position",
-        "computer_mouse_down",
-        "computer_mouse_up",
-        "computer_hold_key",
-        "computer_wait",
-    ];
-
-    for (id, name) in tool_names.iter().enumerate() {
-        let call_request = JsonRpcRequest::with_id(
-            (id + 10) as u64,
-            "tools/call",
-            Some(serde_json::json!({
-                "name": name,
-                "arguments": {}
-            })),
-        );
-        let call_response = server.handle_request(&call_request);
-        assert!(
-            call_response.is_success(),
-            "Tool {} should be callable",
-            name
-        );
-    }
-}
-
-#[test]
-fn test_mcp_error_handling() {
-    let server = McpServer::new();
-
-    // Unknown method
-    let request = JsonRpcRequest::with_id(1, "unknown/method", None);
-    let response = server.handle_request(&request);
-    assert!(response.is_error());
-
-    // Tool not found
-    let request = JsonRpcRequest::with_id(
-        2,
-        "tools/call",
-        Some(serde_json::json!({"name": "nonexistent_tool"})),
-    );
-    let response = server.handle_request(&request);
-    assert!(response.is_success()); // Returns success with error in result
-    let result = response.result.unwrap();
-    assert!(result["isError"].as_bool().unwrap());
 }

@@ -12,6 +12,7 @@
 mod cli;
 mod completions;
 mod logging;
+mod mcp_backend;
 
 use clap::Parser;
 use cli::PackAction;
@@ -390,7 +391,9 @@ fn kill_process(pid: u32) {
 /// This starts an MCP server that communicates via stdio, allowing
 /// Claude Code or other MCP clients to use browser automation tools.
 async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use nevoflux_mcp::{create_tools, run_stdio_server, McpServer, McpServerConfig};
+    use nevoflux_mcp::rmcp::service::ServiceExt;
+    use nevoflux_mcp::NevofluxServer;
+    use std::sync::Arc;
 
     // Initialize logging to stderr (stdout is for MCP protocol)
     logging::init_stderr_logging(verbose, Some("nevoflux=info"));
@@ -398,17 +401,35 @@ async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     logging::log_startup(env!("CARGO_PKG_VERSION"));
     tracing::info!("Starting MCP server mode");
 
-    // Create server with default configuration
-    let config = McpServerConfig::default();
-    let mut server = McpServer::with_config(config);
+    // The tools live in the daemon (next to the browser connection and the
+    // computer controller), so this process is a front-end over it. Without a
+    // daemon there is nothing to expose, and failing here beats advertising
+    // tools that would all error on the first call.
+    let backend = mcp_backend::DaemonMcpBackend::connect("mcp-client")
+        .await
+        .map_err(|e| {
+            format!(
+                "{e}\nStart it first with 'nevoflux-agent' (or check 'nevoflux-agent --status')."
+            )
+        })?;
 
-    // Register all tools from the tools module
-    for tool in create_tools() {
-        server.register_tool(tool);
-    }
+    let server = NevofluxServer::new(
+        Arc::new(backend),
+        "nevoflux-agent",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .with_instructions(
+        "Browser and computer control provided by a running NevoFlux daemon. \
+         Browser tools act on the browser currently connected to that daemon.",
+    );
 
-    // Run the stdio server
-    run_stdio_server(server).await?;
+    // rmcp owns the transport: protocol negotiation, `server/discover`,
+    // notification handling and framing all come from the SDK.
+    let running = server
+        .serve(nevoflux_mcp::rmcp::transport::stdio())
+        .await
+        .map_err(|e| format!("Failed to start the MCP stdio server: {e}"))?;
+    running.waiting().await?;
 
     Ok(())
 }
@@ -824,7 +845,7 @@ async fn run_daemon(
                 });
             }
             if let Some(addr) = mcp_addr {
-                let app = http::rpc::mcp_routes().with_state(state.clone());
+                let app = http::rpc::mcp_routes(state.clone());
                 tokio::spawn(async move {
                     tracing::info!("MCP-over-HTTP listening on {} (POST /mcp)", addr);
                     if let Err(e) = http::router::serve(addr, app).await {

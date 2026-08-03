@@ -46,21 +46,15 @@
 //!
 //! ## MCP Mode
 //!
-//! ```rust,ignore
-//! use nevoflux_bridge::{McpBridge, McpBridgeConfig};
-//! use tokio::io::{stdin, stdout};
-//!
-//! let config = McpBridgeConfig::new();
-//! let mut bridge = McpBridge::new(stdin(), stdout(), config);
-//! bridge.connect().await?;
-//! ```
+//! `nevoflux-agent --mcp` serves MCP over stdio via the rmcp SDK and reaches the
+//! daemon through an ordinary [`DaemonClient`] on [`Channel::Mcp`] — there is no
+//! MCP-specific bridge type here.
 
 pub mod async_proxy;
 pub mod chunking;
 pub mod config;
 pub mod daemon_client;
 pub mod error;
-pub mod mcp_bridge;
 pub mod native_messaging;
 pub mod port_discovery;
 pub mod proxy;
@@ -73,7 +67,6 @@ pub use async_proxy::{
 pub use config::{BridgeConfig, ConnectionMode};
 pub use daemon_client::{generate_proxy_id, DaemonClient, DaemonMessageStream};
 pub use error::{BridgeError, Result};
-pub use mcp_bridge::{error_codes, McpBridge, McpBridgeConfig, McpBridgeState};
 pub use native_messaging::{decode_message, encode_message, read_message, write_message};
 pub use port_discovery::{
     cleanup_files, discover_daemon, find_available_port, is_process_running, launch_daemon,
@@ -94,7 +87,6 @@ mod tests {
         // Verify all re-exports are accessible
         let _ = BridgeConfig::new();
         let _ = ProxyConfig::new();
-        let _ = McpBridgeConfig::new();
         let _ = generate_proxy_id();
     }
 

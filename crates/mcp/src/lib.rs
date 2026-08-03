@@ -43,8 +43,8 @@ pub mod error;
 pub mod manager;
 pub mod registry;
 pub mod rmcp_adapter;
+pub mod rmcp_server;
 pub mod search;
-pub mod server;
 pub mod tools;
 pub mod transport;
 pub mod types;
@@ -54,9 +54,13 @@ pub use client::McpClient;
 pub use error::{McpError, Result};
 pub use manager::{ManagerConfig, McpManager, ServerStatus};
 pub use registry::{McpRegistry, ServerConfig, ServerResource, ServerTool};
+// Re-exported so front-ends (the `--mcp` binary, the daemon's HTTP endpoint)
+// build against exactly the rmcp this crate was compiled with, instead of each
+// pinning their own version.
+pub use rmcp;
 pub use rmcp_adapter::RmcpClient;
+pub use rmcp_server::{McpServerBackend, NevofluxServer};
 pub use search::{Bm25Config, SearchResult, ToolSearchIndex};
-pub use server::{run_stdio_server, McpServer, McpServerConfig, PROTOCOL_VERSION};
 pub use tools::create_tools;
 pub use transport::{McpTransport, StdioTransport};
 pub use types::{

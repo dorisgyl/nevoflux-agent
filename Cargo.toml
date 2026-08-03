@@ -126,6 +126,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 fs2 = { workspace = true }
+async-trait = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
