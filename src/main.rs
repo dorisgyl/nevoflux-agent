@@ -1,21 +1,21 @@
 //! NevoFlux Native Agent CLI
 //!
 //! Entry points:
-//! - `nevoflux` - Proxy mode (Native Messaging bridge)
-//! - `nevoflux --daemon` - Core daemon
-//! - `nevoflux --mcp` - MCP server mode
-//! - `nevoflux --status` - Show daemon status
-//! - `nevoflux --stop` - Stop daemon
-//! - `nevoflux config <action>` - Configuration management
-//! - `nevoflux setup` - Interactive setup wizard
+//! - `nevoflux-agent` - Proxy mode (Native Messaging bridge)
+//! - `nevoflux-agent --daemon` - Core daemon
+//! - `nevoflux-agent --mcp` - MCP server mode
+//! - `nevoflux-agent --status` - Show daemon status
+//! - `nevoflux-agent --stop` - Stop daemon
+//! - `nevoflux-agent config <action>` - Configuration management
+//! - `nevoflux-agent setup` - Interactive setup wizard
 
 mod cli;
 mod completions;
 mod logging;
 
 use clap::Parser;
-use cli::{AccountAction, Cli, Commands, ConfigAction};
 use cli::PackAction;
+use cli::{AccountAction, Cli, Commands, ConfigAction};
 use fs2::FileExt;
 use nevoflux_storage::Storage;
 use std::fs::File;
@@ -124,7 +124,7 @@ fn run_status() {
             println!("Daemon is not running (stale files found)");
             println!("  port file: {}", port);
             println!("  pid file: {}", pid);
-            println!("Run 'nevoflux --stop' to clean up.");
+            println!("Run 'nevoflux-agent --stop' to clean up.");
         }
         DaemonStatus::NotRunning => {
             println!("Daemon is not running");
@@ -249,14 +249,16 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
     // users from accidentally invoking proxy mode when they meant to run a
     // CLI subcommand.
     if std::io::stdin().is_terminal() {
-        eprintln!("nevoflux: proxy mode is for browser Native Messaging, not interactive use.");
+        eprintln!(
+            "nevoflux-agent: proxy mode is for browser Native Messaging, not interactive use."
+        );
         eprintln!();
         eprintln!("For CLI usage, try:");
-        eprintln!("  nevoflux --daemon     start the daemon");
-        eprintln!("  nevoflux --mcp        run MCP server");
-        eprintln!("  nevoflux --status     show daemon status");
-        eprintln!("  nevoflux --stop       stop the daemon");
-        eprintln!("  nevoflux --help       full help");
+        eprintln!("  nevoflux-agent --daemon     start the daemon");
+        eprintln!("  nevoflux-agent --mcp        run MCP server");
+        eprintln!("  nevoflux-agent --status     show daemon status");
+        eprintln!("  nevoflux-agent --stop       stop the daemon");
+        eprintln!("  nevoflux-agent --help       full help");
         std::process::exit(2);
     }
 
@@ -773,26 +775,26 @@ async fn run_daemon(
             // Real runner: clone profile → spawn browser → bind → run agent →
             // drain, with taint-gated retry. Falls back to a stub if the daemon
             // context or NEVOFLUX_BROWSER_BIN isn't available yet.
-            let runner: http::queue::Runner =
-                nevoflux_daemon::automation::build_headless_runner(metrics.clone()).unwrap_or_else(
-                    || {
-                        tracing::warn!(
-                            "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
-                        );
-                        Arc::new(|id, _req, _sink, _cancel| {
-                            Box::pin(async move {
-                                http::types::TaskResponse {
-                                    id,
-                                    status: http::types::TaskStatus::Failed,
-                                    attempts: 1,
-                                    output: None,
-                                    error: Some("headless runner context unavailable".into()),
-                                    artifacts: Vec::new(),
-                                }
-                            })
-                        })
-                    },
+            let runner: http::queue::Runner = nevoflux_daemon::automation::build_headless_runner(
+                metrics.clone(),
+            )
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
                 );
+                Arc::new(|id, _req, _sink, _cancel| {
+                    Box::pin(async move {
+                        http::types::TaskResponse {
+                            id,
+                            status: http::types::TaskStatus::Failed,
+                            attempts: 1,
+                            output: None,
+                            error: Some("headless runner context unavailable".into()),
+                            artifacts: Vec::new(),
+                        }
+                    })
+                })
+            });
             let state = http::router::AppState {
                 queue: Arc::new(http::queue::TaskQueue::new(runner)),
                 metrics,
@@ -812,7 +814,10 @@ async fn run_daemon(
             if let Some(addr) = openai_addr {
                 let app = http::router::openai_routes().with_state(state.clone());
                 tokio::spawn(async move {
-                    tracing::info!("OpenAI-compatible API listening on {} (/v1/chat/completions)", addr);
+                    tracing::info!(
+                        "OpenAI-compatible API listening on {} (/v1/chat/completions)",
+                        addr
+                    );
                     if let Err(e) = http::router::serve(addr, app).await {
                         tracing::error!("OpenAI API server error: {}", e);
                     }
@@ -861,7 +866,9 @@ async fn run_daemon(
             eprintln!("--remote-control: this daemon exposed no remote-gateway wiring");
             std::process::exit(2);
         };
-        let Some(browsers) = nevoflux_daemon::registry::CURRENT_BROWSER_REGISTRY.get().cloned()
+        let Some(browsers) = nevoflux_daemon::registry::CURRENT_BROWSER_REGISTRY
+            .get()
+            .cloned()
         else {
             eprintln!("--remote-control: the browser registry was not initialised");
             std::process::exit(2);
@@ -869,7 +876,8 @@ async fn run_daemon(
 
         // The chat path reads these bindings through the same global, which is
         // why it stays unset — and the lookup skipped — on the desktop.
-        let bindings = std::sync::Arc::new(nevoflux_daemon::registry::SessionBrowserBindings::new());
+        let bindings =
+            std::sync::Arc::new(nevoflux_daemon::registry::SessionBrowserBindings::new());
         let _ = nevoflux_daemon::registry::CURRENT_SESSION_BINDINGS.set(bindings.clone());
 
         let deps = nevoflux_daemon::remote::control_service::ServiceDeps {
@@ -972,7 +980,9 @@ fn run_config_show() {
             Ok(entries) => {
                 if entries.is_empty() {
                     println!("No configuration entries found.");
-                    println!("Run 'nevoflux config init' to initialize default configuration.");
+                    println!(
+                        "Run 'nevoflux-agent config init' to initialize default configuration."
+                    );
                 } else {
                     println!("Configuration:");
                     println!("{}", "-".repeat(60));
@@ -1181,8 +1191,8 @@ fn handle_config_command(action: ConfigAction) {
 /// Connect to whichever daemon is running: a manually-started dev daemon
 /// (daemon.port) or a proxy-managed one (daemon-managed.port). Resolves the
 /// data dir the same way the daemon does so NEVOFLUX_DATA_DIR is honored.
-async fn connect_pack_client(
-) -> Result<nevoflux_bridge::DaemonClient, Box<dyn std::error::Error>> {
+async fn connect_pack_client() -> Result<nevoflux_bridge::DaemonClient, Box<dyn std::error::Error>>
+{
     use nevoflux_bridge::{BridgeConfig, ConnectionMode, DaemonClient};
 
     let data_dir = get_data_dir();
@@ -1203,8 +1213,10 @@ async fn connect_pack_client(
         }
     }
     connected.ok_or_else(|| {
-        format!("cannot reach daemon (is it running? start it with `nevoflux --daemon`): {last_err}")
-            .into()
+        format!(
+            "cannot reach daemon (is it running? start it with `nevoflux --daemon`): {last_err}"
+        )
+        .into()
     })
 }
 
@@ -1289,9 +1301,7 @@ async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::erro
         PackAction::Validate { source } => {
             ("pack.validate", serde_json::json!({ "source": source }))
         }
-        PackAction::Inspect { source } => {
-            ("pack.inspect", serde_json::json!({ "source": source }))
-        }
+        PackAction::Inspect { source } => ("pack.inspect", serde_json::json!({ "source": source })),
         PackAction::Install { source, force, .. } => (
             "pack.install",
             serde_json::json!({ "source": source, "force": force, "wait": true }),

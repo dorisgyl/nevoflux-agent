@@ -131,7 +131,7 @@ Browser Extension
        │     - Length-prefixed JSON messages
        │     - stdin/stdout communication
        ▼
-Native Messaging Proxy (nevoflux --native)
+Native Messaging Proxy (nevoflux-agent --native)
        │
        │ (2) Message Translation
        │     - Parse browser message format
@@ -141,7 +141,7 @@ Native Messaging Proxy (nevoflux --native)
        │     - Connect to daemon's ROUTER
        │     - Async request/response
        ▼
-Daemon Server (nevoflux --daemon)
+Daemon Server (nevoflux-agent --daemon)
        │
        │ (4) Response routing
        │     - ROUTER tracks client identity
@@ -166,7 +166,7 @@ Claude Code
        │     - JSON-RPC 2.0 messages
        │     - Tool discovery and invocation
        ▼
-MCP Server (nevoflux --mcp)
+MCP Server (nevoflux-agent --mcp)
        │
        │ (2) Tool Handler
        │     - Map MCP tool calls to agent actions
@@ -176,7 +176,7 @@ MCP Server (nevoflux --mcp)
        │     - Connect to daemon's ROUTER
        │     - Forward requests
        ▼
-Daemon Server (nevoflux --daemon)
+Daemon Server (nevoflux-agent --daemon)
        │
        │ (4) Agent execution
        │     - Process tool request

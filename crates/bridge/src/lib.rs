@@ -2,10 +2,10 @@
 //!
 //! This crate provides two bridge modes:
 //!
-//! 1. **Proxy Mode** (`nevoflux`): Bridges between the browser extension
+//! 1. **Proxy Mode** (`nevoflux-agent`): Bridges between the browser extension
 //!    (via Native Messaging) and the daemon (via TCP).
 //!
-//! 2. **MCP Mode** (`nevoflux --mcp`): Bridges between MCP clients like
+//! 2. **MCP Mode** (`nevoflux-agent --mcp`): Bridges between MCP clients like
 //!    Claude Code (via stdio) and the daemon (via TCP).
 //!
 //! # Architecture
@@ -25,10 +25,10 @@
 //!        │    Length-prefix TCP   │
 //!        └───────────┬───────────┘
 //!                    ▼
-//!          ┌─────────────────┐
-//!          │ nevoflux --daemon│
-//!          │   (Core Daemon) │
-//!          └─────────────────┘
+//!       ┌─────────────────────────┐
+//!       │ nevoflux-agent --daemon │
+//!       │      (Core Daemon)      │
+//!       └─────────────────────────┘
 //! ```
 //!
 //! # Usage

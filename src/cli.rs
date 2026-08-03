@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// NevoFlux Agent - AI-powered browser assistant
 #[derive(Parser, Debug)]
-#[command(name = "nevoflux")]
+#[command(name = "nevoflux-agent")]
 #[command(version)]
 #[command(about = "NevoFlux Agent - AI-powered browser assistant")]
 #[command(

@@ -61,10 +61,10 @@ just clean          # Clean build artifacts
 
 ```bash
 # Linux/macOS
-./install/native-host/setup.sh $(pwd)/target/release/nevoflux YOUR_EXTENSION_ID chrome
+./install/native-host/setup.sh $(pwd)/target/release/nevoflux-agent YOUR_EXTENSION_ID chrome
 
 # Windows (PowerShell as Administrator)
-.\install\native-host\setup.ps1 -BinaryPath "$PWD\target\release\nevoflux.exe" -ExtensionId "YOUR_EXTENSION_ID" -Browser chrome
+.\install\native-host\setup.ps1 -BinaryPath "$PWD\target\release\nevoflux-agent.exe" -ExtensionId "YOUR_EXTENSION_ID" -Browser chrome
 ```
 
 ## Usage
@@ -72,26 +72,26 @@ just clean          # Clean build artifacts
 ### Start Daemon
 
 ```bash
-nevoflux --daemon           # Start daemon
-nevoflux --daemon --verbose # With verbose logging
+nevoflux-agent --daemon           # Start daemon
+nevoflux-agent --daemon --verbose # With verbose logging
 ```
 
 ### Check Status
 
 ```bash
-nevoflux --status
+nevoflux-agent --status
 ```
 
 ### Stop Daemon
 
 ```bash
-nevoflux --stop
+nevoflux-agent --stop
 ```
 
 ### MCP Mode (for Claude Code)
 
 ```bash
-nevoflux --mcp
+nevoflux-agent --mcp
 ```
 
 Add to your Claude Code MCP configuration:
@@ -99,8 +99,8 @@ Add to your Claude Code MCP configuration:
 ```json
 {
   "mcpServers": {
-    "nevoflux": {
-      "command": "/path/to/nevoflux",
+    "nevoflux-agent": {
+      "command": "/path/to/nevoflux-agent",
       "args": ["--mcp"]
     }
   }
@@ -110,12 +110,12 @@ Add to your Claude Code MCP configuration:
 ### Configuration Management
 
 ```bash
-nevoflux config init              # Create default config
-nevoflux config show              # Show current config
-nevoflux config get llm.provider  # Get specific value
-nevoflux config set llm.provider qwen  # Set value
-nevoflux config list daemon.      # List by prefix
-nevoflux config delete key        # Delete value
+nevoflux-agent config init              # Create default config
+nevoflux-agent config show              # Show current config
+nevoflux-agent config get llm.provider  # Get specific value
+nevoflux-agent config set llm.provider qwen  # Set value
+nevoflux-agent config list daemon.      # List by prefix
+nevoflux-agent config delete key        # Delete value
 ```
 
 ### Interactive Setup
@@ -410,8 +410,8 @@ just release
 ### Daemon Issues
 
 ```bash
-nevoflux --status    # Check current status
-nevoflux --stop      # Clean up stale files
+nevoflux-agent --status    # Check current status
+nevoflux-agent --stop      # Clean up stale files
 ```
 
 ### WASM Errors

@@ -24,7 +24,7 @@ fn test_version_output() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::is_match(r"nevoflux \d+\.\d+\.\d+").unwrap());
+        .stdout(predicate::str::is_match(r"nevoflux-agent \d+\.\d+\.\d+").unwrap());
 }
 
 #[test]
