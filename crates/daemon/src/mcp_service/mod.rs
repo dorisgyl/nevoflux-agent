@@ -5,6 +5,7 @@
 //! **every tool in the list can be called**.
 
 pub mod builtin;
+pub mod script;
 pub mod source;
 
 use std::collections::HashSet;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use nevoflux_mcp::ToolDefinition;
 
 pub use builtin::BuiltinSource;
+pub use script::{ReloadReport, ScriptSource, SkipReport};
 pub use source::ToolSource;
 
 /// Lists and dispatches tools across every registered [`ToolSource`].
