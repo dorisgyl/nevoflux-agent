@@ -224,3 +224,57 @@ async fn every_listed_tool_is_reachable() {
     handle.abort();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Deploying one script must not disturb another — the reason single-script
+/// reload exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn reloading_one_script_leaves_the_others_alone() {
+    let dir = tmp_dir("reload_one_e2e");
+    for stem in ["alpha", "beta"] {
+        std::fs::write(
+            dir.join(format!("{stem}.py")),
+            format!(
+                "def describe():\n    return [{{\"name\": \"t\", \"description\": \"t\"}}]\n\
+                 \ndef t(arguments):\n    return \"{stem}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let (scripts, service) = service_over(&dir);
+    scripts.reload().await;
+    let (url, handle) = serve(service).await;
+
+    let transport =
+        nevoflux_mcp::rmcp::transport::StreamableHttpClientTransport::from_uri(url.as_str());
+    let client = ().serve(transport).await.expect("connect");
+
+    std::fs::write(
+        dir.join("alpha.py"),
+        "def describe():\n    return [{\"name\": \"t\", \"description\": \"t\"}, \
+         {\"name\": \"extra\", \"description\": \"e\"}]\n\
+         \ndef t(arguments):\n    return \"alpha\"\n\
+         \ndef extra(arguments):\n    return \"x\"\n",
+    )
+    .unwrap();
+
+    client
+        .call_tool(
+            CallToolRequestParams::new("nevoflux__reload").with_arguments(
+                serde_json::json!({"target": "scripts", "name": "alpha"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("reload one");
+
+    let listed = client.list_tools(Default::default()).await.expect("list");
+    let names: Vec<&str> = listed.tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(names.contains(&"alpha__extra"), "got {names:?}");
+    assert!(names.contains(&"beta__t"), "beta must survive: {names:?}");
+
+    client.cancel().await.ok();
+    handle.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
