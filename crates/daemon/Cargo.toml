@@ -182,6 +182,7 @@ nix = { version = "0.29", features = ["signal", "process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+serial_test = "3"
 tracing-subscriber = { workspace = true }
 nevoflux-testing = { path = "../testing" }
 rusqlite = { workspace = true }

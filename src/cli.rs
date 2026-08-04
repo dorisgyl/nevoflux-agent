@@ -95,6 +95,13 @@ pub struct Cli {
     #[arg(long)]
     pub acp_addr: Option<std::net::SocketAddr>,
 
+    /// Serve the token-protected admin API on this port. e.g. 127.0.0.1:8084
+    ///
+    /// Requires NEVOFLUX_ADMIN_TOKEN; without it the surface is not mounted.
+    /// Keep this on a private interface: it deploys code to the server.
+    #[arg(long)]
+    pub admin_addr: Option<std::net::SocketAddr>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,

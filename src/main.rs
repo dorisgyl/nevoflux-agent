@@ -666,6 +666,7 @@ async fn run_daemon(
     openai_addr: Option<std::net::SocketAddr>,
     mcp_addr: Option<std::net::SocketAddr>,
     acp_addr: Option<std::net::SocketAddr>,
+    admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists first — managed daemons need it for the
     // log file, and SessionManager needs it for the database. This must
@@ -788,7 +789,11 @@ async fn run_daemon(
     }
 
     if headless {
-        if http_addr.is_some() || openai_addr.is_some() || mcp_addr.is_some() || acp_addr.is_some()
+        if http_addr.is_some()
+            || openai_addr.is_some()
+            || mcp_addr.is_some()
+            || acp_addr.is_some()
+            || admin_addr.is_some()
         {
             use nevoflux_daemon::http;
             use std::sync::Arc;
@@ -892,6 +897,25 @@ async fn run_daemon(
                     }
                 });
             }
+            if let Some(addr) = admin_addr {
+                match http::admin::admin_routes(script_source.clone()) {
+                    Some(app) => {
+                        tokio::spawn(async move {
+                            tracing::info!("Admin API listening on {} (/admin/scripts)", addr);
+                            if let Err(e) = http::router::serve(addr, app).await {
+                                tracing::error!("admin server error: {}", e);
+                            }
+                        });
+                    }
+                    // Refusing to start is the point: an unauthenticated
+                    // endpoint that writes executable code to the server is
+                    // worse than no endpoint.
+                    None => tracing::warn!(
+                        "--admin-addr given but NEVOFLUX_ADMIN_TOKEN is unset; \
+                         admin API not started"
+                    ),
+                }
+            }
             if let Some(addr) = acp_addr {
                 let app = http::rpc::acp_routes().with_state(state.clone());
                 tokio::spawn(async move {
@@ -906,7 +930,8 @@ async fn run_daemon(
             // reason to run headless. With --remote-control the absence of one
             // is the design, not an oversight.
             tracing::warn!(
-                "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr: no API served"
+                "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr/--admin-addr: \
+                 no API served"
             );
         }
     }
@@ -1580,6 +1605,7 @@ async fn main() {
             cli.openai_addr,
             cli.mcp_addr,
             cli.acp_addr,
+            cli.admin_addr,
         )
         .await
         {

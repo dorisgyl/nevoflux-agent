@@ -75,6 +75,15 @@ impl<B: McpServerBackend> NevofluxServer<B> {
         self.instructions = Some(instructions.into());
         self
     }
+
+    /// Whether calling `name` can change the tool list, and so warrants
+    /// checking for a `tools/list_changed` notification afterwards.
+    ///
+    /// Only reload-shaped tools qualify; re-listing after every tool call
+    /// would double the work for no benefit.
+    fn notifies_list_changed(&self, name: &str) -> bool {
+        name == "nevoflux__reload"
+    }
 }
 
 /// Convert our tool definition into rmcp's wire type.
@@ -88,10 +97,18 @@ fn to_rmcp_tool(def: &ToolDefinition) -> Tool {
 
 impl<B: McpServerBackend> ServerHandler for NevofluxServer<B> {
     fn get_info(&self) -> ServerInfo {
-        let mut info =
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-                Implementation::new(self.name.to_string(), self.version.to_string()),
-            );
+        // `list_changed` matters here: the tool list is not static. A backend
+        // can gain or lose tools while clients are connected (a script gets
+        // deployed, a reload runs), so a client must know the copy it cached
+        // can go stale.
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if let Some(tools) = capabilities.tools.as_mut() {
+            tools.list_changed = Some(true);
+        }
+        let mut info = ServerInfo::new(capabilities).with_server_info(Implementation::new(
+            self.name.to_string(),
+            self.version.to_string(),
+        ));
         if let Some(ref instructions) = self.instructions {
             info = info.with_instructions(instructions.clone());
         }
@@ -118,14 +135,35 @@ impl<B: McpServerBackend> ServerHandler for NevofluxServer<B> {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = request
             .arguments
             .map(serde_json::Value::Object)
             .unwrap_or_else(|| serde_json::json!({}));
 
-        let result = match self.backend.call_tool(&request.name, arguments).await {
+        let before = if self.notifies_list_changed(&request.name) {
+            Some(self.backend.list_tools().await.unwrap_or_default().len())
+        } else {
+            None
+        };
+
+        let outcome = self.backend.call_tool(&request.name, arguments).await;
+
+        // A tool whose whole job is to change what is available has to say so:
+        // the client is holding a list that may no longer be true. Compare
+        // rather than assume — a reload that changed nothing should not make
+        // every client re-fetch.
+        if let (Some(before), Ok(_)) = (before, &outcome) {
+            let after = self.backend.list_tools().await.unwrap_or_default().len();
+            if after != before {
+                if let Err(e) = context.peer.notify_tool_list_changed().await {
+                    tracing::debug!(error = %e, "client did not accept tools/list_changed");
+                }
+            }
+        }
+
+        let result = match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         };
@@ -199,6 +237,23 @@ mod tests {
             info.protocol_version,
             rmcp::model::ProtocolVersion::V_2024_11_05
         );
+    }
+
+    /// Reloading changes the tool list, so clients must be told they can no
+    /// longer trust the copy they cached.
+    #[test]
+    fn info_declares_tool_list_changed() {
+        let info = server().get_info();
+        let tools = info.capabilities.tools.expect("tools capability");
+        assert_eq!(tools.list_changed, Some(true));
+    }
+
+    #[test]
+    fn only_reload_shaped_tools_trigger_a_list_recheck() {
+        let s = server();
+        assert!(s.notifies_list_changed("nevoflux__reload"));
+        assert!(!s.notifies_list_changed("echo"));
+        assert!(!s.notifies_list_changed("nevoflux__list_scripts"));
     }
 
     #[test]
