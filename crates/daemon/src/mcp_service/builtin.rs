@@ -86,37 +86,59 @@ fn needs_browser(name: &str) -> bool {
     name.starts_with("browser_")
 }
 
+/// The catalogue this source advertises.
+///
+/// `browser_tools` is false when no persistent browser can exist (headless
+/// without `NEVOFLUX_SESSION_MODE=1`). `browser_*` needs the browser to survive
+/// between calls, so listing them there would have clients plan around tools
+/// that can only fail — worse than not offering them at all.
+pub(crate) fn advertised_catalogue(browser_tools: bool) -> Vec<ToolDefinition> {
+    let (kept, dropped): (Vec<_>, Vec<_>) = nevoflux_mcp::create_tools()
+        .into_iter()
+        .filter(|t| browser_tools || !needs_browser(&t.name))
+        .partition(|t| resolve_executor_name(&t.name).is_some());
+    if !dropped.is_empty() {
+        tracing::debug!(
+            dropped = ?dropped.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "MCP catalogue entries without an executor are not advertised"
+        );
+    }
+    kept
+}
+
 /// Executes MCP tool calls against the daemon's own tool implementations.
 pub struct BuiltinSource {
     services: HostServices,
     browsers: Arc<BrowserRegistry>,
     tool_bridge: Arc<McpToolBridge>,
+    browser_tools: bool,
 }
 
 impl BuiltinSource {
     /// Build a source over the daemon's host services and browser registry.
+    ///
+    /// Browser tools are advertised by default: the stdio front-end talks to a
+    /// long-lived daemon whose browser comes from the extension.
     pub fn new(services: HostServices, browsers: Arc<BrowserRegistry>) -> Self {
         Self {
             services,
             browsers,
             tool_bridge: Arc::new(McpToolBridge::new()),
+            browser_tools: true,
         }
+    }
+
+    /// Hide `browser_*` when no persistent browser can exist.
+    pub fn with_browser_tools(mut self, enabled: bool) -> Self {
+        self.browser_tools = enabled;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl ToolSource for BuiltinSource {
     fn tools(&self) -> Vec<ToolDefinition> {
-        let (kept, dropped): (Vec<_>, Vec<_>) = nevoflux_mcp::create_tools()
-            .into_iter()
-            .partition(|t| resolve_executor_name(&t.name).is_some());
-        if !dropped.is_empty() {
-            tracing::debug!(
-                dropped = ?dropped.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-                "MCP catalogue entries without an executor are not advertised"
-            );
-        }
-        kept
+        advertised_catalogue(self.browser_tools)
     }
 
     async fn call(&self, name: &str, arguments: &serde_json::Value) -> Result<String, String> {
@@ -225,6 +247,28 @@ mod tests {
             !advertised.contains(&"agent_chat"),
             "agent_chat has no executor and must not be advertised"
         );
+    }
+
+    fn advertised_names(browser_tools: bool) -> Vec<String> {
+        advertised_catalogue(browser_tools)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    /// Browser tools need a live browser across calls; advertising them when
+    /// none can exist would have clients plan around tools that always fail.
+    #[test]
+    fn browser_tools_are_hidden_when_they_cannot_work() {
+        assert!(!advertised_names(false)
+            .iter()
+            .any(|n| n.starts_with("browser_")));
+        assert!(advertised_names(false)
+            .iter()
+            .any(|n| n.starts_with("computer_")));
+        assert!(advertised_names(true)
+            .iter()
+            .any(|n| n.starts_with("browser_")));
     }
 
     #[test]

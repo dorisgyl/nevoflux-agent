@@ -5,8 +5,10 @@
 //! **every tool in the list can be called**.
 
 pub mod builtin;
+pub mod meta;
 pub mod script;
 pub mod source;
+pub mod task;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,8 +16,10 @@ use std::sync::Arc;
 use nevoflux_mcp::ToolDefinition;
 
 pub use builtin::BuiltinSource;
+pub use meta::MetaSource;
 pub use script::{ReloadReport, ScriptSource, SkipReport};
 pub use source::ToolSource;
+pub use task::TaskSource;
 
 /// Lists and dispatches tools across every registered [`ToolSource`].
 #[derive(Clone)]
@@ -62,6 +66,17 @@ impl McpService {
             }
         }
         Err(format!("Unknown tool: {name}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl nevoflux_mcp::McpServerBackend for McpService {
+    async fn list_tools(&self) -> Result<Vec<ToolDefinition>, String> {
+        Ok(self.tools())
+    }
+
+    async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> Result<String, String> {
+        McpService::call_tool(self, name, &arguments).await
     }
 }
 

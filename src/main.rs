@@ -844,8 +844,47 @@ async fn run_daemon(
                     }
                 });
             }
+            // One ScriptSource shared by the MCP endpoint and the admin API:
+            // the admin API reloads it after a write, and `/mcp` must see that
+            // same snapshot. Two instances would deploy into a void.
+            let script_source = nevoflux_daemon::mcp_service::ScriptSource::from_env();
+            script_source.reload().await;
+
             if let Some(addr) = mcp_addr {
-                let app = http::rpc::mcp_routes(state.clone());
+                use nevoflux_daemon::mcp_service::ToolSource;
+                // `browser_*` needs the browser to survive between calls, which
+                // only session mode provides; without it they are not offered
+                // rather than offered-and-broken.
+                let session_mode = std::env::var("NEVOFLUX_SESSION_MODE").as_deref() == Ok("1");
+                let mut sources: Vec<std::sync::Arc<dyn ToolSource>> = vec![std::sync::Arc::new(
+                    nevoflux_daemon::mcp_service::TaskSource::new(state.clone()),
+                )];
+                match (
+                    nevoflux_daemon::automation::CURRENT_SERVICES_TEMPLATE.get(),
+                    nevoflux_daemon::registry::CURRENT_BROWSER_REGISTRY.get(),
+                ) {
+                    (Some(services), Some(browsers)) => {
+                        sources.push(std::sync::Arc::new(
+                            nevoflux_daemon::mcp_service::BuiltinSource::new(
+                                services.clone(),
+                                browsers.clone(),
+                            )
+                            .with_browser_tools(session_mode),
+                        ));
+                    }
+                    _ => tracing::warn!(
+                        "daemon context not ready; serving /mcp without built-in browser \
+                         and computer tools"
+                    ),
+                }
+                sources.push(script_source.clone());
+                sources.push(std::sync::Arc::new(
+                    nevoflux_daemon::mcp_service::MetaSource::new(script_source.clone()),
+                ));
+                let service = std::sync::Arc::new(
+                    nevoflux_daemon::mcp_service::McpService::with_sources(sources),
+                );
+                let app = http::rpc::mcp_routes(service);
                 tokio::spawn(async move {
                     tracing::info!("MCP-over-HTTP listening on {} (POST /mcp)", addr);
                     if let Err(e) = http::router::serve(addr, app).await {

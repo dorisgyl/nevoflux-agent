@@ -72,6 +72,21 @@ impl SessionHolder {
             inner: Arc::new(Mutex::new(None)),
         })
     }
+
+    /// Drop the reused browser so the next task re-clones from its base
+    /// profile.
+    ///
+    /// Deliberately does not save: a reload means "pick up the new base", not
+    /// "persist what the old session did". Callers wanting a save should use
+    /// the `/session/close` handler, which takes that as a parameter.
+    ///
+    /// The mutex serialises against task execution, so this waits for an
+    /// in-flight task rather than pulling the browser out from under it.
+    pub async fn close_for_reload(&self) -> serde_json::Value {
+        let mut guard = self.inner.lock().await;
+        let had = guard.take().is_some();
+        serde_json::json!({ "closed": had })
+    }
 }
 
 /// Tear the live session down (if any) and clear the slot: reap the child, kill
