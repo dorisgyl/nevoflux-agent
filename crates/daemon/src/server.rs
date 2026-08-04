@@ -4449,10 +4449,13 @@ pub async fn start_server(
                 }
                 RouteDecision::ProcessMcp { .. } => {
                     // Handle MCP messages
-                    let service = crate::mcp_service::McpService::new(
-                        process_services.clone(),
-                        process_available_browsers.clone(),
-                    );
+                    let service =
+                        crate::mcp_service::McpService::with_sources(vec![std::sync::Arc::new(
+                            crate::mcp_service::BuiltinSource::new(
+                                process_services.clone(),
+                                process_available_browsers.clone(),
+                            ),
+                        )]);
                     let response_payload = handle_mcp_message(&envelope.payload, &service).await;
                     let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
                         .with_request_id(&request_id);
@@ -13766,10 +13769,12 @@ mod tests {
     // paths a client can actually trigger.
 
     fn test_mcp_service() -> crate::mcp_service::McpService {
-        crate::mcp_service::McpService::new(
-            HostServices::new(Arc::new(schedule_test_db())),
-            Arc::new(crate::registry::BrowserRegistry::new()),
-        )
+        crate::mcp_service::McpService::with_sources(vec![Arc::new(
+            crate::mcp_service::BuiltinSource::new(
+                HostServices::new(Arc::new(schedule_test_db())),
+                Arc::new(crate::registry::BrowserRegistry::new()),
+            ),
+        )])
     }
 
     /// Wrap a JSON-RPC message the way the stdio front-end does.

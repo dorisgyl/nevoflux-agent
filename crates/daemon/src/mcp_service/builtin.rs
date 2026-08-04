@@ -1,8 +1,4 @@
-//! Daemon-side execution for MCP `tools/list` and `tools/call`.
-//!
-//! Every MCP front-end the daemon exposes reduces to the same two questions:
-//! *which tools are there* and *run this one*. This module answers both once,
-//! so a front-end only has to speak its transport.
+//! Built-in browser and computer tools, executed by the daemon itself.
 //!
 //! # Why the catalogue is filtered
 //!
@@ -11,15 +7,17 @@
 //! [`crate::wasm::mcp_tool_executor::execute_mcp_tool`], whose dispatch table
 //! grew separately and does not cover the catalogue one-for-one: a few computer
 //! tools are spelled differently there, and a few have no implementation at all.
-//! [`McpService::tools`] therefore advertises only what [`McpService::call_tool`]
-//! can dispatch — an MCP client that lists a tool can always call it. Names that
-//! drop out are logged rather than silently vanishing.
+//! [`BuiltinSource::tools`] therefore advertises only what
+//! [`BuiltinSource::call`] can dispatch — an MCP client that lists a tool can
+//! always call it. Names that drop out are logged rather than silently
+//! vanishing.
 
 use std::sync::Arc;
 
 use nevoflux_llm::providers::acp::mcp_bridge::McpToolBridge;
 use nevoflux_mcp::ToolDefinition;
 
+use crate::mcp_service::source::ToolSource;
 use crate::registry::BrowserRegistry;
 use crate::wasm::services::HostServices;
 
@@ -89,18 +87,14 @@ fn needs_browser(name: &str) -> bool {
 }
 
 /// Executes MCP tool calls against the daemon's own tool implementations.
-///
-/// Cloneable: front-ends hold one per connection, all sharing the same
-/// [`HostServices`].
-#[derive(Clone)]
-pub struct McpService {
+pub struct BuiltinSource {
     services: HostServices,
     browsers: Arc<BrowserRegistry>,
     tool_bridge: Arc<McpToolBridge>,
 }
 
-impl McpService {
-    /// Build a service over the daemon's host services and browser registry.
+impl BuiltinSource {
+    /// Build a source over the daemon's host services and browser registry.
     pub fn new(services: HostServices, browsers: Arc<BrowserRegistry>) -> Self {
         Self {
             services,
@@ -108,10 +102,11 @@ impl McpService {
             tool_bridge: Arc::new(McpToolBridge::new()),
         }
     }
+}
 
-    /// Tools this daemon advertises, i.e. the catalogue restricted to entries
-    /// [`Self::call_tool`] can dispatch.
-    pub fn tools(&self) -> Vec<ToolDefinition> {
+#[async_trait::async_trait]
+impl ToolSource for BuiltinSource {
+    fn tools(&self) -> Vec<ToolDefinition> {
         let (kept, dropped): (Vec<_>, Vec<_>) = nevoflux_mcp::create_tools()
             .into_iter()
             .partition(|t| resolve_executor_name(&t.name).is_some());
@@ -124,15 +119,7 @@ impl McpService {
         kept
     }
 
-    /// Run one tool and return its textual result.
-    ///
-    /// `Err` is a tool-level failure the caller should surface to its client
-    /// (rendered as `isError: true`), not a transport fault.
-    pub async fn call_tool(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<String, String> {
+    async fn call(&self, name: &str, arguments: &serde_json::Value) -> Result<String, String> {
         let Some(executor_name) = resolve_executor_name(name) else {
             return Err(format!("Unknown tool: {name}"));
         };
