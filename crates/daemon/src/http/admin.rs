@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 
@@ -82,8 +82,10 @@ pub fn admin_routes(scripts: Arc<ScriptSource>) -> Option<Router> {
             .route("/admin/scripts", get(list_scripts))
             .route(
                 "/admin/scripts/:name",
-                put(put_script).delete(delete_script),
+                put(put_script).delete(delete_script).get(get_script),
             )
+            .route("/admin/scripts/:name/validate", post(validate_script))
+            .route("/admin/reload", post(reload))
             .with_state(AdminState { scripts, token }),
     )
 }
@@ -109,6 +111,96 @@ async fn list_scripts(State(s): State<AdminState>, headers: HeaderMap) -> impl I
         "skipped": snapshot.skipped,
     }))
     .into_response()
+}
+
+/// Return a deployed script's source verbatim.
+///
+/// The deploy loop needs this: an agent that wrote a script, got an error
+/// back, and wants to fix it has to read what is actually on the server rather
+/// than trust its own memory of what it sent.
+async fn get_script(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    if let Err(e) = validate_script_name(&name) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    for dir in s.scripts.dirs() {
+        if let Ok(code) = std::fs::read_to_string(dir.join(format!("{name}.py"))) {
+            return (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                code,
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "no such script").into_response()
+}
+
+/// Report what a script would export, without deploying it.
+///
+/// Returns the same shape as `PUT` so a caller needs one parser for both. A
+/// script that fails to declare itself comes back 200 with a reason, not 4xx:
+/// the source is the *content* being validated, and a 4xx would conflate
+/// "your script is broken" with "your request is broken".
+async fn validate_script(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: String,
+) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    if let Err(e) = validate_script_name(&name) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    match crate::mcp_service::script::run_describe(&body, &name).await {
+        Ok(value) => {
+            let (tools, skipped) = crate::mcp_service::script::parse_describe_output(&name, &value);
+            Json(serde_json::json!({
+                "name": name,
+                "tools": tools.iter().map(|t| t.full_name.clone()).collect::<Vec<_>>(),
+                "skipped": skipped,
+            }))
+            .into_response()
+        }
+        Err(reason) => Json(serde_json::json!({
+            "name": name,
+            "tools": [],
+            "skipped": [{ "path": format!("{name}.py"), "reason": reason }],
+        }))
+        .into_response(),
+    }
+}
+
+/// Reload without an MCP client — for operators and CI.
+async fn reload(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    let target = match crate::mcp_service::meta::ReloadTarget::parse(
+        body.get("target")
+            .and_then(|t| t.as_str())
+            .unwrap_or("scripts"),
+        body.get("name").and_then(|n| n.as_str()),
+    ) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let out = crate::mcp_service::meta::run_reload(&s.scripts, &target).await;
+    Json(serde_json::Value::Object(out)).into_response()
 }
 
 async fn put_script(
@@ -249,6 +341,28 @@ mod tests {
             Some(v) => std::env::set_var("NEVOFLUX_ADMIN_TOKEN", v),
             None => std::env::remove_var("NEVOFLUX_ADMIN_TOKEN"),
         }
+    }
+
+    /// Validation reports what a script *would* export, without writing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_reports_tools_without_writing() {
+        use crate::mcp_service::script::{parse_describe_output, run_describe};
+        let code = "def describe():\n    return [{\"name\": \"t\", \"description\": \"d\"}]\n";
+        let value = run_describe(code, "demo").await.unwrap();
+        let (tools, skipped) = parse_describe_output("demo", &value);
+        assert_eq!(tools[0].full_name, "demo__t");
+        assert!(skipped.is_empty());
+    }
+
+    /// A script that raises is content that failed validation, not a bad
+    /// request — so it comes back with a reason, same shape as PUT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_surfaces_a_failing_describe_as_a_reason() {
+        let err =
+            crate::mcp_service::script::run_describe("def describe():\n    return nope\n", "demo")
+                .await
+                .unwrap_err();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]
