@@ -7,6 +7,8 @@
 //! sharing a base share only what that base already implies (login + tenant
 //! brain), and never pollute the base.
 
+pub mod filter;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,47 +88,46 @@ impl ProfileManager {
 
 /// Recursively copy `src` into `dst` (dirs + files).
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
+    copy_tree(src, dst, Path::new(""), false)
 }
 
-/// Like `copy_dir_all`, but at the profile ROOT it (a) skips Firefox lock files
-/// (`lock`, `.parentlock`) so a stale lock never poisons the base, and (b) strips
-/// the injected `nevoflux.headless.automation` pref from `user.js` so the base
-/// stays a clean human-login profile (it is re-injected per clone). Subdirectories
-/// are copied verbatim.
+/// Like [`copy_dir_all`], but strips the injected
+/// `nevoflux.headless.automation` pref from `user.js` so a saved base stays a
+/// clean human-login profile (it is re-injected per clone).
 fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_tree(src, dst, Path::new(""), true)
+}
+
+/// Copy `src` into `dst`, skipping anything [`filter::should_copy`] rejects.
+///
+/// `rel` is the path relative to the profile root, which the filter needs in
+/// order to tell `storage/default/` (login state) from `storage/temporary/`
+/// (evictable). Firefox lock files are excluded by the filter rather than
+/// special-cased here.
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    strip_automation_pref: bool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str == "lock" || name_str == ".parentlock" {
+        let entry_rel = rel.join(&name);
+        if !filter::should_copy(&entry_rel) {
             continue;
         }
-        let ty = entry.file_type()?;
         let target = dst.join(&name);
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else if name_str == "user.js" {
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target, &entry_rel, strip_automation_pref)?;
+        } else if strip_automation_pref && name.to_string_lossy() == "user.js" {
             let contents = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            let mut filtered = String::new();
-            for line in contents.lines() {
-                if !line.contains("nevoflux.headless.automation") {
-                    filtered.push_str(line);
-                    filtered.push('\n');
-                }
-            }
+            let filtered: String = contents
+                .lines()
+                .filter(|l| !l.contains("nevoflux.headless.automation"))
+                .map(|l| format!("{l}\n"))
+                .collect();
             std::fs::write(&target, filtered)?;
         } else {
             std::fs::copy(entry.path(), target)?;
@@ -138,6 +139,34 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the filter: a task's clone must not carry the
+    /// ~125 MB of regenerable bulk a real profile accumulates.
+    #[test]
+    fn clone_skips_regenerable_bulk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base-profiles/acme");
+        std::fs::create_dir_all(base.join("security_state")).unwrap();
+        std::fs::create_dir_all(base.join("storage/default/site")).unwrap();
+        std::fs::create_dir_all(base.join("storage/temporary/site")).unwrap();
+        std::fs::write(base.join("cookies.sqlite"), b"x").unwrap();
+        std::fs::write(base.join("places.sqlite"), b"x").unwrap();
+        std::fs::write(base.join("security_state/data.bin"), b"x").unwrap();
+        std::fs::write(base.join("storage/default/site/idb"), b"x").unwrap();
+        std::fs::write(base.join("storage/temporary/site/junk"), b"x").unwrap();
+
+        let pm = ProfileManager {
+            base_dir: tmp.path().join("base-profiles"),
+            work_dir: tmp.path().join("work"),
+        };
+        let clone = pm.clone_base("acme").unwrap();
+
+        assert!(clone.join("cookies.sqlite").exists());
+        assert!(clone.join("storage/default/site/idb").exists());
+        assert!(!clone.join("places.sqlite").exists());
+        assert!(!clone.join("security_state").exists());
+        assert!(!clone.join("storage/temporary").exists());
+    }
 
     #[test]
     fn clone_copies_base_contents() {
