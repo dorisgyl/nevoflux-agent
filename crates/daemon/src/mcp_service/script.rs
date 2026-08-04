@@ -374,6 +374,72 @@ impl ScriptSource {
         *self.snapshot.write().unwrap() = Arc::new(next);
         report
     }
+
+    /// Rescan a single script and splice the result into the snapshot.
+    ///
+    /// Everything belonging to another stem is carried over untouched, so
+    /// deploying one script does not pay to re-run every other script's
+    /// `describe()`. A stem whose file is gone simply loses its tools — that
+    /// is how a delete takes effect.
+    pub async fn reload_one(&self, stem: &str) -> ReloadReport {
+        let current = self.snapshot();
+        let marker = format!("{stem}.py");
+        let mut tools: Vec<ScriptTool> = current
+            .tools
+            .iter()
+            .filter(|t| t.stem != stem)
+            .cloned()
+            .collect();
+        let mut skipped: Vec<SkipReport> = current
+            .skipped
+            .iter()
+            .filter(|s| !s.path.ends_with(&marker))
+            .cloned()
+            .collect();
+
+        for dir in &self.dirs {
+            let path = dir.join(&marker);
+            if !path.is_file() {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(code) => match run_describe(&code, stem).await {
+                    Ok(value) => {
+                        let (mut fresh, mut fresh_skips) = parse_describe_output(stem, &value);
+                        for tool in &mut fresh {
+                            tool.source_path = path.clone();
+                        }
+                        for skip in &mut fresh_skips {
+                            skip.path = path.display().to_string();
+                        }
+                        tools.append(&mut fresh);
+                        skipped.append(&mut fresh_skips);
+                    }
+                    Err(reason) => skipped.push(SkipReport {
+                        path: path.display().to_string(),
+                        reason,
+                    }),
+                },
+                Err(e) => skipped.push(SkipReport {
+                    path: path.display().to_string(),
+                    reason: format!("cannot read script: {e}"),
+                }),
+            }
+            // Earlier directories win, same as a full scan.
+            break;
+        }
+
+        for skip in &skipped {
+            tracing::warn!(path = %skip.path, reason = %skip.reason, "script tool skipped");
+        }
+        let report = ReloadReport {
+            loaded: tools.len(),
+            skipped: skipped.clone(),
+            error: None,
+        };
+        *self.snapshot.write().unwrap() = Arc::new(Snapshot { tools, skipped });
+        report
+    }
 }
 
 #[async_trait::async_trait]
@@ -700,6 +766,56 @@ mod tests {
         let report = src.reload().await;
         assert_eq!(report.loaded, 1);
         assert_eq!(src.tools().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_one_touches_only_its_own_stem() {
+        let dir = tmp_dir("reload_one");
+        for stem in ["a", "b"] {
+            std::fs::write(
+                dir.join(format!("{stem}.py")),
+                "def describe():\n    return [{\"name\": \"t\", \"description\": \"t\"}]\n",
+            )
+            .unwrap();
+        }
+        let src = ScriptSource::new(vec![dir.clone()]);
+        src.reload().await;
+        assert_eq!(src.tools().len(), 2);
+
+        std::fs::write(
+            dir.join("a.py"),
+            "def describe():\n    return [{\"name\": \"t\", \"description\": \"t\"}, \
+             {\"name\": \"u\", \"description\": \"u\"}]\n",
+        )
+        .unwrap();
+        let report = src.reload_one("a").await;
+        assert_eq!(report.loaded, 3, "a now exports two tools, b still one");
+
+        let names: Vec<String> = src.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.contains(&"a__t".to_string()));
+        assert!(names.contains(&"a__u".to_string()));
+        assert!(names.contains(&"b__t".to_string()), "b must be untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reloading a name whose file is gone is how a delete takes effect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_one_on_a_missing_file_removes_its_tools() {
+        let dir = tmp_dir("reload_one_gone");
+        std::fs::write(
+            dir.join("a.py"),
+            "def describe():\n    return [{\"name\": \"t\", \"description\": \"t\"}]\n",
+        )
+        .unwrap();
+        let src = ScriptSource::new(vec![dir.clone()]);
+        src.reload().await;
+        assert_eq!(src.tools().len(), 1);
+
+        std::fs::remove_file(dir.join("a.py")).unwrap();
+        let report = src.reload_one("a").await;
+        assert_eq!(report.loaded, 0);
+        assert!(src.tools().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
