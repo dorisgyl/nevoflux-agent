@@ -7,6 +7,7 @@
 //! sharing a base share only what that base already implies (login + tenant
 //! brain), and never pollute the base.
 
+pub mod archive;
 pub mod filter;
 
 use std::path::{Path, PathBuf};
