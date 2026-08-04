@@ -5,6 +5,7 @@
 //! Without `NEVOFLUX_ADMIN_TOKEN` the routes are not mounted at all — an
 //! unauthenticated code-upload endpoint is worse than no endpoint.
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -72,22 +73,204 @@ pub fn token_matches(expected: &str, header: Option<&str>) -> bool {
 struct AdminState {
     scripts: Arc<ScriptSource>,
     token: String,
+    /// Where base profiles live; same source as the headless task runner.
+    base_dir: PathBuf,
+}
+
+/// Whether the profile export endpoint is mounted.
+///
+/// Off unless explicitly enabled: exporting ships `key4.db` and `logins.json`
+/// — the saved passwords — which is a different order of sensitivity from
+/// listing or deploying a script. The admin token alone is not the right bar.
+pub fn profile_export_enabled() -> bool {
+    std::env::var("NEVOFLUX_PROFILE_EXPORT").as_deref() == Ok("1")
+}
+
+/// Directory holding base profiles, matching the headless runner's default.
+fn base_profiles_dir() -> PathBuf {
+    std::env::var("NEVOFLUX_BASE_PROFILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/base-profiles"))
 }
 
 /// Admin routes, or `None` when no token is configured.
 pub fn admin_routes(scripts: Arc<ScriptSource>) -> Option<Router> {
     let token = admin_token()?;
-    Some(
-        Router::new()
-            .route("/admin/scripts", get(list_scripts))
-            .route(
-                "/admin/scripts/:name",
-                put(put_script).delete(delete_script).get(get_script),
-            )
-            .route("/admin/scripts/:name/validate", post(validate_script))
-            .route("/admin/reload", post(reload))
-            .with_state(AdminState { scripts, token }),
-    )
+    let mut router = Router::new()
+        .route("/admin/scripts", get(list_scripts))
+        .route(
+            "/admin/scripts/:name",
+            put(put_script).delete(delete_script).get(get_script),
+        )
+        .route("/admin/scripts/:name/validate", post(validate_script))
+        .route("/admin/reload", post(reload))
+        .route("/admin/profiles", get(list_profiles))
+        .route(
+            "/admin/profiles/:name",
+            put(put_profile).delete(delete_profile),
+        );
+    if profile_export_enabled() {
+        router = router.route("/admin/profiles/:name/export", get(export_profile));
+    }
+    Some(router.with_state(AdminState {
+        scripts,
+        token,
+        base_dir: base_profiles_dir(),
+    }))
+}
+
+/// Total bytes under `dir`, best effort.
+fn dir_size(dir: &FsPath) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+        })
+        .sum()
+}
+
+async fn list_profiles(State(s): State<AdminState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    let mut profiles = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&s.base_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip the in-flight `.<name>.incoming` / `.<name>.old` staging
+            // directories a concurrent upload may be using.
+            if name.starts_with('.') || !entry.path().is_dir() {
+                continue;
+            }
+            profiles.push(serde_json::json!({
+                "name": name,
+                "bytes": dir_size(&entry.path()),
+            }));
+        }
+    }
+    Json(serde_json::json!({
+        "directory": s.base_dir.display().to_string(),
+        "profiles": profiles,
+        "export_enabled": profile_export_enabled(),
+    }))
+    .into_response()
+}
+
+/// Replace a base profile with an uploaded tar.gz.
+async fn put_profile(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use crate::profile::archive::{unpack, Limits, UnpackError};
+
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    if let Err(e) = validate_script_name(&name) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    if let Err(e) = std::fs::create_dir_all(&s.base_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
+    }
+
+    // Unpack beside the target so the swap is a rename: `base_dir/<name>` is
+    // either the whole old profile or the whole new one, never half of
+    // either, and a task cloning right now cannot catch it mid-swap.
+    let incoming = s.base_dir.join(format!(".{name}.incoming"));
+    let old = s.base_dir.join(format!(".{name}.old"));
+    let final_path = s.base_dir.join(&name);
+    let _ = std::fs::remove_dir_all(&incoming);
+
+    let report = match unpack(&body, &incoming, Limits::default()) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&incoming);
+            let code = match e {
+                UnpackError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                UnpackError::PathTraversal(_) => StatusCode::BAD_REQUEST,
+                UnpackError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (code, format!("{e}")).into_response();
+        }
+    };
+
+    let _ = std::fs::remove_dir_all(&old);
+    if final_path.exists() && std::fs::rename(&final_path, &old).is_err() {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not move the existing profile aside",
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::rename(&incoming, &final_path) {
+        // Put the old one back rather than leaving nothing behind.
+        let _ = std::fs::rename(&old, &final_path);
+        let _ = std::fs::remove_dir_all(&incoming);
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
+    }
+    let _ = std::fs::remove_dir_all(&old);
+
+    Json(serde_json::json!({
+        "name": name,
+        "written": report.written,
+        "skipped": report.skipped,
+    }))
+    .into_response()
+}
+
+/// Download a base profile as a filtered tar.gz. Mounted only when
+/// `NEVOFLUX_PROFILE_EXPORT=1`; see [`profile_export_enabled`].
+async fn export_profile(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    if let Err(e) = validate_script_name(&name) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let dir = s.base_dir.join(&name);
+    if !dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "no such profile").into_response();
+    }
+    match crate::profile::archive::pack(&dir) {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/gzip")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn delete_profile(
+    State(s): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if !authorized(&s, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response();
+    }
+    if let Err(e) = validate_script_name(&name) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let dir = s.base_dir.join(&name);
+    if !dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "no such profile").into_response();
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Json(serde_json::json!({ "name": name, "removed": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
 }
 
 fn authorized(state: &AdminState, headers: &HeaderMap) -> bool {
@@ -363,6 +546,24 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    /// The export endpoint ships key4.db and logins.json — saved passwords —
+    /// so it needs its own opt-in beyond the admin token.
+    #[test]
+    #[serial]
+    fn profile_export_is_off_by_default() {
+        let prev = std::env::var("NEVOFLUX_PROFILE_EXPORT").ok();
+        std::env::remove_var("NEVOFLUX_PROFILE_EXPORT");
+        assert!(!profile_export_enabled());
+        std::env::set_var("NEVOFLUX_PROFILE_EXPORT", "1");
+        assert!(profile_export_enabled());
+        std::env::set_var("NEVOFLUX_PROFILE_EXPORT", "0");
+        assert!(!profile_export_enabled(), "only '1' opts in");
+        match prev {
+            Some(v) => std::env::set_var("NEVOFLUX_PROFILE_EXPORT", v),
+            None => std::env::remove_var("NEVOFLUX_PROFILE_EXPORT"),
+        }
     }
 
     #[test]
