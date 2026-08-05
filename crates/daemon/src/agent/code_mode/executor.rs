@@ -1568,6 +1568,73 @@ mod tests {
         assert!(fixed.contains("x = 1 + 2"));
     }
 
+    /// `re` and `datetime` must work with **no tools at all**.
+    ///
+    /// This is the /loop case. Those modules used to be rewritten into
+    /// `run_command` + python3, and `AutomationPolicy` drops `run_command`
+    /// whenever `allow_shell` is false — the headless default. So an
+    /// unattended iteration that called `re.findall` was calling a tool it
+    /// had been denied, and nobody was watching to report it. Passing no
+    /// external names here reproduces exactly that catalogue.
+    #[tokio::test]
+    async fn test_re_and_datetime_work_without_any_tools() {
+        for code in [
+            "import re\nprint(re.findall(r'\\d+', 'a1b22')[1])",
+            "import datetime\nprint(datetime.datetime(2026, 1, 2).year)",
+        ] {
+            let result = CodeModeExecutor::new()
+                .execute(
+                    code,
+                    &[],
+                    |name, _args| {
+                        let name = name.to_string();
+                        Box::pin(async move { Err(format!("no tools available: {name}")) })
+                    },
+                    |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+                )
+                .await;
+            assert!(
+                result.success,
+                "{code:?} must run without tools, got: {:?}",
+                result.error
+            );
+            assert!(
+                result.tool_results.is_empty(),
+                "{code:?} must not reach for a tool, called: {:?}",
+                result.tool_results
+            );
+        }
+    }
+
+    /// The other half of the same story: `random` and `time` are still
+    /// bridged through `run_command`, so they stay unavailable without shell
+    /// access. Asserted so the asymmetry with `re`/`datetime` is recorded
+    /// rather than assumed — it is easy to read the fix above as "orchestrate
+    /// no longer needs shell", which is not true.
+    #[tokio::test]
+    async fn test_random_and_time_still_need_shell() {
+        for code in [
+            "import random\nprint(random.randint(1, 1))",
+            "import time\nprint(time.time())",
+        ] {
+            let result = CodeModeExecutor::new()
+                .execute(
+                    code,
+                    &[],
+                    |name, _args| {
+                        let name = name.to_string();
+                        Box::pin(async move { Err(format!("no tools available: {name}")) })
+                    },
+                    |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+                )
+                .await;
+            assert!(
+                !result.success,
+                "{code:?} should still be unavailable without shell, but succeeded"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_simple_execution() {
         let executor = CodeModeExecutor::new();
