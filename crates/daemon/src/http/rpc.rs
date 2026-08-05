@@ -30,6 +30,11 @@ pub fn mcp_routes(service: Arc<crate::mcp_service::McpService>) -> Router {
     use nevoflux_mcp::rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use nevoflux_mcp::rmcp::transport::streamable_http_server::StreamableHttpService;
 
+    let config =
+        nevoflux_mcp::rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default(
+        )
+        .with_allowed_hosts(allowed_hosts());
+
     let http = StreamableHttpService::new(
         move || {
             Ok(nevoflux_mcp::NevofluxServer::new(
@@ -39,7 +44,7 @@ pub fn mcp_routes(service: Arc<crate::mcp_service::McpService>) -> Router {
             ))
         },
         Arc::new(LocalSessionManager::default()),
-        Default::default(),
+        config,
     );
 
     // `route_service`, not `nest_service`: the transport serves exactly one
@@ -47,6 +52,32 @@ pub fn mcp_routes(service: Arc<crate::mcp_service::McpService>) -> Router {
     // would only add sub-paths that answer nothing and rewrite the URI the
     // transport's host validation reads.
     Router::new().route_service("/mcp", http)
+}
+
+/// Host names the MCP transport will answer to.
+///
+/// rmcp validates the `Host` header as DNS-rebinding protection and ships a
+/// loopback-only default, which is right for a server a browser might be
+/// tricked into calling — and wrong for this one, which exists to be deployed
+/// and reached from elsewhere. A client on another machine sends the server's
+/// address as `Host`, so with the default it gets 403 no matter how the
+/// network is configured.
+///
+/// `NEVOFLUX_MCP_ALLOWED_HOSTS` (comma-separated) adds to the loopback names
+/// rather than replacing them, so turning on remote access cannot accidentally
+/// break local access. Entries may include a port (`box.internal:8082`) or
+/// omit it.
+fn allowed_hosts() -> Vec<String> {
+    let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(extra) = std::env::var("NEVOFLUX_MCP_ALLOWED_HOSTS") {
+        for host in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            hosts.push(host.to_string());
+        }
+    }
+    hosts
 }
 
 /// ACP-over-HTTP routes (unstated). Dedicated port: `acp_routes().with_state(state)`.
@@ -131,4 +162,47 @@ async fn acp_handler(
         other => rpc_err(id, -32601, &format!("method not found: {other}")),
     };
     (StatusCode::OK, Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Loopback must survive whatever an operator adds: turning on remote
+    /// access should never be able to break local access.
+    #[test]
+    #[serial]
+    fn extra_hosts_are_added_never_substituted() {
+        let prev = std::env::var("NEVOFLUX_MCP_ALLOWED_HOSTS").ok();
+
+        std::env::remove_var("NEVOFLUX_MCP_ALLOWED_HOSTS");
+        let base = allowed_hosts();
+        assert!(base.contains(&"localhost".to_string()));
+        assert!(base.contains(&"127.0.0.1".to_string()));
+        assert!(base.contains(&"::1".to_string()));
+
+        std::env::set_var(
+            "NEVOFLUX_MCP_ALLOWED_HOSTS",
+            " box.internal , 10.0.0.5:8082 ",
+        );
+        let extended = allowed_hosts();
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "box.internal",
+            "10.0.0.5:8082",
+        ] {
+            assert!(
+                extended.contains(&host.to_string()),
+                "{host} missing from {extended:?}"
+            );
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("NEVOFLUX_MCP_ALLOWED_HOSTS", v),
+            None => std::env::remove_var("NEVOFLUX_MCP_ALLOWED_HOSTS"),
+        }
+    }
 }
