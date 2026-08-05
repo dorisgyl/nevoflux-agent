@@ -495,20 +495,18 @@ impl ToolRegistry {
         prompt.push_str("- Expressions: arithmetic, comparison, boolean, f-string, lambda, comprehensions, ternary, slice, unpack, walrus (:=)\n");
         prompt.push_str("- Types: int, float, str, bool, list, dict, set, tuple, None, bytes\n");
         prompt.push_str("- Built-ins: len, range, sorted, enumerate, zip, sum, min, max, abs, round, isinstance, type, print\n\n");
+        prompt.push_str("DO NOT use: match/case, yield, decorators\n\n");
+        prompt.push_str("Notes:\n");
+        prompt.push_str("- class, with, global/nonlocal and async/await all work.\n");
         prompt.push_str(
-            "DO NOT use: class, match/case, import, with, async/await, yield, decorators\n\n",
+            "- sorted(key=, reverse=), list.sort(key=), map() and filter() all work normally.\n",
         );
-        prompt.push_str("Built-in limitations (IMPORTANT):\n");
-        prompt.push_str("- sorted() does NOT support key= or reverse= kwargs. Use manual sort: pairs = [[key_fn(x), x] for x in items]; pairs.sort(); result = [p[1] for p in pairs]\n");
-        prompt.push_str("- map() and filter() are NOT available. Use list comprehensions: [f(x) for x in items], [x for x in items if cond(x)]\n");
+        prompt.push_str("- Write imports: json, math, re, datetime, asyncio, os, sys, pathlib and typing are real modules, and their names exist only once imported.\n");
         prompt.push_str("- Tool calls that fail return {\"__tool_error\": true, \"error\": \"...\"}. Always check: if isinstance(result, dict) and result.get(\"__tool_error\"): handle_error\n\n");
         prompt.push_str("Pattern corrections:\n");
-        prompt.push_str(
-            "- Instead of class: use dict + factory function: def make_item(x): return {\"x\": x}\n",
-        );
         prompt.push_str("- Instead of match: use if/elif/else\n");
-        prompt.push_str("- Instead of import: tools are pre-injected as functions\n");
-        prompt.push_str("- Instead of with: use try/finally or call tool directly\n\n");
+        prompt.push_str("- Instead of yield: append to a list and return it\n");
+        prompt.push_str("- Instead of a decorator: call the wrapper explicitly\n\n");
         prompt.push_str(&self.tool_categories_summary());
         prompt.push_str("\nCall get_code_mode_context() to see full function signatures.\n");
         prompt.push_str(

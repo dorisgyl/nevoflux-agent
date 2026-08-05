@@ -17,22 +17,28 @@ Built-ins: len, range, sorted, enumerate, zip, sum,
 min, max, abs, round, isinstance, type, print, int, str, float,
 bool, list, dict, set, tuple, repr, any, all, reversed, chr, ord.
 
-NOT supported (common pitfalls):
-- sorted() does NOT support key= or reverse= kwargs. \
-Use a manual loop or list comprehension to sort: \
-pairs = [[key_fn(x), x] for x in items]; pairs.sort(); result = [p[1] for p in pairs]
-- map() and filter() are NOT available. \
-Use list comprehensions: [f(x) for x in items], [x for x in items if cond(x)]
-- class, import, with, async/await, yield, match/case, decorators are NOT supported
+NOT supported:
+- match/case, yield (and generators), decorators (@...)
+- itertools, subprocess, requests
+
+Supported, so do not rewrite these away:
+- class, with, global/nonlocal, async/await
+- sorted(key=, reverse=), list.sort(key=), map(), filter()
+- imports of json, math, re, datetime, asyncio, os, sys, pathlib, typing \
+(the name exists only once imported, so keep the import)
+
+Other notes:
+- os exists but has no os.path; write os.path.join / os.path.basename anyway \
+and the runtime substitutes an equivalent, as it does for functools.reduce \
+and collections.Counter
+- random and time need shell access; avoid them if the task may run without it
 - Tool calls that fail return {\"__tool_error\": true, \"error\": \"...\"}. \
 Always check: if isinstance(result, dict) and result.get(\"__tool_error\"): handle error
 
 Common patterns:
-- class → dict + factory function: def make_item(x): return {\"x\": x}
 - match → if/elif/else chain
-- import → not needed (tools pre-injected as functions)
-- with → try/finally or call tool directly
-- yield → use list.append() to collect results";
+- yield → use list.append() to collect results
+- decorator → call the wrapper explicitly";
 
 /// Generates structured repair prompts for the LLM to fix Python code
 /// that violates Monty constraints or fails at runtime.
@@ -186,16 +192,27 @@ mod tests {
     }
 
     #[test]
+    /// The repair prompt must name what Monty actually cannot do. Telling the
+    /// model that a working construct is unsupported is worse than silence: it
+    /// spends a retry rewriting code that already ran, and this prompt is only
+    /// ever seen when something has already gone wrong.
     fn test_monty_limitations_in_prompt() {
         let prompt = RepairPrompt::from_runtime_error(
-            "sorted(items, key=lambda x: x)",
-            "TypeError",
-            "sorted() got unexpected keyword argument",
+            "match x:\n    case 1:\n        pass",
+            "NotImplementedError",
+            "pattern matching (match statements)",
             Some(1),
             &[],
         );
-        assert!(prompt.contains("sorted() does NOT support key="));
-        assert!(prompt.contains("map() and filter() are NOT available"));
+        for unsupported in ["match/case", "yield", "decorators"] {
+            assert!(prompt.contains(unsupported), "must name {unsupported}");
+        }
+        for supported in ["class", "with", "map()", "filter()"] {
+            assert!(
+                prompt.contains(supported),
+                "must list {supported} as supported so it is not rewritten away"
+            );
+        }
         assert!(prompt.contains("__tool_error"));
     }
 }

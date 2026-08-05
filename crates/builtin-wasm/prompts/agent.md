@@ -178,13 +178,14 @@ Prefer `browser_get_markdown` over `browser_eval_js` — many sites block eval()
 ### Syntax
 
 - The code runs in a sandboxed Python interpreter (Monty).
-- **Supported**: variables, `def`, `if/elif/else`, `for/while`, `try/except`, comprehensions, f-strings, lambda, slicing.
-- **NOT supported**: `class`, `match/case`, `import`, `with`, `async/await`, `yield`, decorators.
-- **Builtin limitations**: `sorted()` does NOT support `key=` / `reverse=` kwargs. `map()` and `filter()` are NOT available. Use list comprehensions instead: `[f(x) for x in items]`, `[x for x in items if cond(x)]`.
-- **No imports needed**: The runtime auto-provides helpers for common stdlib functions. You can write `import json`, `import math`, `import os`, `import functools`, `import collections`, `import re`, `import datetime`, `import random`, `import time` — the runtime will strip the imports and inject equivalents. Write code naturally — the runtime handles the rest.
-  - **Pure Python helpers** (zero overhead): `json.loads`, `json.dumps`, `math.sqrt`, `math.floor`, `math.ceil`, `math.log`, `math.pi`, `os.path.join`, `os.path.basename`, `functools.reduce`, `collections.Counter`
-  - **Bash-bridged helpers** (uses `run_command` + python3): `re.findall`, `re.search`, `re.sub`, `re.split`, `re.match`, `datetime.datetime.now`, `datetime.date.today`, `datetime.datetime.strptime`, `random.randint`, `random.choice`, `random.shuffle`, `random.sample`, `random.random`, `time.sleep`, `time.time`
-- **Truly unavailable**: `itertools`, `subprocess`, `requests`, `asyncio`. Do NOT use these — there are no replacements.
+- **Supported**: variables, `def`, `class`, `if/elif/else`, `for/while`, `try/except`, `with`, comprehensions, f-strings, lambda, slicing, `global`/`nonlocal`, `async`/`await`.
+- **NOT supported**: `match/case`, `yield` (and generators), decorators (`@...`). Use an if/elif chain instead of `match`, and build a list instead of yielding.
+- **Builtins**: `sorted(key=..., reverse=...)`, `list.sort(key=...)`, `map()` and `filter()` all work normally.
+- **Imports**: write them. `json`, `math`, `re`, `datetime`, `asyncio`, `os`, `sys`, `pathlib`, `typing` are real modules — `import json` then `json.dumps(...)`. The name only exists once imported, so do not omit the import.
+  - `os.path` is the exception: `os` exists but has no `path`. The runtime rewrites `os.path.join` / `os.path.basename` for you, so write them as normal.
+  - `functools.reduce` and `collections.Counter` are provided as injected helpers — write them normally and the runtime substitutes equivalents.
+  - `random` and `time` are bridged through `run_command` + python3, so they need shell access. If the task may run without it, avoid them.
+- **Truly unavailable**: `itertools`, `subprocess`, `requests`. Do NOT use these — there are no replacements.
 
 ### Examples
 
