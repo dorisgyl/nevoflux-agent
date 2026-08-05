@@ -131,6 +131,32 @@ fn dur_secs_or(default: u64, configured: u64) -> Duration {
     Duration::from_secs(if configured > 0 { configured } else { default })
 }
 
+/// Whether to spawn gbrain, with `NEVOFLUX_BRAIN_ENABLED` overriding the TOML.
+///
+/// The env override exists for containers: a deployment that mounts one shared
+/// `config.toml` across several instances should not need a separate copy of
+/// the file just to turn the subprocess off for some of them. Accepts
+/// `1`/`true`/`yes` and `0`/`false`/`no`; anything else is ignored so a typo
+/// falls back to the configured value rather than silently flipping it.
+pub fn brain_enabled(configured: bool) -> bool {
+    match std::env::var("NEVOFLUX_BRAIN_ENABLED")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("yes") => true,
+        Some("0") | Some("false") | Some("no") => false,
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "NEVOFLUX_BRAIN_ENABLED is not a boolean; using the configured value"
+            );
+            configured
+        }
+        None => configured,
+    }
+}
+
 /// Built-in `GBRAIN_MODEL` value used when `[knowledge_base.brain].model` is
 /// empty. The `openrouter:` prefix is the load-bearing part: it dodges
 /// gbrain's `ANTHROPIC_API_KEY` short-circuit (which only triggers for
@@ -186,8 +212,8 @@ pub async fn init_brain(
         tracing::info!("knowledge_base.enabled = false -> skipping brain init");
         return Ok(None);
     }
-    if !kb_config.brain.enabled {
-        tracing::info!("knowledge_base.brain.enabled = false -> skipping brain init");
+    if !brain_enabled(kb_config.brain.enabled) {
+        tracing::info!("brain disabled -> skipping brain init");
         return Ok(None);
     }
     let Some(gw) = gateway else {
@@ -325,6 +351,52 @@ pub async fn init_brain(
     let engine: Arc<dyn BrainEngine> = Arc::new(GbrainEngine::new(transport));
 
     Ok(Some(BrainBoot { supervisor, engine }))
+}
+
+#[cfg(test)]
+mod brain_enabled_tests {
+    use super::brain_enabled;
+    use serial_test::serial;
+
+    fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("NEVOFLUX_BRAIN_ENABLED").ok();
+        match value {
+            Some(v) => std::env::set_var("NEVOFLUX_BRAIN_ENABLED", v),
+            None => std::env::remove_var("NEVOFLUX_BRAIN_ENABLED"),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("NEVOFLUX_BRAIN_ENABLED", v),
+            None => std::env::remove_var("NEVOFLUX_BRAIN_ENABLED"),
+        }
+        out
+    }
+
+    #[test]
+    #[serial]
+    fn unset_keeps_the_configured_value() {
+        assert!(with_env(None, || brain_enabled(true)));
+        assert!(!with_env(None, || brain_enabled(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn the_env_wins_in_both_directions() {
+        assert!(with_env(Some("0"), || brain_enabled(true)) == false);
+        assert!(with_env(Some("false"), || brain_enabled(true)) == false);
+        assert!(with_env(Some("1"), || brain_enabled(false)));
+        assert!(with_env(Some("yes"), || brain_enabled(false)));
+    }
+
+    /// A typo must not silently flip the switch: an operator who wrote
+    /// "ture" meant to enable, and quietly disabling would be worse than
+    /// ignoring them and saying so.
+    #[test]
+    #[serial]
+    fn a_non_boolean_falls_back_to_the_configured_value() {
+        assert!(with_env(Some("ture"), || brain_enabled(true)));
+        assert!(!with_env(Some("ture"), || brain_enabled(false)));
+    }
 }
 
 #[cfg(test)]

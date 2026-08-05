@@ -542,6 +542,69 @@ fn failed(msg: String) -> SessionOutcome {
     }
 }
 
+/// Make sure a session browser is live, launching one if not.
+///
+/// Extracted so startup can pre-warm the browser instead of every caller
+/// paying for a cold launch on its first tool call: `browser_*` and
+/// script tools that drive the browser fail outright until one is registered,
+/// and "run a task first" is a poor thing to require of an MCP client.
+///
+/// The caller holds the [`SessionHolder`] lock, which is what serialises a
+/// pre-warm against a task that starts at the same moment.
+/// Returns `true` when it had to launch, so a caller can tell a fresh browser
+/// from a reused one — the soft reset between tasks only makes sense for the
+/// latter.
+pub async fn ensure_session_browser(
+    deps: &AutomationDeps,
+    guard: &mut Option<LiveSession>,
+) -> std::result::Result<bool, String> {
+    // A REGISTERED browser is the cross-platform liveness signal. On Windows the
+    // launcher child exits after re-parenting the real browser, so the child handle
+    // is not a valid liveness check — the registry entry (connection-driven) is.
+    if guard.is_some() && deps.registry.single().is_ok() {
+        return Ok(false);
+    }
+
+    // Crash-relaunch REUSES the existing clone dir so in-flow login/cookies on
+    // disk survive; a fresh flow clones the base profile.
+    let clone = match guard.take() {
+        Some(mut dead) => {
+            tracing::warn!(
+                clone_dir = %dead.clone_dir.display(),
+                "session browser died; relaunching against the same profile clone"
+            );
+            dead.handle.terminate().await;
+            crate::browser_launch::kill_profile_processes(&dead.clone_dir).await;
+            dead.clone_dir
+        }
+        None => deps
+            .profile_mgr
+            .clone_base(&deps.profile)
+            .map_err(|e| format!("profile clone failed: {e}"))?,
+    };
+    let _ = deps.profile_mgr.inject_automation_pref(&clone);
+    let cfg = BrowserLaunchConfig {
+        browser_bin: deps.browser_bin.clone(),
+        profile_dir: clone.clone(),
+        display: deps.display.clone(),
+        register_timeout: Duration::from_secs(60),
+    };
+    match spawn_and_supervise(cfg, deps.registry.clone()).await {
+        Ok(handle) => {
+            *guard = Some(LiveSession {
+                handle,
+                clone_dir: clone,
+                base_profile: deps.profile.clone(),
+            });
+            Ok(true)
+        }
+        Err(e) => {
+            deps.profile_mgr.cleanup(&clone);
+            Err(format!("browser launch failed: {e}"))
+        }
+    }
+}
+
 /// Session-mode task runner: reuse ONE browser + profile clone across tasks.
 /// Serialized by the `SessionHolder` mutex. Launches on first use / after a
 /// crash; soft-resets between reuses; tears down only when `end_session`.
@@ -561,56 +624,24 @@ pub async fn execute_session_task(
     // is not a valid liveness check — the registry entry (connection-driven) is.
     // Reuse when a browser is registered; otherwise (first task, or the session
     // died) launch.
-    let need_launch = guard.is_none() || deps.registry.single().is_err();
-    if need_launch {
-        // Crash-relaunch REUSES the existing clone dir so in-flow login/cookies on
-        // disk survive; a fresh flow clones the base profile.
-        let clone = match guard.take() {
-            Some(mut dead) => {
-                tracing::warn!(
-                    clone_dir = %dead.clone_dir.display(),
-                    "session browser died; relaunching against the same profile clone"
-                );
-                dead.handle.terminate().await;
-                crate::browser_launch::kill_profile_processes(&dead.clone_dir).await;
-                dead.clone_dir
+    let launched = match ensure_session_browser(deps, &mut guard).await {
+        Ok(launched) => launched,
+        Err(e) => return failed(e),
+    };
+    if !launched {
+        if let Ok(browser) = deps.registry.single() {
+            // Reuse: reset the visible page before the next task runs — agent-loop
+            // tasks only. Script backends keep their tabs across requests; see
+            // `should_soft_reset` for why blanking theirs is counterproductive.
+            // A browser we just launched opens blank, so there is nothing to reset.
+            let runs_script =
+                resolve_script_path(deps.script_call.as_ref(), env_headless_script()).is_some();
+            if should_soft_reset(
+                runs_script,
+                std::env::var("NEVOFLUX_SESSION_SOFT_RESET").ok().as_deref(),
+            ) {
+                soft_reset_active_tab(&deps.services_template, &browser).await;
             }
-            None => match deps.profile_mgr.clone_base(&deps.profile) {
-                Ok(c) => c,
-                Err(e) => return failed(format!("profile clone failed: {e}")),
-            },
-        };
-        let _ = deps.profile_mgr.inject_automation_pref(&clone);
-        let cfg = BrowserLaunchConfig {
-            browser_bin: deps.browser_bin.clone(),
-            profile_dir: clone.clone(),
-            display: deps.display.clone(),
-            register_timeout: Duration::from_secs(60),
-        };
-        match spawn_and_supervise(cfg, deps.registry.clone()).await {
-            Ok(handle) => {
-                *guard = Some(LiveSession {
-                    handle,
-                    clone_dir: clone,
-                    base_profile: deps.profile.clone(),
-                });
-            }
-            Err(e) => {
-                deps.profile_mgr.cleanup(&clone);
-                return failed(format!("browser launch failed: {e}"));
-            }
-        }
-    } else if let Ok(browser) = deps.registry.single() {
-        // Reuse: reset the visible page before the next task runs — agent-loop
-        // tasks only. Script backends keep their tabs across requests; see
-        // `should_soft_reset` for why blanking theirs is counterproductive.
-        let runs_script =
-            resolve_script_path(deps.script_call.as_ref(), env_headless_script()).is_some();
-        if should_soft_reset(
-            runs_script,
-            std::env::var("NEVOFLUX_SESSION_SOFT_RESET").ok().as_deref(),
-        ) {
-            soft_reset_active_tab(&deps.services_template, &browser).await;
         }
     }
 

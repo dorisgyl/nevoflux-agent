@@ -916,6 +916,13 @@ async fn run_daemon(
                     ),
                 }
             }
+            // Start the shared browser now rather than on the first tool call.
+            // Under session mode every caller shares one browser, and the tools
+            // that need it (browser_*, script tools that search the web) fail
+            // outright until it exists — telling an MCP client "run a task
+            // first" is not a usable contract.
+            tokio::spawn(nevoflux_daemon::automation::prewarm_session_browser());
+
             if let Some(addr) = acp_addr {
                 let app = http::rpc::acp_routes().with_state(state.clone());
                 tokio::spawn(async move {

@@ -42,6 +42,65 @@ fn session_mode_enabled(val: Option<&str>) -> bool {
 ///
 /// End-to-end behavior is verified against a live browser (phase gate); the
 /// wiring + the pieces it composes are unit-tested.
+/// Launch the session browser now, so the first caller does not pay for a cold
+/// start.
+///
+/// Only under `NEVOFLUX_SESSION_MODE=1`: without it every task gets its own
+/// browser and there is no shared one to pre-warm. Failure is logged, never
+/// fatal — a daemon that cannot start a browser should still serve the
+/// endpoints that do not need one, and the next task will retry the launch.
+pub async fn prewarm_session_browser() {
+    use std::path::PathBuf;
+
+    if !session_mode_enabled(std::env::var("NEVOFLUX_SESSION_MODE").ok().as_deref()) {
+        return;
+    }
+    let (Some(template), Some(registry)) = (
+        CURRENT_SERVICES_TEMPLATE.get(),
+        crate::registry::CURRENT_BROWSER_REGISTRY.get(),
+    ) else {
+        tracing::debug!("no headless context; skipping browser pre-warm");
+        return;
+    };
+    let Ok(browser_bin) = std::env::var("NEVOFLUX_BROWSER_BIN") else {
+        tracing::debug!("NEVOFLUX_BROWSER_BIN unset; skipping browser pre-warm");
+        return;
+    };
+
+    // Same profile the interface front-ends default to, or the pre-warmed
+    // browser would be running the wrong one and the first task would throw it
+    // away and relaunch — costing more than not pre-warming at all.
+    let profile = std::env::var("NEVOFLUX_TASK_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let base_dir = std::env::var("NEVOFLUX_BASE_PROFILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/base-profiles"));
+    let work_dir = std::env::var("NEVOFLUX_PROFILE_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
+
+    let deps = session::AutomationDeps {
+        profile_mgr: crate::profile::ProfileManager { base_dir, work_dir },
+        profile,
+        registry: registry.clone(),
+        services_template: template.clone(),
+        browser_bin: PathBuf::from(browser_bin),
+        display: std::env::var("DISPLAY").ok(),
+        mode: nevoflux_builtin_wasm::AgentMode::Chat,
+        workspace: std::env::temp_dir().join("nevoflux-prewarm"),
+        script_call: None,
+    };
+    let holder = crate::automation::session_holder::SessionHolder::global();
+    let mut guard = holder.inner.lock().await;
+    match session::ensure_session_browser(&deps, &mut guard).await {
+        Ok(true) => tracing::info!("session browser pre-warmed"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "browser pre-warm failed; the next task will retry"),
+    }
+}
+
 pub fn build_headless_runner(
     metrics: std::sync::Arc<crate::http::metrics::Metrics>,
 ) -> Option<crate::http::queue::Runner> {
