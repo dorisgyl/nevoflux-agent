@@ -7833,11 +7833,11 @@ async fn handle_chat_message(
                 "session.unpin" => handle_session_pin(session_manager, &params, false).await,
                 // MCP server configuration commands
                 "mcp.list" => handle_mcp_list(&params).await,
-                "mcp.add" => handle_mcp_add(&params).await,
+                "mcp.add" => handle_mcp_add(services, &params).await,
                 "mcp.update" => handle_mcp_update(&params).await,
                 "mcp.delete" => handle_mcp_delete(&params).await,
                 "mcp.test" => handle_mcp_test(&params).await,
-                "mcp.connect" => handle_mcp_connect(&params).await,
+                "mcp.connect" => handle_mcp_connect(services, &params).await,
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
@@ -9837,7 +9837,7 @@ async fn handle_mcp_list(params: &serde_json::Value) -> serde_json::Value {
 /// Handle mcp.add command.
 ///
 /// Adds a new MCP server configuration.
-async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
+async fn handle_mcp_add(services: &HostServices, params: &serde_json::Value) -> serde_json::Value {
     let request_id = params
         .get("request_id")
         .and_then(|r| r.as_str())
@@ -9915,6 +9915,26 @@ async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
         });
     }
 
+    // Connect immediately. Writing the config alone used to be the whole of
+    // "add": the server then sat unconnected and unindexed until the next
+    // daemon restart, while the UI reported success — the most confusing
+    // possible outcome. A connect failure is reported but does not undo the
+    // config, so a typo can be fixed by editing rather than re-adding.
+    let connected = if services.mcp_manager.is_some() {
+        let outcome = handle_mcp_connect(
+            services,
+            &serde_json::json!({ "request_id": "", "name": server_name.clone() }),
+        )
+        .await;
+        outcome
+            .get("payload")
+            .and_then(|p| p.get("data"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+
     info!("Added MCP server: {}", server_name);
     serde_json::json!({
         "type": "system_response",
@@ -9923,7 +9943,8 @@ async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
             "command": "mcp.add",
             "success": true,
             "data": {
-                "name": server_name
+                "name": server_name,
+                "connect": connected
             }
         }
     })
@@ -10315,15 +10336,36 @@ async fn handle_mcp_test(params: &serde_json::Value) -> serde_json::Value {
 /// Handle mcp.connect command.
 ///
 /// Connects to an MCP server.
-async fn handle_mcp_connect(params: &serde_json::Value) -> serde_json::Value {
+/// Connect one configured MCP server and index its tools.
+///
+/// Both halves matter. Connecting alone leaves the server's tools invisible to
+/// `tool_search`, which is where the agent looks — the startup path indexes
+/// once and never again, so a server registered at runtime would connect and
+/// then appear to do nothing.
+async fn handle_mcp_connect(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
     let request_id = params
         .get("request_id")
         .and_then(|r| r.as_str())
         .unwrap_or("")
         .to_string();
 
+    let reply = |success: bool, body: serde_json::Value| {
+        serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "mcp.connect",
+                "success": success,
+                "data": body,
+            }
+        })
+    };
+
     let name = match params.get("name").and_then(|n| n.as_str()) {
-        Some(n) => n,
+        Some(n) => n.to_string(),
         None => {
             return serde_json::json!({
                 "type": "system_response",
@@ -10340,23 +10382,117 @@ async fn handle_mcp_connect(params: &serde_json::Value) -> serde_json::Value {
         }
     };
 
-    // TODO: Implement actual MCP connection via MCP registry
-    // For now, just acknowledge the request
-    info!("MCP connect requested for: {}", name);
-
-    serde_json::json!({
-        "type": "system_response",
-        "payload": {
-            "request_id": request_id,
-            "command": "mcp.connect",
-            "success": true,
-            "data": {
+    let Some(manager) = services.mcp_manager.as_ref() else {
+        return reply(
+            false,
+            serde_json::json!({
                 "name": name,
                 "connected": false,
-                "message": "Connection management not yet implemented"
-            }
+                "message": "MCP manager is not available in this daemon",
+            }),
+        );
+    };
+
+    // A server added at runtime is only in the config file; register it with
+    // the manager before connecting, or `connect` has nothing to look up.
+    if let Err(e) = register_configured_mcp_server(manager, &name).await {
+        return reply(
+            false,
+            serde_json::json!({ "name": name, "connected": false, "message": e }),
+        );
+    }
+
+    if let Err(e) = manager.connect(&name).await {
+        warn!(server = %name, error = %e, "mcp.connect failed");
+        return reply(
+            false,
+            serde_json::json!({
+                "name": name,
+                "connected": false,
+                "message": format!("{e}"),
+            }),
+        );
+    }
+
+    let indexed = index_mcp_tools(services, &name).await;
+    info!(server = %name, indexed, "mcp.connect succeeded");
+    reply(
+        true,
+        serde_json::json!({ "name": name, "connected": true, "indexed_tools": indexed }),
+    )
+}
+
+/// Register `name` from the on-disk config with the manager.
+///
+/// Idempotent: re-adding an existing server config is how an edited entry
+/// takes effect, so this is also the update path.
+async fn register_configured_mcp_server(
+    manager: &nevoflux_mcp::McpManager,
+    name: &str,
+) -> std::result::Result<(), String> {
+    use nevoflux_mcp::ServerConfig as McpServerConfig;
+
+    let config = crate::mcp_config::McpServersConfig::load()
+        .map_err(|e| format!("cannot read the MCP config: {e}"))?;
+    let server = config
+        .get_server(name)
+        .ok_or_else(|| format!("no MCP server named '{name}' in the config"))?;
+
+    let sc = if server.server_type == "http" || server.server_type == "sse" {
+        let url = server.url.as_ref().ok_or_else(|| {
+            format!(
+                "MCP server '{name}' is {} but has no url",
+                server.server_type
+            )
+        })?;
+        McpServerConfig::new_http(name, url.as_str())
+    } else {
+        let command = server
+            .command
+            .as_ref()
+            .ok_or_else(|| format!("MCP server '{name}' is stdio but has no command"))?;
+        let mut sc = McpServerConfig::new(name, command)
+            .with_args(server.args.iter().map(|s| s.as_str()).collect());
+        for (k, v) in &server.env {
+            sc = sc.with_env(k, v);
         }
-    })
+        sc
+    };
+
+    manager
+        .add_server(sc)
+        .await
+        .map_err(|e| format!("cannot register '{name}': {e}"))
+}
+
+/// Add a connected server's tools to the shared search index.
+///
+/// Additive, matching the startup path: the brain tools and any other
+/// server's entries stay put. Returns how many tools were added.
+async fn index_mcp_tools(services: &HostServices, name: &str) -> usize {
+    let (Some(manager), Some(index)) =
+        (services.mcp_manager.as_ref(), services.tool_search.as_ref())
+    else {
+        return 0;
+    };
+    // `list_all_tools` is the only listing API; filter to this server so a
+    // connect does not silently re-add every other server's entries.
+    let all = match manager.list_all_tools().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(server = %name, error = %e, "cannot list tools to index");
+            return 0;
+        }
+    };
+    let mine: Vec<_> = all
+        .into_iter()
+        .filter(|st| st.server_name == name)
+        .collect();
+    let mut idx = index.write().await;
+    for st in &mine {
+        idx.add(&st.tool);
+    }
+    mine.len()
 }
 
 /// Handle mcp.disconnect command.
@@ -13758,6 +13894,55 @@ mod tests {
             active_status["payload"]["data"]["condition"],
             "the task is done"
         );
+    }
+
+    // ---- runtime MCP server registration ---------------------------------
+
+    /// A server added at runtime must reach the manager from the config file,
+    /// which is the only place `mcp.add` writes it.
+    #[tokio::test]
+    async fn registering_an_http_server_needs_a_url() {
+        let mgr = Arc::new(nevoflux_mcp::McpManager::new(Default::default()));
+        // The config has no such server at all, which must be said plainly
+        // rather than surfacing as a connect failure later.
+        let err = register_configured_mcp_server(&mgr, "definitely-not-configured")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("definitely-not-configured"),
+            "the error must name the server: {err}"
+        );
+    }
+
+    /// Without a manager or an index there is nothing to do, and saying "0
+    /// indexed" is the honest answer — not a panic and not a silent success.
+    #[tokio::test]
+    async fn indexing_without_a_manager_reports_zero() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        assert_eq!(index_mcp_tools(&services, "anything").await, 0);
+    }
+
+    /// `mcp.connect` used to answer `connected: false` with "not yet
+    /// implemented" while reporting `success: true`. A missing manager is a
+    /// real failure and must read as one.
+    #[tokio::test]
+    async fn connect_without_a_manager_is_not_a_success() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let out = handle_mcp_connect(
+            &services,
+            &serde_json::json!({ "request_id": "r", "name": "x" }),
+        )
+        .await;
+        assert_eq!(out["payload"]["success"], false);
+        assert_eq!(out["payload"]["data"]["connected"], false);
+    }
+
+    #[tokio::test]
+    async fn connect_without_a_name_is_a_parameter_error() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let out = handle_mcp_connect(&services, &serde_json::json!({ "request_id": "r" })).await;
+        assert_eq!(out["payload"]["success"], false);
+        assert_eq!(out["payload"]["error"]["code"], "MISSING_PARAM");
     }
 
     // ---- MCP over the proxy bridge (`Channel::Mcp`) ----------------------
