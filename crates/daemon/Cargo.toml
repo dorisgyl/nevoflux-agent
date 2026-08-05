@@ -163,7 +163,10 @@ rfd = "0.15"
 which = "7"
 
 # Code Mode - Python interpreter for agent code execution
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.7" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.19" }
+# v0.0.19 split the value/limit/IO types out of the `monty` root into their
+# own crate; both must be pinned to the same tag to stay ABI-compatible.
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.19" }
 
 # Tempfile staging — used by canvas_video render to stage narration MP3
 # bytes for ffmpeg's `-i <audio>` input (P5b-final). Must be in [dependencies]

@@ -6,8 +6,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use monty::{
-    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
+use monty::{MontyRun, RunProgress};
+use monty_types::CompileOptions;
+use monty_types::{
+    ExtFunctionResult, LimitedTracker, MontyObject, NameLookupResult, PrintWriter, ResourceLimits,
 };
 
 use super::auto_fixer::MontyAutoFixer;
@@ -134,7 +136,11 @@ pub fn is_timeout_error(error_type: &str, error_msg: &str) -> bool {
 /// Default resource limits for Monty execution.
 fn default_resource_limits() -> ResourceLimits {
     ResourceLimits {
-        max_allocations: Some(100_000),
+        // v0.0.19 dropped `max_allocations`. `max_memory` still bounds a
+        // runaway allocator and `max_duration` still bounds a runaway loop, so
+        // nothing is unguarded — but an allocation-count ceiling used to trip
+        // sooner than either, which mattered most for /loop, where a runaway
+        // iteration reruns on a schedule with nobody watching.
         max_duration: Some(DEFAULT_MAX_DURATION),
         max_memory: Some(64 * 1024 * 1024), // 64MB
         gc_interval: Some(10_000),
@@ -226,14 +232,6 @@ fn json_to_monty_object(val: &serde_json::Value) -> MontyObject {
                 .collect();
             MontyObject::dict(pairs)
         }
-    }
-}
-
-/// Extract collected output from a `PrintWriter::Collect`, returning an empty string for other variants.
-fn collect_output(print_writer: PrintWriter<'_>) -> String {
-    match print_writer {
-        PrintWriter::Collect(s) => s,
-        _ => String::new(),
     }
 }
 
@@ -400,7 +398,7 @@ impl CodeModeExecutor {
                 auto_fixed.clone(),
                 "code_mode.py",
                 vec![],
-                external_function_names.to_vec(),
+                CompileOptions::default(),
             ) {
                 Ok(runner) => runner,
                 Err(exc) => {
@@ -473,7 +471,7 @@ impl CodeModeExecutor {
             };
 
             let resource_tracker = LimitedTracker::new(self.resource_limits());
-            let mut print_writer = PrintWriter::Collect(String::new());
+            let mut output = String::new();
             let mut tool_results: Vec<ToolCallResult> = Vec::new();
             // Track resolved external call results keyed by call_id for ResolveFutures.
             // When a FunctionCall is processed synchronously via state.run(), we also
@@ -481,7 +479,11 @@ impl CodeModeExecutor {
             // asyncio.gather edge cases), we can provide the already-computed values.
             let mut pending_results: Vec<(u32, MontyObject)> = Vec::new();
 
-            let start_result = runner.start(vec![], resource_tracker, &mut print_writer);
+            let start_result = runner.start(
+                vec![],
+                resource_tracker,
+                PrintWriter::CollectString(&mut output, None),
+            );
 
             let mut progress = match start_result {
                 Ok(p) => p,
@@ -500,7 +502,7 @@ impl CodeModeExecutor {
                     // A timeout is not fixable by rewriting — return it directly.
                     if is_timeout_error(&error_type, &error_msg) {
                         return CodeModeResult::fail_with_output(
-                            collect_output(print_writer),
+                            output.clone(),
                             format!("{error_type}: {error_msg}"),
                         )
                         .with_tool_results(tool_results)
@@ -555,7 +557,7 @@ impl CodeModeExecutor {
                                     e
                                 );
                                 return CodeModeResult::fail_with_output(
-                                    collect_output(print_writer),
+                                    output.clone(),
                                     format!("Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
                                 )
                                 .with_tool_results(tool_results)
@@ -565,7 +567,7 @@ impl CodeModeExecutor {
                     }
 
                     return CodeModeResult::fail_with_output(
-                        collect_output(print_writer),
+                        output.clone(),
                         format!("{error_type}: {error_msg}"),
                     )
                     .with_tool_results(tool_results)
@@ -581,7 +583,7 @@ impl CodeModeExecutor {
                 if self.is_cancelled() {
                     tracing::info!("Code Mode: cancelled by interrupt");
                     return CodeModeResult::fail_with_output(
-                        collect_output(print_writer),
+                        output.clone(),
                         "Cancelled by user interrupt",
                     )
                     .with_tool_results(tool_results)
@@ -589,14 +591,45 @@ impl CodeModeExecutor {
                 }
 
                 match progress {
-                    RunProgress::FunctionCall {
-                        function_name,
-                        args,
-                        kwargs,
-                        call_id,
-                        method_call: _,
-                        state,
-                    } => {
+                    RunProgress::FunctionCall(call) => {
+                        // Cloned rather than borrowed: `call` is consumed by
+                        // `resume` below, and a tool call dwarfs the copy.
+                        let function_name = call.function_name.clone();
+                        let args = call.args.clone();
+                        let kwargs = call.kwargs.clone();
+                        let call_id = call.call_id;
+
+                        // Monty offers *every* unresolved callee to the host,
+                        // not just the ones we advertised, so the catalogue has
+                        // to be enforced here rather than at construction time.
+                        // Without this an invented name reaches the tool
+                        // executor and comes back as a `__tool_error` dict that
+                        // the script then treats as data; `NotFound` instead
+                        // raises the NameError the caller (and the mechanical
+                        // fixer) expects.
+                        if !external_function_names.contains(&function_name) {
+                            match call.resume(
+                                ExtFunctionResult::NotFound(function_name.clone()),
+                                PrintWriter::CollectString(&mut output, None),
+                            ) {
+                                Ok(next) => {
+                                    progress = next;
+                                    continue;
+                                }
+                                Err(exc) => {
+                                    let error_msg =
+                                        exc.message().unwrap_or("runtime error").to_string();
+                                    let error_type = format!("{}", exc.exc_type());
+                                    return CodeModeResult::fail_with_output(
+                                        output.clone(),
+                                        format!("{error_type}: {error_msg}"),
+                                    )
+                                    .with_tool_results(tool_results)
+                                    .with_retries(retries);
+                                }
+                            }
+                        }
+
                         // Build arguments JSON, merging positional args and kwargs.
                         // When kwargs are present, use a special envelope so
                         // positional_to_named_auto can map positional args by
@@ -635,7 +668,7 @@ impl CodeModeExecutor {
                         };
                         let cache_key = format!("{call_signature}#{occurrence}");
 
-                        let (result_json, resume_value): (serde_json::Value, ExternalResult) =
+                        let (result_json, resume_value): (serde_json::Value, ExtFunctionResult) =
                             if let Some(cached) = tool_cache.get(&cache_key) {
                                 tracing::debug!(
                                     "Code Mode: tool cache hit for {} (key len={})",
@@ -643,7 +676,7 @@ impl CodeModeExecutor {
                                     cache_key.len()
                                 );
                                 let return_obj = json_to_monty_object(cached);
-                                (cached.clone(), ExternalResult::Return(return_obj))
+                                (cached.clone(), ExtFunctionResult::Return(return_obj))
                             } else {
                                 // Execute the tool
                                 let tool_result =
@@ -652,19 +685,19 @@ impl CodeModeExecutor {
                                 let (rj, rv) = match tool_result {
                                     Ok(result_val) => {
                                         let return_obj = json_to_monty_object(&result_val);
-                                        (result_val, ExternalResult::Return(return_obj))
+                                        (result_val, ExtFunctionResult::Return(return_obj))
                                     }
                                     Err(e) => {
                                         // Return error as a dict rather than
-                                        // ExternalResult::Error, because Monty may not
+                                        // ExtFunctionResult::Error, because Monty may not
                                         // properly raise Python exceptions from
-                                        // ExternalResult::Error.
+                                        // ExtFunctionResult::Error.
                                         let error_val = serde_json::json!({
                                             "__tool_error": true,
                                             "error": format!("{function_name}: {e}"),
                                         });
                                         let return_obj = json_to_monty_object(&error_val);
-                                        (error_val, ExternalResult::Return(return_obj))
+                                        (error_val, ExtFunctionResult::Return(return_obj))
                                     }
                                 };
                                 // Cache successful results (skip error dicts)
@@ -684,13 +717,15 @@ impl CodeModeExecutor {
                         });
 
                         let pending_obj = match &resume_value {
-                            ExternalResult::Return(obj) => obj.clone(),
+                            ExtFunctionResult::Return(obj) => obj.clone(),
                             _ => MontyObject::None,
                         };
                         pending_results.push((call_id, pending_obj));
 
                         // Resume execution with the result
-                        match state.run(resume_value, &mut print_writer) {
+                        match call
+                            .resume(resume_value, PrintWriter::CollectString(&mut output, None))
+                        {
                             Ok(next) => {
                                 progress = next;
                             }
@@ -712,7 +747,7 @@ impl CodeModeExecutor {
                                 // "No LLM retry in orchestrate tool mode" error).
                                 if is_timeout_error(&error_type, &error_msg) {
                                     return CodeModeResult::fail_with_output(
-                                        collect_output(print_writer),
+                                        output.clone(),
                                         format!("{error_type}: {error_msg}"),
                                     )
                                     .with_tool_results(tool_results)
@@ -768,7 +803,7 @@ impl CodeModeExecutor {
                                         Err(e) => {
                                             tracing::error!("Code Mode: LLM rewrite failed for post-tool-call error: {}", e);
                                             return CodeModeResult::fail_with_output(
-                                                collect_output(print_writer),
+                                                output.clone(),
                                                 format!("Runtime error after tool call and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
                                             )
                                             .with_tool_results(tool_results)
@@ -778,7 +813,7 @@ impl CodeModeExecutor {
                                 }
 
                                 return CodeModeResult::fail_with_output(
-                                    collect_output(print_writer),
+                                    output.clone(),
                                     format!("{error_type}: {error_msg}"),
                                 )
                                 .with_tool_results(tool_results)
@@ -788,7 +823,7 @@ impl CodeModeExecutor {
                     }
                     RunProgress::Complete(value) => {
                         let final_value = monty_object_to_json(&value);
-                        let mut result = CodeModeResult::success(collect_output(print_writer))
+                        let mut result = CodeModeResult::success(output.clone())
                             .with_tool_results(tool_results)
                             .with_retries(retries);
                         // Capture non-None final expressions as the result
@@ -797,20 +832,55 @@ impl CodeModeExecutor {
                         }
                         return result;
                     }
-                    RunProgress::OsCall { .. } => {
+                    RunProgress::OsCall(_) => {
                         return CodeModeResult::fail_with_output(
-                            collect_output(print_writer),
+                            output.clone(),
                             "OS calls are not permitted in sandboxed execution",
                         )
                         .with_tool_results(tool_results)
                         .with_retries(retries);
+                    }
+                    // Monty resolves undefined names by asking rather than by
+                    // being told upfront, so the tool catalogue is applied here
+                    // instead of at `MontyRun::new`. Answering `Undefined` for
+                    // an unknown name is what produces the familiar
+                    // "name 'x' is not defined" NameError that the mechanical
+                    // fixer keys off, so the allow-list stays exactly as tight
+                    // as the catalogue the caller passed in.
+                    RunProgress::NameLookup(lookup) => {
+                        let resolved = if external_function_names.contains(&lookup.name) {
+                            NameLookupResult::Value(MontyObject::Function {
+                                name: lookup.name.clone(),
+                                docstring: None,
+                            })
+                        } else {
+                            NameLookupResult::Undefined
+                        };
+                        match lookup.resume(resolved, PrintWriter::CollectString(&mut output, None))
+                        {
+                            Ok(next) => {
+                                progress = next;
+                            }
+                            Err(exc) => {
+                                return CodeModeResult::fail_with_output(
+                                    output.clone(),
+                                    format!(
+                                        "{}: {}",
+                                        exc.exc_type(),
+                                        exc.message().unwrap_or("runtime error")
+                                    ),
+                                )
+                                .with_tool_results(tool_results)
+                                .with_retries(retries);
+                            }
+                        }
                     }
                     RunProgress::ResolveFutures(future_state) => {
                         // Sequential dispatch: resolve all pending futures using
                         // results that were already computed during FunctionCall
                         // handling.  For any call_id without a stored result, we
                         // fall back to MontyObject::None.
-                        let results: Vec<(u32, ExternalResult)> = future_state
+                        let results: Vec<(u32, ExtFunctionResult)> = future_state
                             .pending_call_ids()
                             .iter()
                             .map(|&cid| {
@@ -825,7 +895,7 @@ impl CodeModeExecutor {
                                         );
                                         MontyObject::None
                                     });
-                                (cid, ExternalResult::Return(value))
+                                (cid, ExtFunctionResult::Return(value))
                             })
                             .collect();
 
@@ -834,7 +904,9 @@ impl CodeModeExecutor {
                             results.len()
                         );
 
-                        match future_state.resume(results, &mut print_writer) {
+                        match future_state
+                            .resume(results, PrintWriter::CollectString(&mut output, None))
+                        {
                             Ok(next) => {
                                 progress = next;
                             }
@@ -855,7 +927,7 @@ impl CodeModeExecutor {
                                 // it directly.
                                 if is_timeout_error(&error_type, &error_msg) {
                                     return CodeModeResult::fail_with_output(
-                                        collect_output(print_writer),
+                                        output.clone(),
                                         format!("{error_type}: {error_msg}"),
                                     )
                                     .with_tool_results(tool_results)
@@ -913,7 +985,7 @@ impl CodeModeExecutor {
                                         Err(e) => {
                                             tracing::error!("Code Mode: LLM rewrite failed for post-futures error: {}", e);
                                             return CodeModeResult::fail_with_output(
-                                                collect_output(print_writer),
+                                                output.clone(),
                                                 format!(
                                                     "Runtime error resolving futures and LLM \
                                                      rewrite failed: {error_type}: {error_msg} \
@@ -927,7 +999,7 @@ impl CodeModeExecutor {
                                 }
 
                                 return CodeModeResult::fail_with_output(
-                                    collect_output(print_writer),
+                                    output.clone(),
                                     format!("{error_type}: {error_msg}"),
                                 )
                                 .with_tool_results(tool_results)
@@ -1380,7 +1452,7 @@ mod tests {
         // Other limits stay at their defaults.
         let defaults = default_resource_limits();
         assert_eq!(limits.max_memory, defaults.max_memory);
-        assert_eq!(limits.max_allocations, defaults.max_allocations);
+        assert_eq!(limits.max_recursion_depth, defaults.max_recursion_depth);
     }
 
     #[test]

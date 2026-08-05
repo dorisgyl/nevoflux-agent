@@ -442,4 +442,39 @@ mod tests {
         assert!(matches!(finished, CanvasToolEvent::Finished { .. }));
         assert!(matches!(error, CanvasToolEvent::Error { .. }));
     }
+
+    /// Numbers must survive MessagePack, which is how every extension↔daemon
+    /// envelope travels.
+    ///
+    /// This guards against `serde_json/arbitrary_precision` re-entering the
+    /// dependency graph. Cargo unifies features across the whole build, so a
+    /// single transitive crate turning it on applies it here — and under that
+    /// feature `serde_json` hands a number to `serde` as a one-entry map keyed
+    /// by a private sentinel. Formats other than JSON have no idea what that
+    /// means: MessagePack writes it as a one-element array and reads back
+    /// `Array [String("0")]` where a `Number(0)` went in. No error, no panic,
+    /// just a payload that quietly stopped being the thing that was sent.
+    ///
+    /// `monty` shipped that feature in v0.0.17 and dropped it again in
+    /// v0.0.19; this test is what makes the difference visible rather than
+    /// something to rediscover from a corrupted payload.
+    #[test]
+    fn json_numbers_survive_a_messagepack_round_trip() {
+        for original in [
+            serde_json::json!(0),
+            serde_json::json!(-17),
+            serde_json::json!(1.5),
+            serde_json::json!({"count": 3, "ratio": 0.25}),
+            serde_json::json!([1, 2.5, {"n": 0}]),
+        ] {
+            let bytes = rmp_serde::to_vec_named(&original).expect("serialize to msgpack");
+            let back: serde_json::Value =
+                rmp_serde::from_slice(&bytes).expect("deserialize from msgpack");
+            assert_eq!(
+                back, original,
+                "MessagePack round-trip changed the value — is \
+                 serde_json/arbitrary_precision enabled somewhere in the graph?"
+            );
+        }
+    }
 }

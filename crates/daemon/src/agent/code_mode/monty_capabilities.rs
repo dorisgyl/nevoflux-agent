@@ -19,13 +19,18 @@
 //! "No LLM retry in orchestrate tool mode" branch in [`super::executor`]), so
 //! the mechanical layer is the only safety net an unattended iteration gets.
 
-use monty::{LimitedTracker, MontyRun, PrintWriter, ResourceLimits, RunProgress};
+use monty::{MontyRun, RunProgress};
+use monty_types::{CompileOptions, LimitedTracker, NameLookupResult, PrintWriter, ResourceLimits};
 
 /// Limits for a capability probe: generous enough that nothing here trips them,
 /// tight enough that a runaway probe fails the suite instead of hanging it.
 fn probe_limits() -> ResourceLimits {
     ResourceLimits {
-        max_allocations: Some(100_000),
+        // v0.0.19 dropped `max_allocations`. `max_memory` still bounds a
+        // runaway allocator and `max_duration` still bounds a runaway loop, so
+        // nothing is unguarded — but an allocation-count ceiling used to trip
+        // sooner than either, which mattered most for /loop, where a runaway
+        // iteration reruns on a schedule with nobody watching.
         max_duration: Some(std::time::Duration::from_secs(5)),
         max_memory: Some(64 * 1024 * 1024),
         gc_interval: Some(10_000),
@@ -40,34 +45,46 @@ fn probe_limits() -> ResourceLimits {
 /// `"ExcType: message"` for both parse and runtime failures, since for the
 /// purpose of "can Monty do this" the distinction does not matter.
 pub fn probe(code: &str) -> Result<String, String> {
-    let runner =
-        MontyRun::new(code.to_string(), "capability.py", vec![], vec![]).map_err(|exc| {
-            format!(
-                "{}: {}",
-                exc.exc_type(),
-                exc.message().unwrap_or("parse error")
-            )
-        })?;
+    fn describe(exc: &monty_types::MontyException, fallback: &str) -> String {
+        format!("{}: {}", exc.exc_type(), exc.message().unwrap_or(fallback))
+    }
 
-    let mut writer = PrintWriter::Collect(String::new());
-    let progress = runner
-        .start(vec![], LimitedTracker::new(probe_limits()), &mut writer)
-        .map_err(|exc| {
-            format!(
-                "{}: {}",
-                exc.exc_type(),
-                exc.message().unwrap_or("runtime error")
-            )
-        })?;
+    let runner = MontyRun::new(
+        code.to_string(),
+        "capability.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .map_err(|exc| describe(&exc, "parse error"))?;
 
-    match progress {
-        RunProgress::Complete(_) => Ok(match writer {
-            PrintWriter::Collect(s) => s,
-            _ => String::new(),
-        }),
-        // A probe that suspends wanted something this module refuses to give
-        // it (a tool call, an OS call). That is a failed probe, not a pass.
-        other => Err(format!("suspended instead of completing: {other:?}")),
+    let mut output = String::new();
+    let mut progress = runner
+        .start(
+            vec![],
+            LimitedTracker::new(probe_limits()),
+            PrintWriter::CollectString(&mut output, None),
+        )
+        .map_err(|exc| describe(&exc, "runtime error"))?;
+
+    loop {
+        match progress {
+            RunProgress::Complete(_) => return Ok(output),
+            // Monty resolves unknown names by asking the host. A probe has no
+            // tool catalogue by design, so every such name is undefined — which
+            // is what turns an unsupported construct into the `NameError` this
+            // module reports, rather than a hang.
+            RunProgress::NameLookup(lookup) => {
+                progress = lookup
+                    .resume(
+                        NameLookupResult::Undefined,
+                        PrintWriter::CollectString(&mut output, None),
+                    )
+                    .map_err(|exc| describe(&exc, "runtime error"))?;
+            }
+            // Anything else wanted something this module refuses to give it (a
+            // tool call, an OS call). That is a failed probe, not a pass.
+            other => return Err(format!("suspended instead of completing: {other:?}")),
+        }
     }
 }
 
@@ -92,7 +109,7 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "class",
         code: "class P:\n    def __init__(self, n):\n        self.n = n\n    def hi(self):\n        return self.n\nprint(P('ok').hi())\n",
-        supported: false,
+        supported: true,
         workaround: Some("linter::detects class"),
     },
     Capability {
@@ -104,17 +121,17 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "import",
         code: "import json\nprint('ok' if json.dumps({'a': 1}) else 'no')\n",
-        supported: false,
+        supported: true,
         workaround: Some("auto_fixer phase 3 strips imports"),
     },
-    // Probes `with` for *parse* support only. There is deliberately no context
-    // manager in the body: with `class` and `open()` both unsupported, nothing
-    // in the language can produce one, so a realistic probe would fail for the
-    // wrong reason and hide the answer to the question actually being asked.
+    // Uses a real context manager rather than `with 1 as x`. Once `class`
+    // landed, an int failing the protocol is correct Python semantics, not a
+    // missing feature — the parse-only probe would have reported "unsupported"
+    // for a `with` that actually works.
     Capability {
         name: "with",
-        code: "with 1 as x:\n    print('ok')\n",
-        supported: false,
+        code: "class C:\n    def __enter__(self):\n        return 'ok'\n    def __exit__(self, a, b, c):\n        return False\nwith C() as v:\n    print(v)\n",
+        supported: true,
         workaround: Some("linter::detects with"),
     },
     // Must actually `await`, not merely define an `async def`: Monty parsed
@@ -134,10 +151,14 @@ pub const CAPABILITIES: &[Capability] = &[
         supported: false,
         workaround: Some("linter::detects yield"),
     },
+    // The decorator must *change* what the function returns. An identity
+    // decorator cannot tell "applied" from "silently dropped", and Monty did
+    // silently drop them through v0.0.17 — so the obvious probe reported
+    // support for a feature that was quietly changing program behaviour.
     Capability {
         name: "decorator",
-        code: "def d(f):\n    return f\n@d\ndef g():\n    return 'ok'\nprint(g())\n",
-        supported: true,
+        code: "def d(f):\n    return lambda: 'ok'\n@d\ndef g():\n    return 'no'\nprint(g())\n",
+        supported: false,
         workaround: Some("auto_fixer phase 3 strips decorators"),
     },
     // ---- agent.md:183 "Builtin limitations" ----
@@ -162,9 +183,14 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "filter()",
         code: "print('ok' if list(filter(lambda x: x > 1, [1, 2, 3]))[0] == 2 else 'no')\n",
-        supported: false,
+        supported: true,
         workaround: Some("auto_fixer phase 2 rewrite; mechanical_fixer::fix_name_error_filter"),
     },
+    // Still unavailable, but the *shape* of the failure changed: Monty now
+    // offers `open` to the host as an external call rather than raising
+    // NameError. Nothing here provides it, so the probe reports a suspend —
+    // and `mechanical_fixer::fix_name_error_open`, which keys off the old
+    // NameError text, no longer has an error to match.
     Capability {
         name: "open()",
         code: "f = open('/dev/null', 'r')\nprint('ok')\n",
@@ -184,13 +210,13 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "re (native, no shell)",
         code: "import re\nprint('ok' if re.findall(r'\\d+', 'a1b22')[1] == '22' else 'no')\n",
-        supported: false,
+        supported: true,
         workaround: Some("auto_fixer phase 2b bridges re.* via run_command + python3"),
     },
     Capability {
         name: "datetime (native, no shell)",
         code: "import datetime\nprint('ok' if datetime.datetime(2026, 1, 2).year == 2026 else 'no')\n",
-        supported: false,
+        supported: true,
         workaround: Some("auto_fixer phase 2b bridges datetime.* via run_command + python3"),
     },
     Capability {
