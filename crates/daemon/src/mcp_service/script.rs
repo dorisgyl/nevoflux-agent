@@ -205,6 +205,29 @@ pub async fn run_describe(code: &str, stem: &str) -> Result<serde_json::Value, S
         .ok_or_else(|| "describe() returned no value".to_string())
 }
 
+/// A browser context for script tools to drive, when one can exist.
+///
+/// Script tools are meant to compose NevoFlux's own capabilities — a
+/// `google__search` that drives the live browser is the point of the feature,
+/// not an extra. Without a context the interpreter only pre-injects the
+/// non-browser builtins, and a script calling `web_search` dies with a bare
+/// `NameError` that says nothing about why.
+///
+/// Resolved per call rather than held: the browser registry changes as
+/// browsers connect and disconnect, and a context captured at startup would
+/// address a browser that has since gone.
+fn script_browser_context() -> Option<crate::wasm::services::BrowserContext> {
+    let template = crate::automation::CURRENT_SERVICES_TEMPLATE.get()?;
+    let browsers = crate::registry::CURRENT_BROWSER_REGISTRY.get()?;
+    // Same routing rule as the built-in tools: an MCP caller is not itself a
+    // browser, so the identity comes from the registry.
+    let entry = browsers.single().ok()?;
+    let mut services = template.clone();
+    services.proxy_id = entry.proxy_id;
+    services.client_identity = entry.client_identity;
+    services.browser_context()
+}
+
 /// Marker used to recognise a whole-directory failure in [`ScriptSource::reload`].
 const DIR_FAILURE_PREFIX: &str = "cannot read script directory";
 
@@ -483,8 +506,12 @@ impl crate::mcp_service::source::ToolSource for ScriptSource {
         };
 
         let program = format!("{code}\n\n{invocation}\n");
-        let outcome =
-            crate::agent::code_mode::execute_python_simple_with_timeout(&program, None, None, None);
+        let outcome = crate::agent::code_mode::execute_python_simple_with_timeout(
+            &program,
+            script_browser_context(),
+            None,
+            None,
+        );
         if !outcome.success {
             return Err(outcome
                 .error
@@ -817,6 +844,51 @@ mod tests {
         assert_eq!(report.loaded, 0);
         assert!(src.tools().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression this guards: script tools used to run with no browser
+    /// context, so a script calling `web_search` died with a bare `NameError`
+    /// and no hint that the capability was simply absent. Composing NevoFlux's
+    /// own tools is the point of script tools, not an extra.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_context_puts_browser_tools_in_scope() {
+        use crate::wasm::services::BrowserContext;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = BrowserContext {
+            sender: tx,
+            proxy_id: "p".to_string(),
+            client_identity: Vec::new(),
+            session_id: "s".to_string(),
+            asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
+        };
+
+        // Merely naming the function is enough: an absent tool is a NameError
+        // at lookup, so this separates "not injected" from "call failed".
+        let without = crate::agent::code_mode::execute_python_simple_with_timeout(
+            "web_search\n",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            without.error.unwrap_or_default().contains("web_search"),
+            "without a context web_search must be unknown"
+        );
+
+        let with = crate::agent::code_mode::execute_python_simple_with_timeout(
+            "web_search\n",
+            Some(ctx),
+            None,
+            None,
+        );
+        assert!(
+            with.success,
+            "with a context web_search must resolve, got: {:?}",
+            with.error
+        );
     }
 
     /// Never leave the endpoint empty because a reload went wrong.
