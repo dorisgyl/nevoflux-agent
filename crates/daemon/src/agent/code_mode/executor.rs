@@ -1559,10 +1559,12 @@ mod tests {
 
     #[test]
     fn test_auto_fix_applied() {
-        // Verify that auto-fixer runs: code with `import os` should have it stripped
-        let code = "import os\nx = 1 + 2\nprint(x)";
+        // The auto-fixer still strips imports of modules it shims. `os` would
+        // be the wrong example now — Monty provides it natively, so its import
+        // has to survive.
+        let code = "import functools\nx = 1 + 2\nprint(x)";
         let fixed = MontyAutoFixer::fix(code);
-        assert!(!fixed.contains("import os"));
+        assert!(!fixed.contains("import functools"));
         assert!(fixed.contains("x = 1 + 2"));
     }
 
@@ -1595,12 +1597,12 @@ mod tests {
         let executor = CodeModeExecutor::new();
         let result = executor
             .execute(
-                "class Foo:\n    pass",
+                "match x:\n    case 1:\n        pass",
                 &[],
                 |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
                 |_prompt| {
                     Box::pin(async {
-                        // Return valid code without class
+                        // Return valid code without the match statement
                         Ok("x = {\"type\": \"Foo\"}\nprint(x)".to_string())
                     })
                 },
@@ -1645,13 +1647,13 @@ mod tests {
         let executor = CodeModeExecutor::new();
         let result = executor
             .execute(
-                "class Foo:\n    pass",
+                "match x:\n    case 1:\n        pass",
                 &[],
                 |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
                 |_prompt| {
                     Box::pin(async {
-                        // Always return code with class (never fixes it)
-                        Ok("class Bar:\n    pass".to_string())
+                        // Always returns a match statement (never fixes it)
+                        Ok("match y:\n    case 2:\n        pass".to_string())
                     })
                 },
             )
@@ -1662,11 +1664,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_import_auto_stripped_before_execution() {
+    /// Native-module imports now run rather than being stripped, so code that
+    /// opens with them must still execute end to end.
+    async fn test_native_imports_execute() {
         let executor = CodeModeExecutor::new();
         let result = executor
             .execute(
-                "import os\nimport sys\nx = 10\nprint(x)",
+                "import os\nimport sys\nimport json\nx = 10\nprint(x)",
                 &[],
                 |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
                 |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),

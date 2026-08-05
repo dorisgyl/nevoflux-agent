@@ -32,22 +32,19 @@ impl MontyAutoFixer {
         // Phase 1: Strip markdown artifacts that LLMs sometimes include
         let code = Self::strip_markdown_artifacts(code);
 
-        // Phase 1b: Strip async/await — Monty external functions return
-        // synchronously, so `await func(...)` would cause
-        // `TypeError: 'str' object can't be awaited` at runtime.
-        let code = Self::strip_await(&code);
-
-        // Phase 2: Rewrite unsupported builtins patterns
-        let code = Self::rewrite_sorted_with_key(&code);
-        let code = Self::rewrite_map_filter(&code);
-        let code = Self::rewrite_math(&code);
+        // Phase 2: Shims for what Monty still lacks. Each one is here because
+        // `monty_capabilities` proves the real thing is missing — `sorted(key=)`,
+        // `map`, `filter`, `math`, `json`, `re` and `datetime` all work natively
+        // now, and their rewrites are gone.
+        //
+        // `os` is native but exposes no `path`, so that shim stays despite the
+        // module existing.
         let code = Self::rewrite_os_path(&code);
-        let code = Self::rewrite_json(&code);
         let code = Self::rewrite_reduce(&code);
         let code = Self::rewrite_counter(&code);
-        // Phase 2b: Bash-bridged stdlib rewrites (requires run_command tool)
-        let code = Self::rewrite_re(&code);
-        let code = Self::rewrite_datetime(&code);
+        // Phase 2b: Bash-bridged stdlib (requires the `run_command` tool, which
+        // `AutomationPolicy` withholds when allow_shell is false). Only the
+        // modules Monty still has no native version of.
         let code = Self::rewrite_random(&code);
         let code = Self::rewrite_time(&code);
 
@@ -57,15 +54,18 @@ impl MontyAutoFixer {
         for line in code.lines() {
             let trimmed = line.trim();
 
-            // Strip import statements: `import X` and `from X import Y`
-            if trimmed.starts_with("import ") {
-                continue;
-            }
-            if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+            // Strip the import only for modules this fixer shims. Monty binds
+            // a module's names only once imported, so dropping `import json`
+            // now breaks code that would otherwise run — while keeping
+            // `from collections import Counter` would raise
+            // ModuleNotFoundError even though the shim already bound the name.
+            if Self::imports_shimmed_module(trimmed) {
                 continue;
             }
 
-            // Strip decorator lines: lines starting with `@`
+            // Strip decorator lines: lines starting with `@`. Monty rejects
+            // decorators outright as of v0.0.19; through v0.0.17 it accepted
+            // and silently ignored them, which quietly changed behaviour.
             if trimmed.starts_with('@') {
                 continue;
             }
@@ -95,6 +95,40 @@ impl MontyAutoFixer {
         let trimmed_lines = &result_lines[start..];
 
         trimmed_lines.join("\n")
+    }
+
+    /// Modules this fixer shims, and whose imports therefore have to go.
+    ///
+    /// Deliberately *not* the complement of Monty's native module list: `os`
+    /// is native (so `import os` stays) even though `os.path` is shimmed,
+    /// because the shim rewrites the call site rather than the module.
+    ///
+    /// A module that is neither native nor shimmed — `itertools`,
+    /// `subprocess`, `requests` — keeps its import on purpose, so it fails as
+    /// a clear ModuleNotFoundError naming the module rather than as a
+    /// NameError several lines later.
+    const SHIMMED_MODULES: &'static [&'static str] =
+        &["collections", "functools", "random", "time"];
+
+    /// Whether `line` imports a module [`Self::SHIMMED_MODULES`] replaces.
+    ///
+    /// Handles `import X`, `import X as Y`, `import X.Y` and
+    /// `from X import Y`.
+    fn imports_shimmed_module(line: &str) -> bool {
+        let module = if let Some(rest) = line.strip_prefix("import ") {
+            rest.split_whitespace().next()
+        } else if let Some(rest) = line.strip_prefix("from ") {
+            if !line.contains(" import ") {
+                return false;
+            }
+            rest.split_whitespace().next()
+        } else {
+            return false;
+        };
+
+        module
+            .map(|m| m.split('.').next().unwrap_or(m))
+            .is_some_and(|root| Self::SHIMMED_MODULES.contains(&root))
     }
 
     /// Strip markdown artifacts that LLMs commonly embed in generated code.
@@ -132,22 +166,6 @@ impl MontyAutoFixer {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Strip `await` / `async def` / `async for` / `async with` keywords.
-    ///
-    /// Monty allows async/await syntax but external tool functions return
-    /// synchronously.  `await tool(...)` causes `TypeError: 'str' object
-    /// can't be awaited` at runtime.  Stripping before execution is the
-    /// cheapest fix (no LLM rewrite needed).
-    fn strip_await(code: &str) -> String {
-        if !code.contains("await ") && !code.contains("async ") {
-            return code.to_string();
-        }
-        code.replace("await ", "")
-            .replace("async def ", "def ")
-            .replace("async for ", "for ")
-            .replace("async with ", "with ")
     }
 
     /// Strip type annotations from simple variable assignments.
@@ -204,210 +222,6 @@ impl MontyAutoFixer {
         line.to_string()
     }
 
-    /// Rewrite `sorted(iterable, key=func)` → manual sort pattern.
-    ///
-    /// Monty doesn't support keyword arguments for `sorted()`.
-    /// Also rewrites `sorted(iterable, reverse=True)`.
-    ///
-    /// Transforms:
-    /// - `sorted(items, key=lambda x: x['name'])` → `_sorted_list = list(items); _sorted_list.sort(); _sorted_list`
-    ///   (but with a decorated-sort pattern for key functions)
-    /// - `sorted(items, key=func, reverse=True)` → same with .reverse()
-    ///
-    /// This is a best-effort transform for common patterns.
-    fn rewrite_sorted_with_key(code: &str) -> String {
-        // Strategy: find `sorted(` with `key=` and rewrite to a helper function
-        // that uses manual comparison-based sorting.
-        //
-        // We inject a helper function at the top, then replace
-        // `sorted(X, key=Y)` with `_keysort(X, Y)`
-        // `sorted(X, key=Y, reverse=True)` with `_keysort(X, Y, True)`
-        // `sorted(X, reverse=True)` with `_keysort(X, None, True)`
-
-        // Check if any sorted() or .sort() call uses keyword arguments
-        let has_sorted_key = code.contains("sorted(") && code.contains("key=");
-        let has_sorted_reverse = code.contains("sorted(") && code.contains("reverse=");
-        let has_sort_method =
-            code.contains(".sort(") && (code.contains("key=") || code.contains("reverse="));
-
-        if !has_sorted_key && !has_sorted_reverse && !has_sort_method {
-            return code.to_string();
-        }
-
-        // Inject helper function at the top.
-        // Uses insertion sort with slice concatenation to avoid subscript
-        // assignment (result[i] = x), which Monty does not support.
-        let helper = r#"def _keysort(items, key_fn=None, reverse=False):
-    result = []
-    for item in items:
-        k = key_fn(item) if key_fn else item
-        inserted = False
-        for i in range(len(result)):
-            rk = key_fn(result[i]) if key_fn else result[i]
-            do_insert = False
-            if reverse:
-                if k > rk:
-                    do_insert = True
-            else:
-                if k < rk:
-                    do_insert = True
-            if do_insert:
-                result = result[:i] + [item] + result[i:]
-                inserted = True
-                break
-        if not inserted:
-            result.append(item)
-    return result
-"#;
-
-        let mut result = code.to_string();
-
-        // Replace patterns: sorted(X, key=Y, reverse=Z) and sorted(X, key=Y)
-        // and sorted(X, reverse=Z)
-        // This is a simplified regex-free approach that handles common patterns.
-        result = Self::replace_sorted_calls(&result);
-
-        // Replace .sort(key=...) and .sort(reverse=...) method calls
-        // e.g. `data.sort(key=lambda x: x[0], reverse=True)` → `data = _keysort(data, lambda x: x[0], True)`
-        result = Self::replace_sort_method_calls(&result);
-
-        format!("{}\n{}", helper.trim(), result)
-    }
-
-    /// Replace sorted() calls with keyword args to use _keysort().
-    fn replace_sorted_calls(code: &str) -> String {
-        let mut result = String::new();
-        let mut chars = code.chars().peekable();
-        let mut i = 0;
-
-        while i < code.len() {
-            // Look for "sorted(" — use starts_with to avoid slicing at non-char-boundary
-            if code[i..].starts_with("sorted(") {
-                // Find the matching closing parenthesis
-                if let Some((args_str, end_pos)) = Self::extract_balanced_parens(code, i + 6) {
-                    // Check if args contain key= or reverse=
-                    if args_str.contains("key=") || args_str.contains("reverse=") {
-                        let rewritten = Self::rewrite_single_sorted(&args_str);
-                        result.push_str(&rewritten);
-                        i = end_pos + 1;
-                        // Advance the chars iterator to match
-                        chars = code[i..].chars().peekable();
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(c) = chars.next() {
-                result.push(c);
-                i += c.len_utf8();
-            } else {
-                break;
-            }
-        }
-
-        result
-    }
-
-    /// Replace `.sort(key=..., reverse=...)` method calls with `_keysort()`.
-    ///
-    /// Rewrites `var.sort(key=fn)` → `var = _keysort(var, fn)`
-    /// and `var.sort(key=fn, reverse=True)` → `var = _keysort(var, fn, True)`
-    /// and `var.sort(reverse=True)` → `var = _keysort(var, None, True)`
-    ///
-    /// Works line-by-line since `.sort()` is always a statement (no return value).
-    fn replace_sort_method_calls(code: &str) -> String {
-        let mut result_lines: Vec<String> = Vec::new();
-
-        for line in code.lines() {
-            let trimmed = line.trim();
-            // Find `.sort(` in the line
-            if let Some(sort_dot_pos) = trimmed.find(".sort(") {
-                let before_dot = trimmed[..sort_dot_pos].trim();
-                // The variable name is the identifier before `.sort(`
-                // Must be a simple identifier (no operators, no complex expressions)
-                if !before_dot.is_empty() && Self::is_simple_identifier(before_dot) {
-                    let paren_start_in_trimmed = sort_dot_pos + ".sort".len();
-                    if let Some((args_str, end_pos)) =
-                        Self::extract_balanced_parens(trimmed, paren_start_in_trimmed)
-                    {
-                        if args_str.contains("key=") || args_str.contains("reverse=") {
-                            // Check nothing follows the closing paren (it's a statement)
-                            let after = trimmed[end_pos + 1..].trim();
-                            if after.is_empty() || after.starts_with('#') {
-                                let rewritten =
-                                    Self::rewrite_single_sorted_for_method(before_dot, &args_str);
-                                // Preserve leading whitespace
-                                let indent = &line[..line.len() - line.trim_start().len()];
-                                result_lines.push(format!("{}{}", indent, rewritten));
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-            result_lines.push(line.to_string());
-        }
-
-        result_lines.join("\n")
-    }
-
-    /// Check if a string is a simple Python identifier (variable name, possibly with
-    /// subscript or attribute access like `data`, `self.items`, `results[0]`).
-    fn is_simple_identifier(s: &str) -> bool {
-        if s.is_empty() {
-            return false;
-        }
-        let bytes = s.as_bytes();
-        // Must start with letter or underscore
-        if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
-            return false;
-        }
-        // Allow alphanumeric, underscore, dot, brackets
-        let mut bracket_depth = 0i32;
-        for &b in bytes {
-            match b {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'\'' | b'"' => {}
-                b'[' => bracket_depth += 1,
-                b']' => bracket_depth -= 1,
-                _ if bracket_depth > 0 => {} // allow anything inside brackets
-                _ => return false,
-            }
-        }
-        bracket_depth == 0
-    }
-
-    /// Rewrite args for a .sort() method call to a _keysort() assignment.
-    /// `var.sort(key=fn, reverse=True)` → `var = _keysort(var, fn, True)`
-    fn rewrite_single_sorted_for_method(var_name: &str, args: &str) -> String {
-        let parts = Self::split_top_level_commas(args);
-
-        let mut key_fn = String::new();
-        let mut reverse = String::new();
-
-        for part in &parts {
-            let trimmed = part.trim();
-            if let Some(rest) = trimmed.strip_prefix("key=") {
-                key_fn = rest.trim().to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("reverse=") {
-                reverse = rest.trim().to_string();
-            }
-        }
-
-        if !key_fn.is_empty() && !reverse.is_empty() {
-            format!(
-                "{} = _keysort({}, {}, {})",
-                var_name, var_name, key_fn, reverse
-            )
-        } else if !key_fn.is_empty() {
-            format!("{} = _keysort({}, {})", var_name, var_name, key_fn)
-        } else if !reverse.is_empty() {
-            format!("{} = _keysort({}, None, {})", var_name, var_name, reverse)
-        } else {
-            // No keyword args, keep original
-            format!("{}.sort({})", var_name, args)
-        }
-    }
-
     /// Extract content inside balanced parentheses starting at `open_pos`.
     /// Returns (inner_content, close_paren_position).
     fn extract_balanced_parens(code: &str, open_pos: usize) -> Option<(String, usize)> {
@@ -444,249 +258,6 @@ impl MontyAutoFixer {
             i += 1;
         }
         None
-    }
-
-    /// Rewrite args of a single sorted() call to _keysort() call.
-    /// Input: the content inside sorted(...), e.g. "items, key=lambda x: x['name']"
-    /// Output: "_keysort(items, lambda x: x['name'])" etc.
-    fn rewrite_single_sorted(args: &str) -> String {
-        // Split by top-level commas (not inside parens/brackets)
-        let parts = Self::split_top_level_commas(args);
-
-        let mut iterable = String::new();
-        let mut key_fn = String::new();
-        let mut reverse = String::new();
-
-        for (idx, part) in parts.iter().enumerate() {
-            let trimmed = part.trim();
-            if let Some(rest) = trimmed.strip_prefix("key=") {
-                key_fn = rest.trim().to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("reverse=") {
-                reverse = rest.trim().to_string();
-            } else if idx == 0 {
-                iterable = trimmed.to_string();
-            }
-        }
-
-        if !key_fn.is_empty() && !reverse.is_empty() {
-            format!("_keysort({}, {}, {})", iterable, key_fn, reverse)
-        } else if !key_fn.is_empty() {
-            format!("_keysort({}, {})", iterable, key_fn)
-        } else if !reverse.is_empty() {
-            format!("_keysort({}, None, {})", iterable, reverse)
-        } else {
-            // No keyword args found, keep original
-            format!("sorted({})", args)
-        }
-    }
-
-    /// Split a string by commas, but only at the top level
-    /// (not inside parentheses, brackets, or braces).
-    fn split_top_level_commas(s: &str) -> Vec<String> {
-        let mut parts = Vec::new();
-        let mut current = String::new();
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut string_char = '"';
-
-        for ch in s.chars() {
-            if in_string {
-                current.push(ch);
-                if ch == string_char {
-                    in_string = false;
-                }
-                continue;
-            }
-            match ch {
-                '"' | '\'' => {
-                    in_string = true;
-                    string_char = ch;
-                    current.push(ch);
-                }
-                '(' | '[' | '{' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' | ']' | '}' => {
-                    depth -= 1;
-                    current.push(ch);
-                }
-                ',' if depth == 0 => {
-                    parts.push(current.clone());
-                    current.clear();
-                }
-                _ => {
-                    current.push(ch);
-                }
-            }
-        }
-        if !current.is_empty() {
-            parts.push(current);
-        }
-        parts
-    }
-
-    /// Rewrite `math.*` calls and constants to pure Python equivalents.
-    ///
-    /// Handles:
-    /// - `math.pi` → `3.141592653589793`
-    /// - `math.e` → `2.718281828459045`
-    /// - `math.inf` → `float("inf")`
-    /// - `math.sqrt(x)` → `(x) ** 0.5`
-    /// - `math.pow(x, y)` → `(x) ** (y)` (simplified; doesn't handle 3-arg pow)
-    /// - `math.fabs(x)` → `abs(x)`
-    /// - `math.floor(x)` → `_math_floor(x)` (injected helper)
-    /// - `math.ceil(x)` → `_math_ceil(x)` (injected helper)
-    /// - `math.log(x)` / `math.log(x, base)` → `_math_log(x)` / `_math_log(x, base)` (injected helper using Newton's method)
-    /// - `math.log2(x)` → `_math_log(x, 2)`
-    /// - `math.log10(x)` → `_math_log(x, 10)`
-    fn rewrite_math(code: &str) -> String {
-        if !code.contains("math.") {
-            return code.to_string();
-        }
-
-        let mut result = code.to_string();
-        let mut need_floor = false;
-        let mut need_ceil = false;
-        let mut need_log = false;
-
-        // Simple constant replacements
-        result = result.replace("math.pi", "3.141592653589793");
-        result = result.replace("math.e", "2.718281828459045");
-        result = result.replace("math.inf", "float(\"inf\")");
-
-        // math.fabs(x) → abs(x)
-        result = result.replace("math.fabs(", "abs(");
-
-        // math.sqrt(x) → (x) ** 0.5
-        // We need to find math.sqrt(...) and extract the argument
-        while result.contains("math.sqrt(") {
-            let pos = match result.find("math.sqrt(") {
-                Some(p) => p,
-                None => break,
-            };
-            let paren_start = pos + "math.sqrt".len();
-            if let Some((inner, end)) = Self::extract_balanced_parens(&result, paren_start) {
-                let replacement = format!("({}) ** 0.5", inner.trim());
-                result = format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
-            } else {
-                break;
-            }
-        }
-
-        // math.pow(x, y) → (x) ** (y)
-        while result.contains("math.pow(") {
-            let pos = match result.find("math.pow(") {
-                Some(p) => p,
-                None => break,
-            };
-            let paren_start = pos + "math.pow".len();
-            if let Some((inner, end)) = Self::extract_balanced_parens(&result, paren_start) {
-                let parts = Self::split_top_level_commas(&inner);
-                if parts.len() == 2 {
-                    let replacement = format!("({}) ** ({})", parts[0].trim(), parts[1].trim());
-                    result = format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // math.floor(x) → _math_floor(x)
-        if result.contains("math.floor(") {
-            need_floor = true;
-            result = result.replace("math.floor(", "_math_floor(");
-        }
-
-        // math.ceil(x) → _math_ceil(x)
-        if result.contains("math.ceil(") {
-            need_ceil = true;
-            result = result.replace("math.ceil(", "_math_ceil(");
-        }
-
-        // math.log2(x) → _math_log(x, 2)
-        while result.contains("math.log2(") {
-            let pos = match result.find("math.log2(") {
-                Some(p) => p,
-                None => break,
-            };
-            let paren_start = pos + "math.log2".len();
-            if let Some((inner, end)) = Self::extract_balanced_parens(&result, paren_start) {
-                need_log = true;
-                let replacement = format!("_math_log({}, 2)", inner.trim());
-                result = format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
-            } else {
-                break;
-            }
-        }
-
-        // math.log10(x) → _math_log(x, 10)
-        while result.contains("math.log10(") {
-            let pos = match result.find("math.log10(") {
-                Some(p) => p,
-                None => break,
-            };
-            let paren_start = pos + "math.log10".len();
-            if let Some((inner, end)) = Self::extract_balanced_parens(&result, paren_start) {
-                need_log = true;
-                let replacement = format!("_math_log({}, 10)", inner.trim());
-                result = format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
-            } else {
-                break;
-            }
-        }
-
-        // math.log(x) or math.log(x, base) → _math_log(x) or _math_log(x, base)
-        if result.contains("math.log(") {
-            need_log = true;
-            result = result.replace("math.log(", "_math_log(");
-        }
-
-        // Inject helpers
-        let mut helpers = String::new();
-        if need_floor {
-            helpers.push_str("def _math_floor(x):\n    n = int(x)\n    if x < 0 and x != n:\n        return n - 1\n    return n\n");
-        }
-        if need_ceil {
-            helpers.push_str("def _math_ceil(x):\n    n = int(x)\n    if x > n:\n        return n + 1\n    return n\n");
-        }
-        if need_log {
-            // Natural log via Newton's method (ln), then log(x, base) = ln(x) / ln(base)
-            helpers.push_str(concat!(
-                "def _math_log(x, base=None):\n",
-                "    if x <= 0:\n",
-                "        return float(\"inf\")\n",
-                "    ln = 0.0\n",
-                "    if x < 1:\n",
-                "        x = 1.0 / x\n",
-                "        ln = -1.0\n",
-                "    else:\n",
-                "        ln = 0.0\n",
-                "    y = (x - 1) / (x + 1)\n",
-                "    y2 = y * y\n",
-                "    term = y\n",
-                "    s = term\n",
-                "    for i in range(1, 100):\n",
-                "        term = term * y2\n",
-                "        s = s + term / (2 * i + 1)\n",
-                "    result = 2.0 * s\n",
-                "    if ln < 0:\n",
-                "        result = -result\n",
-                "    if base is not None:\n",
-                "        lb = _math_log(base)\n",
-                "        if lb != 0:\n",
-                "            return result / lb\n",
-                "    return result\n",
-            ));
-        }
-
-        if helpers.is_empty() {
-            result
-        } else {
-            format!("{}\n{}", helpers.trim(), result)
-        }
     }
 
     /// Rewrite `os.path.join(...)` to a pure Python helper.
@@ -798,186 +369,6 @@ impl MontyAutoFixer {
         }
     }
 
-    /// Rewrite `json.dumps(x)` and `json.loads(s)` to pure Python helpers.
-    ///
-    /// `_json_dumps` recursively serializes dict/list/str/int/float/bool/None.
-    /// `_json_loads` is a recursive descent parser for JSON strings.
-    fn rewrite_json(code: &str) -> String {
-        let has_dumps = code.contains("json.dumps(");
-        let has_loads = code.contains("json.loads(");
-        // Also handle standalone calls after `from json import dumps, loads`
-        let has_json_import = code.contains("import json") || code.contains("from json import");
-        let has_standalone_dumps = has_json_import && Self::has_standalone_call(code, "dumps");
-        let has_standalone_loads = has_json_import && Self::has_standalone_call(code, "loads");
-
-        let need_dumps = has_dumps || has_standalone_dumps;
-        let need_loads = has_loads || has_standalone_loads;
-
-        if !need_dumps && !need_loads {
-            return code.to_string();
-        }
-
-        let mut helpers = String::new();
-        let mut result = code.to_string();
-
-        if need_dumps {
-            helpers.push_str(concat!(
-                "def _json_dumps(obj, indent=None):\n",
-                "    if obj is None:\n",
-                "        return \"null\"\n",
-                "    if obj is True:\n",
-                "        return \"true\"\n",
-                "    if obj is False:\n",
-                "        return \"false\"\n",
-                "    if type(obj) == int or type(obj) == float:\n",
-                "        return str(obj)\n",
-                "    if type(obj) == str:\n",
-                "        s = obj.replace(\"\\\\\", \"\\\\\\\\\").replace('\"', '\\\\\"')\n",
-                "        s = s.replace(\"\\n\", \"\\\\n\").replace(\"\\t\", \"\\\\t\")\n",
-                "        return '\"' + s + '\"'\n",
-                "    if type(obj) == list:\n",
-                "        parts = []\n",
-                "        for item in obj:\n",
-                "            parts.append(_json_dumps(item))\n",
-                "        return \"[\" + \", \".join(parts) + \"]\"\n",
-                "    if type(obj) == dict:\n",
-                "        parts = []\n",
-                "        for k in obj:\n",
-                "            parts.append(_json_dumps(str(k)) + \": \" + _json_dumps(obj[k]))\n",
-                "        return \"{\" + \", \".join(parts) + \"}\"\n",
-                "    return str(obj)\n",
-            ));
-            result = result.replace("json.dumps(", "_json_dumps(");
-            if has_standalone_dumps {
-                result = Self::replace_standalone_call(&result, "dumps", "_json_dumps");
-            }
-        }
-
-        if need_loads {
-            // Order matters: Monty requires functions to be defined before
-            // they are referenced.  Leaf helpers first, then the recursive
-            // dispatcher, then the public entry-point last.
-            helpers.push_str(concat!(
-                // --- leaf helpers (no inter-function deps) ---
-                "def _json_skip_ws(s, i):\n",
-                "    while i < len(s) and s[i] in \" \\t\\n\\r\":\n",
-                "        i = i + 1\n",
-                "    return i\n",
-                "\n",
-                "def _json_parse_str(s, i):\n",
-                "    i = i + 1\n",
-                "    result = \"\"\n",
-                "    while i < len(s) and s[i] != '\"':\n",
-                "        if s[i] == '\\\\':\n",
-                "            i = i + 1\n",
-                "            if i < len(s):\n",
-                "                esc = s[i]\n",
-                "                if esc == 'n':\n",
-                "                    result = result + \"\\n\"\n",
-                "                elif esc == 't':\n",
-                "                    result = result + \"\\t\"\n",
-                "                elif esc == '\"':\n",
-                "                    result = result + '\"'\n",
-                "                elif esc == '\\\\':\n",
-                "                    result = result + '\\\\'\n",
-                "                elif esc == '/':\n",
-                "                    result = result + '/'\n",
-                "                else:\n",
-                "                    result = result + esc\n",
-                "        else:\n",
-                "            result = result + s[i]\n",
-                "        i = i + 1\n",
-                "    return [result, i + 1]\n",
-                "\n",
-                "def _json_parse_num(s, i):\n",
-                "    start = i\n",
-                "    if i < len(s) and s[i] == '-':\n",
-                "        i = i + 1\n",
-                "    while i < len(s) and s[i] in \"0123456789\":\n",
-                "        i = i + 1\n",
-                "    is_float = False\n",
-                "    if i < len(s) and s[i] == '.':\n",
-                "        is_float = True\n",
-                "        i = i + 1\n",
-                "        while i < len(s) and s[i] in \"0123456789\":\n",
-                "            i = i + 1\n",
-                "    if i < len(s) and s[i] in \"eE\":\n",
-                "        is_float = True\n",
-                "        i = i + 1\n",
-                "        if i < len(s) and s[i] in \"+-\":\n",
-                "            i = i + 1\n",
-                "        while i < len(s) and s[i] in \"0123456789\":\n",
-                "            i = i + 1\n",
-                "    raw = s[start:i]\n",
-                "    if is_float:\n",
-                "        return [float(raw), i]\n",
-                "    return [int(raw), i]\n",
-                "\n",
-                // --- recursive dispatcher (inlines obj/arr to avoid cycles) ---
-                "def _json_parse(s, i):\n",
-                "    i = _json_skip_ws(s, i)\n",
-                "    if i >= len(s):\n",
-                "        return [None, i]\n",
-                "    c = s[i]\n",
-                "    if c == '\"':\n",
-                "        return _json_parse_str(s, i)\n",
-                "    if c == '{':\n",
-                "        i = i + 1\n",
-                "        obj = {}\n",
-                "        i = _json_skip_ws(s, i)\n",
-                "        if i < len(s) and s[i] == '}':\n",
-                "            return [obj, i + 1]\n",
-                "        while i < len(s):\n",
-                "            i = _json_skip_ws(s, i)\n",
-                "            key, i = _json_parse_str(s, i)\n",
-                "            i = _json_skip_ws(s, i)\n",
-                "            i = i + 1\n",
-                "            val, i = _json_parse(s, i)\n",
-                "            obj[key] = val\n",
-                "            i = _json_skip_ws(s, i)\n",
-                "            if i < len(s) and s[i] == ',':\n",
-                "                i = i + 1\n",
-                "            else:\n",
-                "                break\n",
-                "        return [obj, i + 1]\n",
-                "    if c == '[':\n",
-                "        i = i + 1\n",
-                "        arr = []\n",
-                "        i = _json_skip_ws(s, i)\n",
-                "        if i < len(s) and s[i] == ']':\n",
-                "            return [arr, i + 1]\n",
-                "        while i < len(s):\n",
-                "            val, i = _json_parse(s, i)\n",
-                "            arr.append(val)\n",
-                "            i = _json_skip_ws(s, i)\n",
-                "            if i < len(s) and s[i] == ',':\n",
-                "                i = i + 1\n",
-                "            else:\n",
-                "                break\n",
-                "        return [arr, i + 1]\n",
-                "    if s[i:i+4] == \"true\":\n",
-                "        return [True, i + 4]\n",
-                "    if s[i:i+5] == \"false\":\n",
-                "        return [False, i + 5]\n",
-                "    if s[i:i+4] == \"null\":\n",
-                "        return [None, i + 4]\n",
-                "    return _json_parse_num(s, i)\n",
-                "\n",
-                // --- public entry-point (all deps defined above) ---
-                "def _json_loads(s):\n",
-                "    s = s.strip()\n",
-                "    val, _ = _json_parse(s, 0)\n",
-                "    return val\n",
-            ));
-            result = result.replace("json.loads(", "_json_loads(");
-            if has_standalone_loads {
-                result = Self::replace_standalone_call(&result, "loads", "_json_loads");
-            }
-        }
-
-        format!("{}\n{}", helpers.trim(), result)
-    }
-
     /// Rewrite `reduce(func, iterable)` and `functools.reduce(func, iterable)`.
     ///
     /// Injects a `_reduce` helper and replaces calls.
@@ -1053,265 +444,6 @@ impl MontyAutoFixer {
         }
 
         format!("{}\n{}", helper.trim(), result)
-    }
-
-    /// Rewrite `map(func, iterable)` and `filter(func, iterable)` to helper functions.
-    ///
-    /// Monty doesn't have `map` or `filter` as builtins.
-    /// Injects `_map` and `_filter` helper functions and replaces calls.
-    ///
-    /// Only replaces standalone calls — not `obj.map(...)` or `"map"` in strings.
-    fn rewrite_map_filter(code: &str) -> String {
-        let needs_map = Self::has_standalone_call(code, "map");
-        let needs_filter = Self::has_standalone_call(code, "filter");
-
-        if !needs_map && !needs_filter {
-            return code.to_string();
-        }
-
-        let mut helpers = String::new();
-        let mut result = code.to_string();
-
-        if needs_map {
-            helpers.push_str(
-                "def _map(fn, items):\n    result = []\n    for _x in items:\n        result.append(fn(_x))\n    return result\n",
-            );
-            result = Self::replace_standalone_call(&result, "map", "_map");
-        }
-
-        if needs_filter {
-            helpers.push_str(
-                "def _filter(fn, items):\n    result = []\n    for _x in items:\n        if fn(_x):\n            result.append(_x)\n    return result\n",
-            );
-            result = Self::replace_standalone_call(&result, "filter", "_filter");
-        }
-
-        format!("{}\n{}", helpers.trim(), result)
-    }
-
-    /// Rewrite `re.*` calls to use `run_command("python3 -c ...")`.
-    ///
-    /// Injects helpers: `_re_findall`, `_re_search`, `_re_sub`, `_re_split`, `_re_match`.
-    /// Each helper builds a python3 one-liner that uses the real `re` module
-    /// and parses the output back.
-    fn rewrite_re(code: &str) -> String {
-        if !code.contains("re.") {
-            return code.to_string();
-        }
-
-        let needs_findall = code.contains("re.findall(");
-        let needs_search = code.contains("re.search(");
-        let needs_sub = code.contains("re.sub(");
-        let needs_split = code.contains("re.split(");
-        let needs_match = code.contains("re.match(");
-
-        if !needs_findall && !needs_search && !needs_sub && !needs_split && !needs_match {
-            return code.to_string();
-        }
-
-        let mut helpers = String::new();
-        let mut result = code.to_string();
-
-        // Common JSON parse helper (reuse _json_loads if present, else add inline)
-        let needs_json_parse = needs_findall || needs_search || needs_split || needs_match;
-        if needs_json_parse && !result.contains("def _json_loads(") {
-            helpers.push_str(concat!(
-                "def _json_parse_simple(s):\n",
-                "    if isinstance(s, list) or isinstance(s, dict):\n",
-                "        return s\n",
-                "    s = str(s).strip()\n",
-                "    if s == \"null\" or s == \"None\":\n",
-                "        return None\n",
-                "    if s[0:1] == \"[\":\n",
-                "        inner = s[1:-1].strip()\n",
-                "        if inner == \"\":\n",
-                "            return []\n",
-                "        parts = []\n",
-                "        current = \"\"\n",
-                "        depth = 0\n",
-                "        in_str = False\n",
-                "        for c in inner:\n",
-                "            if in_str:\n",
-                "                current = current + c\n",
-                "                if c == '\"':\n",
-                "                    in_str = False\n",
-                "            elif c == '\"':\n",
-                "                in_str = True\n",
-                "                current = current + c\n",
-                "            elif c in \"([{\":\n",
-                "                depth = depth + 1\n",
-                "                current = current + c\n",
-                "            elif c in \")]}\":\n",
-                "                depth = depth - 1\n",
-                "                current = current + c\n",
-                "            elif c == \",\" and depth == 0:\n",
-                "                parts.append(current.strip())\n",
-                "                current = \"\"\n",
-                "            else:\n",
-                "                current = current + c\n",
-                "        if current.strip():\n",
-                "            parts.append(current.strip())\n",
-                "        result = []\n",
-                "        for p in parts:\n",
-                "            if p[0:1] == \"'\" or p[0:1] == '\"':\n",
-                "                result.append(p[1:-1])\n",
-                "            else:\n",
-                "                result.append(p)\n",
-                "        return result\n",
-                "    if s[0:1] == \"'\" or s[0:1] == '\"':\n",
-                "        return s[1:-1]\n",
-                "    return s\n",
-            ));
-        }
-
-        // NOTE: python3 commands use aliased imports (`import re as _R, json as _J`)
-        // to avoid `rewrite_json`'s global `str::replace("json.dumps(", ...)` from
-        // corrupting the command strings during LLM rewrite cycles.
-
-        if needs_findall {
-            helpers.push_str(concat!(
-                "def _re_findall(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; print(_J.dumps(_R.findall(sys.argv[1], sys.argv[2])))\" '\n",
-                "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
-                "    out = run_command(cmd)\n",
-                "    return _json_parse_simple(out)\n",
-            ));
-            result = result.replace("re.findall(", "_re_findall(");
-        }
-
-        if needs_search {
-            helpers.push_str(concat!(
-                "def _re_search(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; m=_R.search(sys.argv[1],sys.argv[2]); print(_J.dumps(m.group(0) if m else None))\" '\n",
-                "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
-                "    out = run_command(cmd)\n",
-                "    return _json_parse_simple(out)\n",
-            ));
-            result = result.replace("re.search(", "_re_search(");
-        }
-
-        if needs_match {
-            helpers.push_str(concat!(
-                "def _re_match(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; m=_R.match(sys.argv[1],sys.argv[2]); print(_J.dumps(m.group(0) if m else None))\" '\n",
-                "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
-                "    out = run_command(cmd)\n",
-                "    return _json_parse_simple(out)\n",
-            ));
-            result = result.replace("re.match(", "_re_match(");
-        }
-
-        if needs_sub {
-            helpers.push_str(concat!(
-                "def _re_sub(pattern, repl, text):\n",
-                "    cmd = 'python3 -c \"import re as _R,sys; print(_R.sub(sys.argv[1],sys.argv[2],sys.argv[3]))\" '\n",
-                "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(repl) + ' ' + _shell_quote(text)\n",
-                "    out = run_command(cmd)\n",
-                "    return out.strip()\n",
-            ));
-            result = result.replace("re.sub(", "_re_sub(");
-        }
-
-        if needs_split {
-            helpers.push_str(concat!(
-                "def _re_split(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; print(_J.dumps(_R.split(sys.argv[1],sys.argv[2])))\" '\n",
-                "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
-                "    out = run_command(cmd)\n",
-                "    return _json_parse_simple(out)\n",
-            ));
-            result = result.replace("re.split(", "_re_split(");
-        }
-
-        // Shell quoting helper
-        if !helpers.is_empty() && !result.contains("def _shell_quote(") {
-            helpers = format!(
-                "def _shell_quote(s):\n    return \"'\" + str(s).replace(\"'\", \"'\\\\''\" ) + \"'\"\n{}",
-                helpers
-            );
-        }
-
-        format!("{}\n{}", helpers.trim(), result)
-    }
-
-    /// Rewrite `datetime.*` calls to use `run_command`.
-    ///
-    /// Handles:
-    /// - `datetime.datetime.now()` → current datetime string
-    /// - `datetime.date.today()` → current date string
-    /// - `datetime.datetime.strptime(s, fmt)` → parsed datetime dict
-    /// - `datetime.datetime.fromisoformat(s)` → parsed datetime dict
-    fn rewrite_datetime(code: &str) -> String {
-        if !code.contains("datetime.") {
-            return code.to_string();
-        }
-
-        let needs_now = code.contains("datetime.datetime.now(") || code.contains("datetime.now(");
-        let needs_today = code.contains("datetime.date.today(");
-        let needs_strptime =
-            code.contains("datetime.datetime.strptime(") || code.contains("datetime.strptime(");
-        let needs_fromisoformat = code.contains("datetime.datetime.fromisoformat(")
-            || code.contains("datetime.fromisoformat(");
-
-        if !needs_now && !needs_today && !needs_strptime && !needs_fromisoformat {
-            return code.to_string();
-        }
-
-        let mut helpers = String::new();
-        let mut result = code.to_string();
-
-        // Shell quoting helper
-        if !result.contains("def _shell_quote(") {
-            helpers.push_str("def _shell_quote(s):\n    return \"'\" + str(s).replace(\"'\", \"'\\\\''\" ) + \"'\"\n");
-        }
-
-        if needs_now {
-            helpers.push_str(concat!(
-                "def _datetime_now():\n",
-                "    out = run_command('python3 -c \"import datetime; print(datetime.datetime.now().isoformat())\"')\n",
-                "    return out.strip()\n",
-            ));
-            result = result.replace("datetime.datetime.now()", "_datetime_now()");
-            result = result.replace("datetime.now()", "_datetime_now()");
-        }
-
-        if needs_today {
-            helpers.push_str(concat!(
-                "def _date_today():\n",
-                "    out = run_command('python3 -c \"import datetime; print(datetime.date.today().isoformat())\"')\n",
-                "    return out.strip()\n",
-            ));
-            result = result.replace("datetime.date.today()", "_date_today()");
-        }
-
-        if needs_strptime {
-            helpers.push_str(concat!(
-                "def _datetime_strptime(date_str, fmt):\n",
-                "    cmd = 'python3 -c \"import datetime,sys; d=datetime.datetime.strptime(sys.argv[1],sys.argv[2]); print(d.isoformat())\" '\n",
-                "    cmd = cmd + _shell_quote(date_str) + ' ' + _shell_quote(fmt)\n",
-                "    out = run_command(cmd)\n",
-                "    return out.strip()\n",
-            ));
-            result = result.replace("datetime.datetime.strptime(", "_datetime_strptime(");
-            result = result.replace("datetime.strptime(", "_datetime_strptime(");
-        }
-
-        if needs_fromisoformat {
-            helpers.push_str(concat!(
-                "def _datetime_fromisoformat(s):\n",
-                "    cmd = 'python3 -c \"import datetime,sys; print(datetime.datetime.fromisoformat(sys.argv[1]).isoformat())\" '\n",
-                "    cmd = cmd + _shell_quote(s)\n",
-                "    out = run_command(cmd)\n",
-                "    return out.strip()\n",
-            ));
-            result = result.replace(
-                "datetime.datetime.fromisoformat(",
-                "_datetime_fromisoformat(",
-            );
-            result = result.replace("datetime.fromisoformat(", "_datetime_fromisoformat(");
-        }
-
-        format!("{}\n{}", helpers.trim(), result)
     }
 
     /// Rewrite `random.*` calls to use `run_command`.
@@ -1529,24 +661,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strip_await() {
-        let code = "result = await browser_eval_js(\"document.title\")\nprint(result)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(!fixed.contains("await "));
-        assert!(fixed.contains("result = browser_eval_js(\"document.title\")"));
-    }
-
-    #[test]
-    fn test_strip_async_def() {
-        let code = "async def fetch():\n    data = await get_data()\n    return data";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(!fixed.contains("async "));
-        assert!(!fixed.contains("await "));
-        assert!(fixed.contains("def fetch():"));
-        assert!(fixed.contains("data = get_data()"));
-    }
-
-    #[test]
     fn test_no_strip_await_when_absent() {
         let code = "x = browser_eval_js(\"test\")\nprint(x)";
         let fixed = MontyAutoFixer::fix(code);
@@ -1554,10 +668,39 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_imports() {
+    /// Imports of natively-supported modules must survive: Monty binds those
+    /// names only once imported, so stripping the line breaks working code.
+    fn test_native_imports_are_kept() {
         let code = "import os\nimport sys\nx = 1\nfrom pathlib import Path\ny = 2";
         let fixed = MontyAutoFixer::fix(code);
-        assert_eq!(fixed, "x = 1\ny = 2");
+        assert_eq!(fixed, code);
+    }
+
+    /// Imports of modules this fixer shims must still go — the shim already
+    /// bound the name, and Monty has no such module to import.
+    #[test]
+    fn test_shimmed_imports_are_stripped() {
+        for code in [
+            "from collections import Counter\nx = 1",
+            "import functools\nx = 1",
+            "import random\nx = 1",
+            "import time as t\nx = 1",
+        ] {
+            let fixed = MontyAutoFixer::fix(code);
+            assert!(
+                !fixed.contains("import"),
+                "shimmed import should be stripped from {code:?}, got {fixed:?}"
+            );
+        }
+    }
+
+    /// A module that is neither native nor shimmed keeps its import, so it
+    /// fails as a ModuleNotFoundError naming the module rather than as a
+    /// NameError somewhere further down.
+    #[test]
+    fn test_unknown_imports_are_left_to_fail_loudly() {
+        let fixed = MontyAutoFixer::fix("import itertools\nx = 1");
+        assert!(fixed.contains("import itertools"), "got {fixed:?}");
     }
 
     #[test]
@@ -1568,11 +711,12 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_typing_imports() {
+    fn test_strip_typing_annotations() {
         let code = "from typing import List, Dict\nx: List[int] = [1, 2]";
         let fixed = MontyAutoFixer::fix(code);
-        // Both the import AND the type annotation are stripped
-        assert_eq!(fixed, "x = [1, 2]");
+        // `typing` is native, so its import stays; the annotation still goes,
+        // because Monty does not parse annotated assignments.
+        assert_eq!(fixed, "from typing import List, Dict\nx = [1, 2]");
     }
 
     #[test]
@@ -1605,11 +749,11 @@ mod tests {
 
     #[test]
     fn test_mixed_code() {
-        let code = "import os\nfrom typing import List\n\n@dataclass\ndef process(items):\n    x = compute()  # type: ignore\n    return x";
+        let code = "import functools\nfrom typing import List\n\n@dataclass\ndef process(items):\n    x = compute()  # type: ignore\n    return x";
         let fixed = MontyAutoFixer::fix(code);
         assert_eq!(
             fixed,
-            "def process(items):\n    x = compute()\n    return x"
+            "from typing import List\n\ndef process(items):\n    x = compute()\n    return x"
         );
     }
 
@@ -1620,9 +764,8 @@ mod tests {
     }
 
     #[test]
-    fn test_only_imports() {
-        let code = "import os\nimport sys\nfrom pathlib import Path";
-        let fixed = MontyAutoFixer::fix(code);
+    fn test_only_shimmed_imports_reduces_to_nothing() {
+        let fixed = MontyAutoFixer::fix("import functools\nimport random");
         assert_eq!(fixed, "");
     }
 
@@ -1726,29 +869,6 @@ mod tests {
     // === sorted() keyword argument rewriting tests ===
 
     #[test]
-    fn test_sorted_with_key_lambda() {
-        let code = "result = sorted(items, key=lambda x: x['name'])";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort(items, lambda x: x['name'])"));
-        assert!(fixed.contains("def _keysort("));
-        assert!(!fixed.contains("sorted(items, key="));
-    }
-
-    #[test]
-    fn test_sorted_with_key_and_reverse() {
-        let code = "result = sorted(data, key=lambda x: x[1], reverse=True)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort(data, lambda x: x[1], True)"));
-    }
-
-    #[test]
-    fn test_sorted_with_reverse_only() {
-        let code = "result = sorted(nums, reverse=True)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort(nums, None, True)"));
-    }
-
-    #[test]
     fn test_sorted_without_key_unchanged() {
         let code = "result = sorted(items)";
         let fixed = MontyAutoFixer::fix(code);
@@ -1756,48 +876,7 @@ mod tests {
         assert!(!fixed.contains("_keysort"));
     }
 
-    #[test]
-    fn test_sorted_multiple_calls() {
-        let code = "a = sorted(x, key=lambda i: i)\nb = sorted(y, key=lambda j: j)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort(x, lambda i: i)"));
-        assert!(fixed.contains("_keysort(y, lambda j: j)"));
-        // Helper should only appear once
-        let count = fixed.matches("def _keysort(").count();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_sorted_nested_in_expression() {
-        let code = "for item in sorted(data, key=lambda x: x['count']):\n    print(item)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort(data, lambda x: x['count'])"));
-    }
-
     // === .sort() method rewriting tests ===
-
-    #[test]
-    fn test_sort_method_with_key() {
-        let code = "items.sort(key=lambda x: x['name'])";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("items = _keysort(items, lambda x: x['name'])"));
-        assert!(fixed.contains("def _keysort("));
-        assert!(!fixed.contains(".sort("));
-    }
-
-    #[test]
-    fn test_sort_method_with_key_and_reverse() {
-        let code = "jobs_data.sort(key=lambda x: x['match_score'], reverse=True)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("jobs_data = _keysort(jobs_data, lambda x: x['match_score'], True)"));
-    }
-
-    #[test]
-    fn test_sort_method_with_reverse_only() {
-        let code = "nums.sort(reverse=True)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("nums = _keysort(nums, None, True)"));
-    }
 
     #[test]
     fn test_sort_method_without_key_unchanged() {
@@ -1807,44 +886,7 @@ mod tests {
         assert!(!fixed.contains("_keysort"));
     }
 
-    #[test]
-    fn test_sort_method_preserves_indent() {
-        let code = "    data.sort(key=lambda x: x[0])";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("    data = _keysort(data, lambda x: x[0])"));
-    }
-
-    #[test]
-    fn test_sort_method_with_attribute_access() {
-        let code = "self.items.sort(key=lambda x: x.name)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("self.items = _keysort(self.items, lambda x: x.name)"));
-    }
-
     // === map() rewriting tests ===
-
-    #[test]
-    fn test_map_lambda() {
-        let code = "result = list(map(lambda x: x * 2, items))";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_map(lambda x: x * 2, items)"));
-        assert!(fixed.contains("def _map("));
-        assert!(!fixed.contains(" map(lambda"));
-    }
-
-    #[test]
-    fn test_map_function_ref() {
-        let code = "result = list(map(str, numbers))";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_map(str, numbers)"));
-    }
-
-    #[test]
-    fn test_map_in_for_loop() {
-        let code = "for x in map(int, values):\n    print(x)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_map(int, values)"));
-    }
 
     #[test]
     fn test_no_replace_method_map() {
@@ -1868,22 +910,6 @@ mod tests {
     // === filter() rewriting tests ===
 
     #[test]
-    fn test_filter_lambda() {
-        let code = "result = list(filter(lambda x: x > 0, items))";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_filter(lambda x: x > 0, items)"));
-        assert!(fixed.contains("def _filter("));
-        assert!(!fixed.contains(" filter(lambda"));
-    }
-
-    #[test]
-    fn test_filter_function_ref() {
-        let code = "result = list(filter(None, items))";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_filter(None, items)"));
-    }
-
-    #[test]
     fn test_no_replace_method_filter() {
         let code = "qs = queryset.filter(active=True)";
         let fixed = MontyAutoFixer::fix(code);
@@ -1892,15 +918,6 @@ mod tests {
     }
 
     // === Combined tests ===
-
-    #[test]
-    fn test_map_and_filter_together() {
-        let code = "result = list(map(str, filter(lambda x: x > 0, nums)))";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_map(str, _filter(lambda x: x > 0, nums))"));
-        assert!(fixed.contains("def _map("));
-        assert!(fixed.contains("def _filter("));
-    }
 
     #[test]
     fn test_no_map_filter_when_absent() {
@@ -1913,115 +930,10 @@ mod tests {
     // === math.* rewriting tests ===
 
     #[test]
-    fn test_math_pi_constant() {
-        let code = "import math\narea = math.pi * r * r";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("3.141592653589793"));
-        assert!(!fixed.contains("math.pi"));
-        assert!(!fixed.contains("import math"));
-    }
-
-    #[test]
-    fn test_math_e_constant() {
-        let code = "import math\nval = math.e";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("2.718281828459045"));
-    }
-
-    #[test]
-    fn test_math_sqrt() {
-        let code = "import math\nx = math.sqrt(16)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("(16) ** 0.5"));
-        assert!(!fixed.contains("math.sqrt"));
-    }
-
-    #[test]
-    fn test_math_sqrt_expression() {
-        let code = "y = math.sqrt(a + b)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("(a + b) ** 0.5"));
-    }
-
-    #[test]
-    fn test_math_pow() {
-        let code = "import math\nresult = math.pow(2, 10)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("(2) ** (10)"));
-        assert!(!fixed.contains("math.pow"));
-    }
-
-    #[test]
-    fn test_math_fabs() {
-        let code = "import math\nx = math.fabs(-5)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("abs(-5)"));
-        assert!(!fixed.contains("math.fabs"));
-    }
-
-    #[test]
-    fn test_math_floor() {
-        let code = "import math\nn = math.floor(3.7)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_math_floor(3.7)"));
-        assert!(fixed.contains("def _math_floor("));
-        assert!(!fixed.contains("math.floor"));
-    }
-
-    #[test]
-    fn test_math_ceil() {
-        let code = "import math\nn = math.ceil(3.2)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_math_ceil(3.2)"));
-        assert!(fixed.contains("def _math_ceil("));
-    }
-
-    #[test]
-    fn test_math_log() {
-        let code = "import math\nx = math.log(100)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_math_log(100)"));
-        assert!(fixed.contains("def _math_log("));
-    }
-
-    #[test]
-    fn test_math_log2() {
-        let code = "import math\nx = math.log2(8)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_math_log(8, 2)"));
-    }
-
-    #[test]
-    fn test_math_log10() {
-        let code = "import math\nx = math.log10(1000)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_math_log(1000, 10)"));
-    }
-
-    #[test]
-    fn test_math_inf() {
-        let code = "import math\nif x == math.inf:\n    pass";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("float(\"inf\")"));
-    }
-
-    #[test]
     fn test_math_no_rewrite_without_math_prefix() {
         let code = "x = sqrt(16)";
         let fixed = MontyAutoFixer::fix(code);
         assert_eq!(fixed, code);
-    }
-
-    #[test]
-    fn test_math_multiple_calls() {
-        let code = "import math\na = math.sqrt(4)\nb = math.floor(3.7)\nc = math.pi";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("(4) ** 0.5"));
-        assert!(fixed.contains("_math_floor(3.7)"));
-        assert!(fixed.contains("3.141592653589793"));
-        assert!(fixed.contains("def _math_floor("));
-        // No ceil helper since it's not used
-        assert!(!fixed.contains("def _math_ceil("));
     }
 
     // === os.path.* rewriting tests ===
@@ -2140,92 +1052,13 @@ mod tests {
     // === json.dumps/json.loads rewriting tests ===
 
     #[test]
-    fn test_json_dumps_simple() {
-        let code = "import json\nresult = json.dumps({\"key\": \"value\"})";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_json_dumps({\"key\": \"value\"})"));
-        assert!(fixed.contains("def _json_dumps("));
-        assert!(!fixed.contains("json.dumps"));
-    }
-
-    #[test]
-    fn test_json_loads_simple() {
-        let code = "import json\ndata = json.loads(text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_json_loads(text)"));
-        assert!(fixed.contains("def _json_loads("));
-        assert!(fixed.contains("def _json_parse("));
-        assert!(!fixed.contains("json.loads"));
-    }
-
-    #[test]
-    fn test_json_both() {
-        let code = "import json\ndata = json.loads(raw)\nout = json.dumps(data)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_json_loads(raw)"));
-        assert!(fixed.contains("_json_dumps(data)"));
-    }
-
-    #[test]
     fn test_json_no_rewrite_without_prefix() {
         let code = "data = loads(text)";
         let fixed = MontyAutoFixer::fix(code);
         assert!(!fixed.contains("_json_loads"));
     }
 
-    #[test]
-    fn test_json_from_import() {
-        let code = "from json import loads, dumps\ndata = loads(text)\nout = dumps(data)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_json_loads(text)"));
-        assert!(fixed.contains("_json_dumps(data)"));
-    }
-
     // === re.* rewriting tests (bash-bridged) ===
-
-    #[test]
-    fn test_re_findall() {
-        let code = "import re\nmatches = re.findall(r'\\d+', text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_findall(r'\\d+', text)"));
-        assert!(fixed.contains("def _re_findall("));
-        assert!(fixed.contains("run_command("));
-        assert!(fixed.contains("def _shell_quote("));
-        // The user code "re.findall" should be replaced, but the helper contains "re.findall" in the python3 command
-        assert!(fixed.contains("matches = _re_findall("));
-    }
-
-    #[test]
-    fn test_re_sub() {
-        let code = "import re\nresult = re.sub(r'\\s+', ' ', text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_sub(r'\\s+', ' ', text)"));
-        assert!(fixed.contains("def _re_sub("));
-    }
-
-    #[test]
-    fn test_re_search() {
-        let code = "import re\nm = re.search(r'(\\w+)', text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_search(r'(\\w+)', text)"));
-        assert!(fixed.contains("def _re_search("));
-    }
-
-    #[test]
-    fn test_re_split() {
-        let code = "import re\nparts = re.split(r'[,;]', text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_split(r'[,;]', text)"));
-        assert!(fixed.contains("def _re_split("));
-    }
-
-    #[test]
-    fn test_re_match() {
-        let code = "import re\nm = re.match(r'^\\d+', text)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_match(r'^\\d+', text)"));
-        assert!(fixed.contains("def _re_match("));
-    }
 
     #[test]
     fn test_re_no_rewrite_without_prefix() {
@@ -2234,58 +1067,7 @@ mod tests {
         assert!(!fixed.contains("_re_findall"));
     }
 
-    #[test]
-    fn test_re_multiple_calls() {
-        let code = "import re\na = re.findall(r'\\d+', t)\nb = re.sub(r'x', 'y', t)";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_re_findall("));
-        assert!(fixed.contains("_re_sub("));
-        // Shell quote helper should appear only once
-        assert_eq!(fixed.matches("def _shell_quote(").count(), 1);
-    }
-
-    #[test]
-    fn test_re_findall_with_json_dumps_no_cross_contamination() {
-        // Regression: rewrite_json must NOT corrupt json.dumps inside _re_findall's python3 command.
-        // When LLM rewrite copies helpers and adds json.dumps, the global replace would turn
-        // 'json.dumps(' into '_json_dumps(' inside the python3 -c string, causing NameError.
-        let code = "import re\nimport json\nm = re.findall(r'\\d+', t)\nout = json.dumps(m)";
-        let fixed = MontyAutoFixer::fix(code);
-        // User code should use internal helpers
-        assert!(fixed.contains("_re_findall(r'\\d+', t)"));
-        assert!(fixed.contains("_json_dumps(m)"));
-        // python3 command inside _re_findall must NOT contain _json_dumps or _re_findall
-        // (it uses aliased imports _J.dumps and _R.findall)
-        assert!(!fixed.contains("print(_json_dumps("));
-        assert!(!fixed.contains("print(_re_findall("));
-    }
-
     // === datetime.* rewriting tests (bash-bridged) ===
-
-    #[test]
-    fn test_datetime_now() {
-        let code = "import datetime\nnow = datetime.datetime.now()";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_datetime_now()"));
-        assert!(fixed.contains("def _datetime_now("));
-        assert!(fixed.contains("run_command("));
-    }
-
-    #[test]
-    fn test_date_today() {
-        let code = "import datetime\ntoday = datetime.date.today()";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_date_today()"));
-        assert!(fixed.contains("def _date_today("));
-    }
-
-    #[test]
-    fn test_datetime_strptime() {
-        let code = "import datetime\nd = datetime.datetime.strptime(s, '%Y-%m-%d')";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_datetime_strptime(s, '%Y-%m-%d')"));
-        assert!(fixed.contains("def _datetime_strptime("));
-    }
 
     #[test]
     fn test_datetime_no_rewrite_without_prefix() {
@@ -2353,15 +1135,6 @@ mod tests {
         let fixed = MontyAutoFixer::fix(code);
         assert!(fixed.contains("# 基于当前页面"));
         assert!(fixed.contains("print(len(jobs))"));
-    }
-
-    #[test]
-    fn test_fix_with_multibyte_in_sorted() {
-        // sorted() with Chinese comments should not panic
-        let code = "# 排序数据\nresult = sorted(items, key=lambda x: x['名前'])";
-        let fixed = MontyAutoFixer::fix(code);
-        assert!(fixed.contains("_keysort"));
-        assert!(fixed.contains("名前"));
     }
 
     #[test]

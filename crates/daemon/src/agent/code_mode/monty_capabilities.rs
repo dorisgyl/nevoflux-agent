@@ -146,6 +146,18 @@ pub const CAPABILITIES: &[Capability] = &[
         workaround: Some("auto_fixer phase 1b strips async/await; mechanical_fixer::fix_await_syntax"),
     },
     Capability {
+        name: "global",
+        code: "g = 1\ndef f():\n    global g\n    g = 2\nf()\nprint('ok' if g == 2 else 'no')\n",
+        supported: true,
+        workaround: Some("linter::detects global"),
+    },
+    Capability {
+        name: "nonlocal",
+        code: "def outer():\n    v = 1\n    def inner():\n        nonlocal v\n        v = 2\n    inner()\n    return v\nprint('ok' if outer() == 2 else 'no')\n",
+        supported: true,
+        workaround: Some("linter::detects nonlocal"),
+    },
+    Capability {
         name: "yield",
         code: "def g():\n    yield 'ok'\nfor v in g():\n    print(v)\n",
         supported: false,
@@ -173,6 +185,14 @@ pub const CAPABILITIES: &[Capability] = &[
         code: "print('ok' if sorted([1, 3, 2], reverse=True)[0] == 3 else 'no')\n",
         supported: true,
         workaround: Some("auto_fixer phase 2 rewrite; mechanical_fixer::fix_sorted_kwargs"),
+    },
+    // `list.sort(key=)` is a separate code path from `sorted(key=)` and has
+    // its own repair in `mechanical_fixer`; probe it separately.
+    Capability {
+        name: "list.sort(key=)",
+        code: "xs = [(2, 'b'), (1, 'a')]\nxs.sort(key=lambda p: p[0])\nprint('ok' if xs[0][1] == 'a' else 'no')\n",
+        supported: true,
+        workaround: Some("mechanical_fixer .sort() TypeError handler"),
     },
     Capability {
         name: "map()",
@@ -230,6 +250,38 @@ pub const CAPABILITIES: &[Capability] = &[
         code: "import time\nprint('ok' if time.time() > 0 else 'no')\n",
         supported: false,
         workaround: Some("auto_fixer phase 2b bridges time.* via run_command + python3"),
+    },
+    Capability {
+        name: "math (native)",
+        code: "import math\nprint('ok' if math.floor(math.sqrt(4.0)) == 2 else 'no')\n",
+        supported: true,
+        workaround: Some("auto_fixer phase 2 injects a pure-Python math shim"),
+    },
+    // `os` is a native module but exposes no `path`, so the shim survives even
+    // though a glance at Monty's module list suggests otherwise.
+    Capability {
+        name: "os.path (native)",
+        code: "import os\nprint('ok' if os.path.basename('/a/b.txt') == 'b.txt' else 'no')\n",
+        supported: false,
+        workaround: Some("auto_fixer phase 2 injects a pure-Python os.path shim"),
+    },
+    Capability {
+        name: "functools.reduce",
+        code: "import functools\nprint('ok' if functools.reduce(lambda a, b: a + b, [1, 2]) == 3 else 'no')\n",
+        supported: false,
+        workaround: Some("auto_fixer phase 2 injects a pure-Python reduce shim"),
+    },
+    Capability {
+        name: "collections.Counter",
+        code: "import collections\nprint('ok' if collections.Counter('aab')['a'] == 2 else 'no')\n",
+        supported: false,
+        workaround: Some("auto_fixer phase 2 injects a pure-Python Counter shim"),
+    },
+    Capability {
+        name: "asyncio",
+        code: "import asyncio\nasync def f():\n    return 'ok'\nprint(asyncio.run(f()))\n",
+        supported: true,
+        workaround: None,
     },
     // ---- agent.md:187 "truly unavailable" ----
     Capability {

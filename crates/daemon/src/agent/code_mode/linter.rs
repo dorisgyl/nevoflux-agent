@@ -4,7 +4,11 @@
 //! Python code line-by-line to detect constructs that Monty cannot
 //! execute, returning actionable suggestions for each violation.
 //!
-//! Detects: class, match/case, with, import, yield, global, nonlocal.
+//! Detects `match`/`case` and `yield` — the two constructs Monty still cannot
+//! parse. `class`, `with`, `import`, `global` and `nonlocal` were all detected
+//! here until v0.0.19 made them work; flagging them now would be telling the
+//! model to rewrite code that runs. See `super::monty_capabilities` for what
+//! is actually supported.
 
 /// A single violation found by the linter, with a concrete suggestion
 /// for how to rewrite the offending construct.
@@ -40,32 +44,12 @@ impl MontyLinter {
                 continue;
             }
 
-            // class definitions: `class Foo:` (must contain `:` to reduce false positives)
-            if trimmed.starts_with("class ") && trimmed.contains(':') {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "class".to_string(),
-                    suggestion:
-                        "Use dict + factory function: `def make_item(x): return {\"x\": x}`"
-                            .to_string(),
-                });
-            }
-
             // match statements: `match <expr>:`
             if trimmed.starts_with("match ") && trimmed.contains(':') {
                 violations.push(Violation {
                     line: line_num,
                     construct: "match".to_string(),
                     suggestion: "Use if/elif/else chain instead".to_string(),
-                });
-            }
-
-            // with statements: `with <expr> as <name>:` or `with <expr>:`
-            if trimmed.starts_with("with ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "with".to_string(),
-                    suggestion: "Use try/finally, or call tool function directly".to_string(),
                 });
             }
 
@@ -82,40 +66,6 @@ impl MontyLinter {
                     suggestion: "Use list.append() to collect results".to_string(),
                 });
             }
-
-            // global statements
-            if trimmed.starts_with("global ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "global".to_string(),
-                    suggestion: "Use function parameters and return values instead".to_string(),
-                });
-            }
-
-            // nonlocal statements
-            if trimmed.starts_with("nonlocal ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "nonlocal".to_string(),
-                    suggestion: "Use function parameters and return values instead".to_string(),
-                });
-            }
-
-            // import statements (Layer 2 strips these, but catch any that slip through)
-            if trimmed.starts_with("import ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "import".to_string(),
-                    suggestion: "All tools are pre-injected; no imports needed".to_string(),
-                });
-            }
-            if trimmed.starts_with("from ") && trimmed.contains(" import ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "import".to_string(),
-                    suggestion: "All tools are pre-injected; no imports needed".to_string(),
-                });
-            }
         }
 
         violations
@@ -125,15 +75,6 @@ impl MontyLinter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_detects_class() {
-        let code = "class Item:\n    def __init__(self):\n        pass";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].construct.contains("class"));
-        assert!(violations[0].suggestion.contains("dict"));
-    }
 
     #[test]
     fn test_detects_match() {
@@ -159,40 +100,10 @@ mod tests {
     }
 
     #[test]
-    fn test_detects_with_statement() {
-        let code = "with open(f) as h:\n    data = h.read()";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].construct.contains("with"));
-    }
-
-    #[test]
     fn test_detects_yield() {
         let code = "def gen():\n    yield 1\n    yield from [2, 3]";
         let violations = MontyLinter::check(code);
         assert!(violations.len() >= 1);
-    }
-
-    #[test]
-    fn test_detects_global_nonlocal() {
-        let code = "def foo():\n    global x\n    nonlocal y";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_detects_import() {
-        let code = "import os\nfrom sys import argv";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_indented_class() {
-        let code = "def foo():\n    class Inner:\n        pass";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].line, 2);
     }
 
     #[test]
@@ -216,19 +127,39 @@ mod tests {
         assert!(violations.is_empty());
     }
 
+    /// Line numbers are 1-based and point at the offending line.
     #[test]
-    fn test_multiple_violations() {
-        let code = "import os\nclass Foo:\n    global x\n    async def bar():\n        await baz()\n        yield 1";
-        let violations = MontyLinter::check(code);
-        // import, class, global, yield = 4 (async/await are now allowed)
-        assert_eq!(violations.len(), 4);
+    fn test_line_numbers_correct() {
+        let violations = MontyLinter::check("x = 1\ny = 2\nmatch x:\nz = 3");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].line, 3);
+    }
+
+    /// The linter exists to name what Monty cannot parse. Flagging something
+    /// it runs fine tells the model to rewrite working code, which is worse
+    /// than saying nothing — so every construct here is one
+    /// `monty_capabilities` records as unsupported.
+    #[test]
+    fn test_supported_constructs_are_not_flagged() {
+        for code in [
+            "class Foo:\n    pass",
+            "with open_thing() as f:\n    pass",
+            "import json",
+            "from typing import List",
+            "def f():\n    global x\n    x = 1",
+            "def outer():\n    v = 1\n    def inner():\n        nonlocal v",
+            "async def f():\n    return await g()",
+        ] {
+            assert!(
+                MontyLinter::check(code).is_empty(),
+                "must not flag supported code: {code:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_line_numbers_correct() {
-        let code = "x = 1\ny = 2\nimport os\nz = 3";
-        let violations = MontyLinter::check(code);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].line, 3);
+    fn test_multiple_violations() {
+        let violations = MontyLinter::check("match x:\n    case 1:\n        yield 1");
+        assert_eq!(violations.len(), 2, "match + yield");
     }
 }

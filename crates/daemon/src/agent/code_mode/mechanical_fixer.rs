@@ -16,12 +16,10 @@ pub fn try_fix(
     _line: Option<usize>,
 ) -> Option<String> {
     // Try fixers in priority order; return first that produces different code.
-    let result = fix_await_syntax(code, error_type, error_msg)
-        .or_else(|| fix_name_error_map(code, error_type, error_msg))
-        .or_else(|| fix_name_error_filter(code, error_type, error_msg))
-        .or_else(|| fix_sorted_kwargs(code, error_type, error_msg))
-        .or_else(|| fix_sort_method_kwargs(code, error_type, error_msg))
-        .or_else(|| fix_max_min_kwargs(code, error_type, error_msg))
+    // `await`, `map`, `filter`, `sorted(key=/reverse=)` and `list.sort(key=)`
+    // are native as of Monty v0.0.19 (see `monty_capabilities`), so the errors
+    // their repairs keyed off no longer occur.
+    let result = fix_max_min_kwargs(code, error_type, error_msg)
         .or_else(|| fix_name_error_reduce(code, error_type, error_msg))
         .or_else(|| fix_name_error_counter(code, error_type, error_msg))
         .or_else(|| fix_name_error_itertools(code, error_type, error_msg))
@@ -33,8 +31,8 @@ pub fn try_fix(
         .or_else(|| fix_name_error_islice(code, error_type, error_msg))
         // Helper functions lost during LLM rewrite cycles:
         .or_else(|| fix_name_error_shell_quote(code, error_type, error_msg))
-        // File I/O: open() is not available, replace with write_file/read_file tools
-        .or_else(|| fix_name_error_open(code, error_type, error_msg))
+        // open() is gone from here: Monty now surfaces it as an OsCall, which
+        // the executor refuses outright, so there is no NameError left to match.
         // Tool name aliases: write→write_file, read→read_file
         .or_else(|| fix_name_error_tool_alias(code, error_type, error_msg))
         // General fallback: strip known module prefixes so the next retry
@@ -49,131 +47,13 @@ pub fn try_fix(
 // Pattern 1: SyntaxError from leftover async/await
 // ---------------------------------------------------------------------------
 
-fn fix_await_syntax(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    // Match SyntaxError, NameError, and TypeError (e.g. "'str' object can't be awaited")
-    if !error_type.contains("SyntaxError")
-        && !error_type.contains("NameError")
-        && !error_type.contains("TypeError")
-    {
-        return None;
-    }
-    let is_async_related = error_msg.contains("await")
-        || error_msg.contains("async")
-        || error_msg.contains("can't be awaited")
-        || (error_type.contains("SyntaxError")
-            && (code.contains("await ") || code.contains("async ")));
-    if !is_async_related {
-        return None;
-    }
-    let fixed = code
-        .replace("await ", "")
-        .replace("async def ", "def ")
-        .replace("async for ", "for ")
-        .replace("async with ", "with ");
-    Some(fixed)
-}
-
-// ---------------------------------------------------------------------------
-// Pattern 2: NameError: name 'map' is not defined
-// ---------------------------------------------------------------------------
-
-const MAP_HELPER: &str = "\
-def _map_fn(fn, iterable):
-    result = []
-    for _x in iterable:
-        result.append(fn(_x))
-    return result
-";
-
-fn fix_name_error_map(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    if !error_type.contains("NameError") {
-        return None;
-    }
-    if !extract_undefined_name(error_msg).is_some_and(|n| n == "map") {
-        return None;
-    }
-    if !code.contains("map(") {
-        return None;
-    }
-    // Inject helper and rename map( → _map_fn(
-    let replaced = replace_function_calls(code, "map", "_map_fn");
-    if replaced == code {
-        return None; // No standalone map( calls found
-    }
-    Some(format!("{}\n{}", MAP_HELPER.trim(), replaced))
-}
-
-// ---------------------------------------------------------------------------
-// Pattern 3: NameError: name 'filter' is not defined
-// ---------------------------------------------------------------------------
-
-const FILTER_HELPER: &str = "\
-def _filter_fn(fn, iterable):
-    result = []
-    for _x in iterable:
-        if fn(_x):
-            result.append(_x)
-    return result
-";
-
-fn fix_name_error_filter(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    if !error_type.contains("NameError") {
-        return None;
-    }
-    if !extract_undefined_name(error_msg).is_some_and(|n| n == "filter") {
-        return None;
-    }
-    if !code.contains("filter(") {
-        return None;
-    }
-    let replaced = replace_function_calls(code, "filter", "_filter_fn");
-    if replaced == code {
-        return None;
-    }
-    Some(format!("{}\n{}", FILTER_HELPER.trim(), replaced))
-}
-
 // ---------------------------------------------------------------------------
 // Pattern 4: TypeError: sorted() got unexpected keyword argument
 // ---------------------------------------------------------------------------
 
-fn fix_sorted_kwargs(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    if !error_type.contains("TypeError") {
-        return None;
-    }
-    if !error_msg.contains("sorted") {
-        return None;
-    }
-    if !error_msg.contains("keyword argument") && !error_msg.contains("unexpected") {
-        return None;
-    }
-    // Fallback: strip key= and reverse= from sorted() calls.
-    // This degrades to unsorted order but prevents the crash.
-    // The auto_fixer should have handled this, so reaching here means
-    // an edge case the regex missed.
-    strip_sorted_keyword_args(code)
-}
-
 // ---------------------------------------------------------------------------
 // Pattern 4b: TypeError: sort() got unexpected keyword argument (method call)
 // ---------------------------------------------------------------------------
-
-fn fix_sort_method_kwargs(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    if !error_type.contains("TypeError") {
-        return None;
-    }
-    // Match .sort() TypeError — not sorted() (already handled by fix_sorted_kwargs)
-    if !error_msg.contains("sort") {
-        return None;
-    }
-    if error_msg.contains("sorted") {
-        return None; // Handled by fix_sorted_kwargs
-    }
-    if !error_msg.contains("keyword argument") && !error_msg.contains("unexpected") {
-        return None;
-    }
-    strip_sort_method_keyword_args(code)
-}
 
 // ---------------------------------------------------------------------------
 // Pattern 4c: TypeError: max()/min() got unexpected keyword argument
@@ -554,196 +434,10 @@ fn fix_name_error_shell_quote(code: &str, error_type: &str, error_msg: &str) -> 
 // Monty has no `open()` builtin; replace with write_file/read_file tools.
 // ---------------------------------------------------------------------------
 
-fn fix_name_error_open(code: &str, error_type: &str, error_msg: &str) -> Option<String> {
-    if !error_type.contains("NameError") {
-        return None;
-    }
-    if !extract_undefined_name(error_msg).is_some_and(|n| n == "open") {
-        return None;
-    }
-    if !code.contains("open(") {
-        return None;
-    }
-
-    let mut result_lines: Vec<String> = Vec::new();
-    let lines: Vec<&str> = code.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let stripped = line.trim();
-
-        // Pattern A: `with open(PATH, "w"...) as VAR:`
-        if let Some(block) = try_parse_with_open(stripped) {
-            let block_indent = get_indent(line);
-            let body_indent = format!("{}    ", block_indent);
-
-            // Collect the indented body
-            let mut body_lines: Vec<&str> = Vec::new();
-            let mut j = i + 1;
-            while j < lines.len() {
-                let next = lines[j];
-                if next.trim().is_empty() {
-                    body_lines.push(next);
-                    j += 1;
-                    continue;
-                }
-                if get_indent(next).len() >= body_indent.len() {
-                    body_lines.push(next);
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if block.is_write {
-                // Collect all VAR.write(EXPR) calls and concatenate
-                let write_prefix = format!("{}.write(", block.var_name);
-                let mut content_parts: Vec<String> = Vec::new();
-                let mut other_lines: Vec<String> = Vec::new();
-
-                for bline in &body_lines {
-                    let bt = bline.trim();
-                    if bt.starts_with(&write_prefix) && bt.ends_with(')') {
-                        let inner = &bt[write_prefix.len()..bt.len() - 1];
-                        content_parts.push(inner.to_string());
-                    } else if !bt.is_empty() {
-                        // Non-write lines in the block — keep them
-                        other_lines.push(format!("{}{}", block_indent, bt));
-                    }
-                }
-
-                if !content_parts.is_empty() {
-                    let content_expr = if content_parts.len() == 1 {
-                        content_parts[0].clone()
-                    } else {
-                        content_parts.join(" + ")
-                    };
-                    result_lines.push(format!(
-                        "{}write_file({}, {})",
-                        block_indent, block.path_expr, content_expr
-                    ));
-                    for ol in other_lines {
-                        result_lines.push(ol);
-                    }
-                } else {
-                    // No write calls found — keep original block as-is
-                    result_lines.push(line.to_string());
-                    for bl in &body_lines {
-                        result_lines.push(bl.to_string());
-                    }
-                }
-            } else {
-                // Read mode: find VAR.read() assignments
-                let read_call = format!("{}.read()", block.var_name);
-                let mut found_read = false;
-
-                for bline in &body_lines {
-                    let bt = bline.trim();
-                    if bt.contains(&read_call) {
-                        // e.g. "data = f.read()" → "data = read_file(PATH)"
-                        let replaced =
-                            bt.replace(&read_call, &format!("read_file({})", block.path_expr));
-                        result_lines.push(format!("{}{}", block_indent, replaced));
-                        found_read = true;
-                    } else if !bt.is_empty() {
-                        result_lines.push(format!("{}{}", block_indent, bt));
-                    }
-                }
-
-                if !found_read {
-                    // Couldn't transform — keep original
-                    result_lines.push(line.to_string());
-                    for bl in &body_lines {
-                        result_lines.push(bl.to_string());
-                    }
-                }
-            }
-
-            i = j;
-            continue;
-        }
-
-        // Pattern B: standalone `VAR = open(PATH, "w")` ... `VAR.write(...)` ... `VAR.close()`
-        // Just replace open( calls inline — simpler fallback
-        result_lines.push(line.to_string());
-        i += 1;
-    }
-
-    let fixed = result_lines.join("\n");
-    // Preserve trailing newline if original had one
-    let fixed = if code.ends_with('\n') && !fixed.ends_with('\n') {
-        format!("{}\n", fixed)
-    } else {
-        fixed
-    };
-
-    if fixed == code {
-        None
-    } else {
-        Some(fixed)
-    }
-}
-
 struct WithOpenBlock {
     path_expr: String,
     var_name: String,
     is_write: bool,
-}
-
-/// Parse `with open(PATH, MODE...) as VAR:` returning components.
-fn try_parse_with_open(line: &str) -> Option<WithOpenBlock> {
-    let rest = line.strip_prefix("with open(")?;
-    // Find the matching closing paren for open(...)
-    let mut depth = 1;
-    let mut open_end = None;
-    for (i, ch) in rest.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    open_end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let open_end = open_end?;
-    let args_str = &rest[..open_end];
-    let after = rest[open_end + 1..].trim();
-
-    // Parse "as VAR:"
-    let after = after.strip_prefix("as ")?;
-    let var_name = after.strip_suffix(':')?.trim().to_string();
-    if var_name.is_empty() {
-        return None;
-    }
-
-    // Parse open() arguments: first arg is path, second is mode
-    let args = split_top_level_args(args_str);
-    if args.is_empty() {
-        return None;
-    }
-    let path_expr = args[0].trim().to_string();
-    let is_write = if args.len() > 1 {
-        let mode = args[1].trim();
-        mode.contains('w') || mode.contains('a')
-    } else {
-        false // default is read
-    };
-
-    Some(WithOpenBlock {
-        path_expr,
-        var_name,
-        is_write,
-    })
-}
-
-fn get_indent(line: &str) -> String {
-    let trimmed = line.trim_start();
-    line[..line.len() - trimmed.len()].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -880,49 +574,6 @@ fn split_top_level_args(args: &str) -> Vec<&str> {
     }
     parts.push(&args[start..]);
     parts
-}
-
-/// Strip `key=` and `reverse=` keyword arguments from sorted() calls.
-/// Fallback when auto_fixer's sophisticated rewrite missed an edge case.
-/// Converts `sorted(items, key=..., reverse=...)` → `sorted(items)`.
-fn strip_sorted_keyword_args(code: &str) -> Option<String> {
-    strip_func_keyword_args(code, "sorted")
-}
-
-/// Strip keyword arguments from `.sort()` method calls.
-/// Converts `expr.sort(key=..., reverse=...)` → `expr.sort()`.
-fn strip_sort_method_keyword_args(code: &str) -> Option<String> {
-    if !code.contains(".sort(") {
-        return None;
-    }
-
-    let mut result = String::new();
-    let mut changed = false;
-    let mut i = 0;
-
-    while i < code.len() {
-        if code[i..].starts_with(".sort(") {
-            let open = i + ".sort(".len();
-            if let Some(args_end) = find_matching_paren(code, open - 1) {
-                let args_str = &code[open..args_end];
-                if args_str.contains("key=") || args_str.contains("reverse=") {
-                    result.push_str(".sort()");
-                    i = args_end + 1;
-                    changed = true;
-                    continue;
-                }
-            }
-        }
-        let ch = code[i..].chars().next().unwrap();
-        result.push(ch);
-        i += ch.len_utf8();
-    }
-
-    if changed {
-        Some(result)
-    } else {
-        None
-    }
 }
 
 /// General-purpose keyword argument stripper for function calls.
@@ -1062,38 +713,6 @@ mod tests {
     // --- fix_await_syntax ---
 
     #[test]
-    fn test_fix_await() {
-        let code = "result = await web_search(\"test\")\nprint(result)";
-        let fixed = try_fix(code, "SyntaxError", "invalid syntax: await", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(!fixed.contains("await "));
-        assert!(fixed.contains("result = web_search(\"test\")"));
-    }
-
-    #[test]
-    fn test_fix_async_def() {
-        let code = "async def fetch():\n    return await get()";
-        let fixed = try_fix(code, "SyntaxError", "invalid syntax: async", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("def fetch():"));
-        assert!(!fixed.contains("async"));
-        assert!(!fixed.contains("await"));
-    }
-
-    #[test]
-    fn test_fix_await_type_error() {
-        // TypeError: 'str' object can't be awaited — runtime error from await on sync return
-        let code = "result = await browser_eval_js(\"document.title\")\nprint(result)";
-        let fixed = try_fix(code, "TypeError", "'str' object can't be awaited", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(!fixed.contains("await "));
-        assert!(fixed.contains("result = browser_eval_js(\"document.title\")"));
-    }
-
-    #[test]
     fn test_no_fix_for_unrelated_syntax_error() {
         let code = "x = 1 +";
         let fixed = try_fix(code, "SyntaxError", "unexpected EOF", None);
@@ -1101,17 +720,6 @@ mod tests {
     }
 
     // --- fix_name_error_map ---
-
-    #[test]
-    fn test_fix_map() {
-        let code = "result = map(lambda x: x * 2, items)";
-        let fixed = try_fix(code, "NameError", "name 'map' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("def _map_fn("));
-        assert!(fixed.contains("_map_fn(lambda x: x * 2, items)"));
-        assert!(!fixed.contains("\nresult = map("));
-    }
 
     #[test]
     fn test_fix_map_no_false_positive() {
@@ -1122,73 +730,9 @@ mod tests {
         assert!(fixed.is_none());
     }
 
-    #[test]
-    fn test_fix_map_in_list() {
-        let code = "result = list(map(str, items))";
-        let fixed = try_fix(code, "NameError", "name 'map' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("list(_map_fn(str, items))"));
-    }
-
     // --- fix_name_error_filter ---
 
-    #[test]
-    fn test_fix_filter() {
-        let code = "result = filter(lambda x: x > 0, nums)";
-        let fixed = try_fix(code, "NameError", "name 'filter' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("def _filter_fn("));
-        assert!(fixed.contains("_filter_fn(lambda x: x > 0, nums)"));
-    }
-
     // --- fix_sorted_kwargs ---
-
-    #[test]
-    fn test_fix_sorted_key() {
-        let code = "result = sorted(items, key=lambda x: x['name'])";
-        let fixed = try_fix(
-            code,
-            "TypeError",
-            "sorted() got an unexpected keyword argument 'key'",
-            None,
-        );
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("sorted(items)"));
-        assert!(!fixed.contains("key="));
-    }
-
-    #[test]
-    fn test_fix_sorted_key_and_reverse() {
-        let code = "result = sorted(data, key=lambda x: x[1], reverse=True)";
-        let fixed = try_fix(
-            code,
-            "TypeError",
-            "sorted() got an unexpected keyword argument 'key'",
-            None,
-        );
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("sorted(data)"));
-        assert!(!fixed.contains("key="));
-        assert!(!fixed.contains("reverse="));
-    }
-
-    #[test]
-    fn test_fix_sorted_nested() {
-        let code = "for item in sorted(data, key=lambda x: x['count']):\n    print(item)";
-        let fixed = try_fix(
-            code,
-            "TypeError",
-            "sorted() got an unexpected keyword argument",
-            None,
-        );
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("sorted(data)"));
-    }
 
     #[test]
     fn test_fix_sorted_without_kwargs_unchanged() {
@@ -1268,16 +812,6 @@ mod tests {
         assert!(fixed.is_none());
     }
 
-    // --- strip_sorted_keyword_args ---
-
-    #[test]
-    fn test_strip_sorted_preserves_complex_first_arg() {
-        let code = "sorted([x for x in data], key=lambda x: x)";
-        let fixed = strip_sorted_keyword_args(code);
-        assert!(fixed.is_some());
-        assert_eq!(fixed.unwrap(), "sorted([x for x in data])");
-    }
-
     // --- find_matching_paren ---
 
     #[test]
@@ -1302,31 +836,6 @@ mod tests {
     }
 
     // --- fix_await: async for / async with ---
-
-    #[test]
-    fn test_fix_async_for() {
-        let code = "async for item in gen():\n    print(item)";
-        let fixed = try_fix(code, "SyntaxError", "invalid syntax: async", None);
-        assert!(fixed.is_some());
-        assert!(fixed.unwrap().contains("for item in gen():"));
-    }
-
-    #[test]
-    fn test_fix_async_with() {
-        let code = "async with open(f) as h:\n    pass";
-        let fixed = try_fix(code, "SyntaxError", "invalid syntax: async", None);
-        assert!(fixed.is_some());
-        assert!(fixed.unwrap().contains("with open(f) as h:"));
-    }
-
-    #[test]
-    fn test_fix_await_on_name_error() {
-        // Monty might treat `await` as an identifier → NameError
-        let code = "result = await fetch()";
-        let fixed = try_fix(code, "NameError", "name 'await' is not defined", None);
-        assert!(fixed.is_some());
-        assert!(fixed.unwrap().contains("result = fetch()"));
-    }
 
     // --- fix_name_error_counter ---
 
@@ -1395,32 +904,6 @@ mod tests {
     }
 
     // --- fix_sort_method_kwargs ---
-
-    #[test]
-    fn test_fix_sort_method_key() {
-        let code = "data.sort(key=lambda x: x[1])";
-        let fixed = try_fix(
-            code,
-            "TypeError",
-            "sort() got an unexpected keyword argument 'key'",
-            None,
-        );
-        assert!(fixed.is_some());
-        assert_eq!(fixed.unwrap(), "data.sort()");
-    }
-
-    #[test]
-    fn test_fix_sort_method_key_and_reverse() {
-        let code = "items.sort(key=lambda x: x['name'], reverse=True)";
-        let fixed = try_fix(
-            code,
-            "TypeError",
-            "sort() got an unexpected keyword argument 'key'",
-            None,
-        );
-        assert!(fixed.is_some());
-        assert_eq!(fixed.unwrap(), "items.sort()");
-    }
 
     #[test]
     fn test_fix_sort_method_no_kwargs_unchanged() {
@@ -1710,77 +1193,10 @@ mod tests {
     // --- fix_name_error_open ---
 
     #[test]
-    fn test_fix_open_write_with_block() {
-        let code = "\
-content = \"hello world\"
-with open(\"/tmp/test.txt\", \"w\", encoding=\"utf-8\") as f:
-    f.write(content)
-print(\"done\")";
-        let fixed = try_fix(code, "NameError", "name 'open' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("write_file(\"/tmp/test.txt\", content)"));
-        assert!(!fixed.contains("with open("));
-        assert!(fixed.contains("print(\"done\")"));
-    }
-
-    #[test]
-    fn test_fix_open_write_multiple_writes() {
-        let code = "\
-with open(\"/tmp/out.txt\", \"w\") as f:
-    f.write(header)
-    f.write(body)";
-        let fixed = try_fix(code, "NameError", "name 'open' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("write_file(\"/tmp/out.txt\", header + body)"));
-    }
-
-    #[test]
-    fn test_fix_open_read_with_block() {
-        let code = "\
-with open(\"/tmp/data.txt\", \"r\") as f:
-    data = f.read()
-print(data)";
-        let fixed = try_fix(code, "NameError", "name 'open' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("data = read_file(\"/tmp/data.txt\")"));
-        assert!(!fixed.contains("with open("));
-        assert!(fixed.contains("print(data)"));
-    }
-
-    #[test]
-    fn test_fix_open_read_default_mode() {
-        // open(path) without mode defaults to read
-        let code = "\
-with open(\"/tmp/data.txt\") as f:
-    text = f.read()";
-        let fixed = try_fix(code, "NameError", "name 'open' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("text = read_file(\"/tmp/data.txt\")"));
-    }
-
-    #[test]
     fn test_fix_open_no_match_for_unrelated_error() {
         let code = "with open(\"/tmp/x.txt\", \"w\") as f:\n    f.write(\"hi\")";
         let fixed = try_fix(code, "NameError", "name 'foo' is not defined", None);
         assert!(fixed.is_none());
-    }
-
-    #[test]
-    fn test_fix_open_indented_block() {
-        let code = "\
-if True:
-    with open(\"/tmp/test.txt\", \"w\") as f:
-        f.write(content)
-    print(\"saved\")";
-        let fixed = try_fix(code, "NameError", "name 'open' is not defined", None);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("    write_file(\"/tmp/test.txt\", content)"));
-        assert!(fixed.contains("print(\"saved\")"));
     }
 
     // --- fix_name_error_tool_alias ---
@@ -1830,18 +1246,6 @@ if True:
         let fixed = strip_func_keyword_args("max([x for x in data], key=lambda x: x)", "max");
         assert!(fixed.is_some());
         assert_eq!(fixed.unwrap(), "max([x for x in data])");
-    }
-
-    // --- strip_sort_method_keyword_args ---
-
-    #[test]
-    fn test_strip_sort_method_preserves_context() {
-        let code = "for x in items:\n    x.sort(key=lambda a: a[0])\n    print(x)";
-        let fixed = strip_sort_method_keyword_args(code);
-        assert!(fixed.is_some());
-        let fixed = fixed.unwrap();
-        assert!(fixed.contains("x.sort()"));
-        assert!(fixed.contains("print(x)"));
     }
 
     // --- extract_positional_args ---
