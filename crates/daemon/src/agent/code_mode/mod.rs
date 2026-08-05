@@ -10,6 +10,7 @@ pub mod auto_fixer;
 pub mod executor;
 pub mod linter;
 pub mod mechanical_fixer;
+pub mod monty_capabilities;
 pub mod repair_prompt;
 pub mod signature;
 
