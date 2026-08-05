@@ -506,16 +506,29 @@ impl crate::mcp_service::source::ToolSource for ScriptSource {
         };
 
         let program = format!("{code}\n\n{invocation}\n");
+        let browser = script_browser_context();
+        let had_browser = browser.is_some();
         let outcome = crate::agent::code_mode::execute_python_simple_with_timeout(
-            &program,
-            script_browser_context(),
-            None,
-            None,
+            &program, browser, None, None,
         );
         if !outcome.success {
-            return Err(outcome
+            let error = outcome
                 .error
-                .unwrap_or_else(|| format!("{name} failed with no error message")));
+                .unwrap_or_else(|| format!("{name} failed with no error message"));
+            // Without a browser the interpreter simply never defines the
+            // browser tools, so a script that uses one dies with a bare
+            // `NameError` that reads like a typo. The built-in tools say
+            // "no browser registered"; a script tool should not be worse off
+            // for asking the same question.
+            if !had_browser && error.contains("is not defined") {
+                return Err(format!(
+                    "{error}\n\nNo browser is connected, so browser-backed tools \
+                     (web_search, fetch_page, browser_*) are not in scope for this \
+                     script. Run a task first to start the session browser, or check \
+                     that NEVOFLUX_SESSION_MODE=1."
+                ));
+            }
+            return Err(error);
         }
         Ok(match outcome.result {
             Some(serde_json::Value::String(s)) => s,
@@ -889,6 +902,34 @@ mod tests {
             "with a context web_search must resolve, got: {:?}",
             with.error
         );
+    }
+
+    /// A bare `NameError` reads like a typo in the script. When the real cause
+    /// is that no browser is connected, say so — the built-in tools already do,
+    /// and a script tool should not be worse off for asking the same question.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_browser_explains_itself() {
+        let dir = tmp_dir("nobrowser");
+        std::fs::write(
+            dir.join("m.py"),
+            "def describe():\n    return [{\"name\": \"go\", \"description\": \"g\"}]\n\
+             \ndef go(arguments):\n    return web_search(query=\"x\")\n",
+        )
+        .unwrap();
+        let src = ScriptSource::new(vec![dir.clone()]);
+        src.reload().await;
+
+        // No browser registry is set in a unit test, so no context resolves.
+        let err = src.call("m__go", &serde_json::json!({})).await.unwrap_err();
+        assert!(
+            err.contains("web_search"),
+            "keeps the original cause: {err}"
+        );
+        assert!(
+            err.contains("No browser is connected"),
+            "must explain why the name is missing: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Never leave the endpoint empty because a reload went wrong.
