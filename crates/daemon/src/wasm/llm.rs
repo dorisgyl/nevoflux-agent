@@ -740,15 +740,23 @@ fn expand_type_to_nullable(prop: &mut serde_json::Value) {
 /// Tools the ACP bridge must not advertise, because only the built-in agent
 /// can carry them out.
 ///
-/// Both live inside `builtin_wasm::Agent` and act on state that exists only
-/// there: `plan` stores a proposal the agent later asks the user to confirm,
-/// and `switch_model` changes the provider the built-in agent runs on — which
-/// an external ACP agent, running its own model, cannot meaningfully be given.
+/// All three live inside `builtin_wasm::Agent` and reach something the ACP
+/// executor has no route to: `plan` stores a proposal for a later confirmation
+/// step, `switch_model` changes the provider the built-in agent runs on (which
+/// an external agent running its own model cannot be handed), and `bash` calls
+/// the WASM host function `tool_bash` — the ACP executor has no shell
+/// execution at all.
 ///
-/// They were advertised anyway, because the catalogue handed to the bridge is
-/// the built-in agent's. Calling `plan` failed with "unknown tool: plan" after
-/// the model had already spent a turn deciding to use it.
-const ACP_UNSUPPORTED_TOOLS: &[&str] = &["plan", "switch_model"];
+/// They were advertised because the catalogue handed to the bridge is the
+/// built-in agent's, so anything the built-in agent can do arrives by default
+/// whether or not this path can honour it.
+///
+/// This list is a stopgap and has already missed tools twice: `orchestrate`
+/// and `bash` only surfaced once the session mode changed and put them in the
+/// catalogue. The durable fix is to derive what the bridge advertises from
+/// what the executor can dispatch, rather than maintaining a denylist beside
+/// it.
+const ACP_UNSUPPORTED_TOOLS: &[&str] = &["plan", "switch_model", "bash"];
 
 fn sanitize_request_tools_for_openai_strict(request: &mut LlmChatRequest) {
     if let Some(ref mut tools) = request.tools {
@@ -6135,14 +6143,22 @@ mod tests {
     /// the model spent a turn choosing it and got "unknown tool: plan" back.
     #[test]
     fn acp_does_not_advertise_builtin_only_tools() {
-        for name in ["plan", "switch_model"] {
+        for name in ["plan", "switch_model", "bash"] {
             assert!(
                 super::ACP_UNSUPPORTED_TOOLS.contains(&name),
                 "{name} needs built-in agent state and must not reach an ACP agent"
             );
         }
         // Tools that do work over the bridge must not be caught by the filter.
-        for name in ["web_fetch", "browser_get_markdown", "tool_search", "think"] {
+        // `orchestrate` is the counter-example that motivated implementing it
+        // rather than hiding it: the ACP executor now runs Code Mode directly.
+        for name in [
+            "web_fetch",
+            "browser_get_markdown",
+            "tool_search",
+            "think",
+            "orchestrate",
+        ] {
             assert!(
                 !super::ACP_UNSUPPORTED_TOOLS.contains(&name),
                 "{name} works on the ACP path and must stay advertised"

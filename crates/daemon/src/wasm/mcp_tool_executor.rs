@@ -475,6 +475,38 @@ async fn execute_mcp_tool_inner(
         return execute_computer_tool(name, arguments, services).await;
     }
 
+    // `orchestrate` runs LLM-authored Python through Code Mode. The built-in
+    // agent intercepts it inside its own loop (agent_host.rs), so an ACP agent
+    // was offered the tool and got "unknown tool: orchestrate" on calling it.
+    //
+    // No LLM rewrite here, deliberately: orchestrate has never had one — the
+    // built-in path also refuses ("No LLM retry in orchestrate tool mode") —
+    // so the mechanical fixer is the whole safety net either way, and this
+    // path behaves the same as the one it mirrors.
+    if name == "orchestrate" {
+        let code = arguments
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if code.trim().is_empty() {
+            return Err("orchestrate: missing required argument 'code'".to_string());
+        }
+        let outcome = crate::agent::code_mode::execute_python_simple_with_timeout(
+            &code,
+            services.browser_context(),
+            Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+            Some(services.interrupt_flag.clone()),
+        );
+        return if outcome.success {
+            Ok(outcome.to_json_string())
+        } else {
+            Err(outcome
+                .error
+                .unwrap_or_else(|| "orchestrate failed with no error message".to_string()))
+        };
+    }
+
     // 3. Special tools (no external deps)
     match name {
         "think" => return Ok("Thought recorded.".to_string()),
@@ -2669,6 +2701,43 @@ mod tests {
         };
         let err = resolve_attach_asset_payload(&req).await.unwrap_err();
         assert!(err.contains("must provide one of"), "got: {err}");
+    }
+
+    /// `orchestrate` must be dispatchable on the ACP path, not just advertised.
+    ///
+    /// The built-in agent intercepts it inside its own loop, so for a long time
+    /// an ACP agent could find it via `tool_search` and then get
+    /// "unknown tool: orchestrate" on calling it — the search result made it
+    /// look available, which is worse than absent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orchestrate_runs_on_the_acp_path() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let bridge = Arc::new(McpToolBridge::new());
+
+        let out = execute_mcp_tool(
+            "orchestrate",
+            &serde_json::json!({"code": "print(6 * 7)"}),
+            &services,
+            &bridge,
+        )
+        .await
+        .expect("orchestrate must execute, not report an unknown tool");
+        assert!(out.contains("42"), "expected the code's output, got: {out}");
+
+        // An empty body is a caller error with a name, not a silent success.
+        let err = execute_mcp_tool(
+            "orchestrate",
+            &serde_json::json!({"code": "   "}),
+            &services,
+            &bridge,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("code"),
+            "the error should name the argument: {err}"
+        );
     }
 
     #[test]
