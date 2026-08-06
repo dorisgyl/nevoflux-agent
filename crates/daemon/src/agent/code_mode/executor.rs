@@ -106,21 +106,32 @@ impl CodeModeResult {
     }
 }
 
-/// Default wall-clock budget for a single Code Mode execution.
+/// Budget for a single Code Mode execution, in **interpreter time**.
 ///
-/// Recorded flows frequently wait on a slow remote response (e.g. an LLM
-/// streaming its reply), so this must comfortably exceed a typical
-/// navigate-fill-send-wait round trip. Individual flows can still raise it
-/// further via their `flow.json` `timeout_ms`; see
-/// [`execute_python_simple_with_timeout`].
+/// Not wall-clock: Monty's tracker stops the clock while an external call is
+/// outstanding, so waiting on a slow tool costs nothing here (pinned by
+/// `test_tool_waits_do_not_count_against_the_budget`). What it bounds is time
+/// the script itself spends computing. Individual flows can still raise it via
+/// their `flow.json` `timeout_ms`; see [`execute_python_simple_with_timeout`].
 pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(180);
 
-/// Wall-clock budget for the `orchestrate` tool's Code Mode scripts. These are
-/// long-running agent-authored orchestrations that legitimately wait on many
-/// slow tool calls (browser automation in headless, remote fetches, LLM
-/// sub-calls), so they get a very generous 24-hour cap rather than the 180s
-/// default. The timeout is a runaway backstop, not a normal completion bound.
-pub const ORCHESTRATE_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Interpreter-time budget for the `orchestrate` tool's Code Mode scripts.
+///
+/// This was 24 hours, chosen on the assumption that orchestrations "legitimately
+/// wait on many slow tool calls" — but waiting does not draw down this budget at
+/// all, so the number was 24 hours of pure computation for scripts whose real
+/// work is glue between tool calls.
+///
+/// That mattered little while `ResourceLimits::max_allocations` existed: a
+/// runaway `while True` tripped the allocation ceiling in milliseconds. Monty
+/// v0.0.19 removed that field, and memory alone does not catch it either, since
+/// GC keeps a tight allocating loop flat. Time became the only backstop, and a
+/// 24-hour one is no backstop for /loop, where an unattended iteration would
+/// spin for a day and then do it again on the next tick.
+///
+/// Five minutes of solid computation is far more than orchestration glue needs
+/// and still fails a runaway ~300x sooner.
+pub const ORCHESTRATE_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 
 /// Whether a Monty runtime error is the wall-clock timeout (`TimeoutError` /
 /// "time limit exceeded"). A timeout is NOT a code defect — rewriting the code
@@ -1416,9 +1427,20 @@ mod tests {
         assert!(!is_timeout_error("KeyError", "__tool_error"));
     }
 
+    /// The orchestrate budget must stay short enough to be a real backstop.
+    ///
+    /// It is the only one left: `max_allocations` used to stop a runaway in
+    /// milliseconds and no longer exists, and memory does not catch a tight
+    /// allocating loop because GC keeps it flat. A day-long ceiling would let
+    /// an unattended /loop iteration spin for a day per tick.
     #[test]
-    fn test_orchestrate_max_duration_is_24h() {
-        assert_eq!(ORCHESTRATE_MAX_DURATION, Duration::from_secs(86_400));
+    fn test_orchestrate_max_duration_is_a_usable_backstop() {
+        assert_eq!(ORCHESTRATE_MAX_DURATION, Duration::from_secs(300));
+        assert!(
+            ORCHESTRATE_MAX_DURATION <= Duration::from_secs(15 * 60),
+            "an orchestrate script computing for more than 15 minutes is a \
+             runaway; this budget does not bound time spent waiting on tools"
+        );
         // execute_python_with_llm applies this budget, not the 180s default.
         let executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
         assert_eq!(
@@ -1566,6 +1588,58 @@ mod tests {
         let fixed = MontyAutoFixer::fix(code);
         assert!(!fixed.contains("import functools"));
         assert!(fixed.contains("x = 1 + 2"));
+    }
+
+    /// The execution budget bounds computation, not waiting.
+    ///
+    /// Everything about how `ORCHESTRATE_MAX_DURATION` is chosen depends on
+    /// this: if a slow tool call drew the budget down, a five-minute ceiling
+    /// would kill legitimate orchestrations that wait on browser automation or
+    /// LLM sub-calls. It does not — but that is a property of Monty's tracker,
+    /// not something this crate controls, so it is pinned here.
+    #[tokio::test]
+    async fn test_tool_waits_do_not_count_against_the_budget() {
+        let result = CodeModeExecutor::new()
+            .with_max_duration(Duration::from_secs(1))
+            .execute(
+                "r = slow_tool()\nprint(r)",
+                &["slow_tool".to_string()],
+                |_name, _args| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Ok(serde_json::json!("done"))
+                    })
+                },
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(
+            result.success,
+            "a 2s tool call must survive a 1s budget, got: {:?}",
+            result.error
+        );
+    }
+
+    /// A runaway loop must still be stopped, now that the allocation ceiling
+    /// that used to catch it is gone. Memory will not do it — GC keeps a tight
+    /// allocating loop flat — so this asserts the time backstop actually fires.
+    #[tokio::test]
+    async fn test_a_runaway_loop_is_stopped_by_the_budget() {
+        let result = CodeModeExecutor::new()
+            .with_max_duration(Duration::from_secs(2))
+            .execute(
+                "acc = 0\nwhile True:\n    x = [1, 2, 3]\n    acc = acc + 1",
+                &[],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(!result.success, "a runaway loop must not report success");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            is_timeout_error("TimeoutError", &error) || error.contains("time limit"),
+            "expected the time backstop to fire, got: {error}"
+        );
     }
 
     /// `re` and `datetime` must work with **no tools at all**.
