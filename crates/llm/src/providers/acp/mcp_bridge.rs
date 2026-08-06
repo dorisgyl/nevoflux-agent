@@ -53,6 +53,15 @@ pub struct PermissionRequest {
 }
 
 /// User's response to a permission request.
+/// How long to wait for a human permission decision before giving up.
+///
+/// The dialog's own browser request allows 24 hours, which is right for "the
+/// user stepped away" and wrong for "the dialog never appeared" — the two are
+/// indistinguishable from here, and only the second is common. Long enough not
+/// to snatch the prompt away from someone reading it; short enough that a
+/// prompt that never rendered does not strand the conversation.
+const PERMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResponse {
     /// Allow this one call.
@@ -262,17 +271,31 @@ impl McpToolBridge {
             return PermissionResponse::Reject;
         }
 
-        match result_rx.await {
-            Ok(response) => {
+        // Bounded: a dialog nobody answers must not hold the turn open forever.
+        // The sidebar can be closed, the dialog missed, or the prompt lost in
+        // transit, and an unbounded wait here turns any of those into a
+        // conversation that simply stops replying with nothing logged.
+        // Rejecting is the safe direction — it denies rather than grants.
+        match tokio::time::timeout(PERMISSION_TIMEOUT, result_rx).await {
+            Ok(Ok(response)) => {
                 if response == PermissionResponse::AllowAlways {
                     self.add_always_allowed(tool_name);
                 }
                 response
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 tracing::warn!(
                     "Permission response channel dropped, rejecting {}",
                     tool_name
+                );
+                PermissionResponse::Reject
+            }
+            Err(_) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    timeout_s = PERMISSION_TIMEOUT.as_secs(),
+                    "no permission decision arrived; rejecting so the turn can \
+                     finish instead of waiting forever"
                 );
                 PermissionResponse::Reject
             }
@@ -291,6 +314,45 @@ pub fn tool_def_to_json(def: &McpToolDef) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    /// A permission dialog nobody answers must not hold the turn open.
+    ///
+    /// The sidebar can be closed or the prompt can fail to render, and both
+    /// look the same from here. Before this, the wait was unbounded: the tool
+    /// call never returned, the ACP turn never reached a stopReason, and the
+    /// conversation just stopped replying with nothing in the log to say why.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_permission_prompt_eventually_rejects() {
+        let bridge = McpToolBridge::new();
+        // A handler that accepts the request and then never decides — the
+        // receiver is held so the channel stays open, which is what makes this
+        // a hang rather than a dropped-channel rejection.
+        let (tx, _held_open) = mpsc::channel::<PermissionRequest>(1);
+        bridge.set_permission_handler(tx);
+
+        // `run_command` is bucket X at every tier, so it cannot auto-approve.
+        let decision = bridge.request_permission("run_command", "{}").await;
+
+        assert_eq!(
+            decision,
+            PermissionResponse::Reject,
+            "an unanswered prompt must resolve, and must resolve to a denial"
+        );
+    }
+
+    /// The timeout must not steal approval from tools that never needed to ask.
+    #[tokio::test(start_paused = true)]
+    async fn auto_approved_tools_never_wait() {
+        let bridge = McpToolBridge::new();
+        let (tx, _held_open) = mpsc::channel::<PermissionRequest>(1);
+        bridge.set_permission_handler(tx);
+
+        // Read-bucket, so it resolves before the handler is ever consulted.
+        assert_eq!(
+            bridge.request_permission("web_fetch", "{}").await,
+            PermissionResponse::AllowOnce
+        );
+    }
+
     use super::*;
 
     #[test]

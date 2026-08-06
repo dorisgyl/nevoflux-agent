@@ -14,6 +14,16 @@ use axum::{
     Json, Router,
 };
 use nevoflux_llm::providers::acp::mcp_bridge::{McpToolBridge, McpToolDef, ToolCallRequest};
+
+/// How long a single MCP tool call may occupy the executor before the caller
+/// gives up on it.
+///
+/// Generous, because legitimate browser work is slow — a page fetch behind a
+/// cold load has taken 40s here. The point is not to police duration but to
+/// guarantee the caller always gets an answer: the executor runs one request
+/// at a time behind a capacity-1 queue, so an unbounded wait lets a single
+/// stuck tool take the whole conversation with it.
+const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -175,6 +185,7 @@ async fn handle_mcp_request(
             };
 
             let (result_tx, result_rx) = oneshot::channel();
+            tracing::debug!(tool = %name, "queued for the tool executor");
             if tx
                 .send(ToolCallRequest {
                     name: name.clone(),
@@ -187,22 +198,47 @@ async fn handle_mcp_request(
                 return json_rpc_error(id, -32603, "Tool executor unavailable");
             }
 
-            match result_rx.await {
-                Ok(Ok(text)) => json_rpc_result(
+            // Bounded, because the executor is strictly serial with a
+            // capacity-1 queue: one tool that never returns stops every later
+            // call behind it, and an ACP turn waiting on this reply never
+            // reaches a stopReason — the conversation simply stops answering,
+            // with nothing logged between "received" and a completion that
+            // never comes. A timeout turns a silent hang into an error the
+            // agent can report and retry past.
+            match tokio::time::timeout(TOOL_CALL_TIMEOUT, result_rx).await {
+                Err(_) => {
+                    tracing::error!(
+                        tool = %name,
+                        timeout_s = TOOL_CALL_TIMEOUT.as_secs(),
+                        "tool call timed out waiting for the executor; it is \
+                         still occupying the serial queue"
+                    );
+                    json_rpc_result(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": format!(
+                                "Tool '{}' did not return within {}s. It may still be running and blocking later calls.",
+                                name, TOOL_CALL_TIMEOUT.as_secs()
+                            )}],
+                            "isError": true
+                        }),
+                    )
+                }
+                Ok(Ok(Ok(text))) => json_rpc_result(
                     id,
                     serde_json::json!({
                         "content": [{ "type": "text", "text": text }],
                         "isError": false
                     }),
                 ),
-                Ok(Err(e)) => json_rpc_result(
+                Ok(Ok(Err(e))) => json_rpc_result(
                     id,
                     serde_json::json!({
                         "content": [{ "type": "text", "text": e }],
                         "isError": true
                     }),
                 ),
-                Err(_) => json_rpc_error(id, -32603, "Tool executor dropped"),
+                Ok(Err(_)) => json_rpc_error(id, -32603, "Tool executor dropped"),
             }
         }
         _ => json_rpc_error(id, -32601, "Method not found"),
@@ -370,6 +406,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 202);
+
+        handle.abort();
+    }
+
+    /// A tool that never returns must still produce a reply.
+    ///
+    /// The executor runs one request at a time behind a capacity-1 queue, so
+    /// an unbounded wait here does not merely stall one call — the ACP turn
+    /// waiting on it never reaches a stopReason, and the conversation stops
+    /// answering with nothing logged between "received" and a completion that
+    /// never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_never_returns_still_answers_the_caller() {
+        let bridge = Arc::new(McpToolBridge::new());
+        // An executor that accepts the request and then never replies. The
+        // receiver is held so the channel stays open — dropping it would
+        // produce "executor dropped" instead of the hang under test.
+        let (tool_tx, _never_drained) = tokio::sync::mpsc::channel::<ToolCallRequest>(1);
+        bridge.set_executor(tool_tx);
+        let (port, handle) = start_mcp_http_server(bridge).await.unwrap();
+
+        let client = test_client();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": { "name": "web_fetch", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a timed-out call must be reported as an error, not silence: {body}"
+        );
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not return"),
+            "the reply should say what happened: {body}"
+        );
 
         handle.abort();
     }

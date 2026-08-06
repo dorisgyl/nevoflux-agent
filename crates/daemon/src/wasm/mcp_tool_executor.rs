@@ -30,6 +30,12 @@ pub async fn run_tool_executor(
 
     while let Some(req) = rx.recv().await {
         let start = std::time::Instant::now();
+        // Logged on entry, not just on completion. This loop is strictly
+        // serial behind a capacity-1 queue, so a tool that never returns
+        // leaves a silent gap in the log with no record of what is holding it
+        // — which is exactly how a 24-minute stall once became impossible to
+        // attribute after the fact.
+        tracing::debug!(tool = %req.name, "MCP tool dispatch start");
         let result = execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
