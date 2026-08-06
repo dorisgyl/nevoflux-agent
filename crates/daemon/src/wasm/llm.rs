@@ -737,6 +737,19 @@ fn expand_type_to_nullable(prop: &mut serde_json::Value) {
 
 /// Sanitize every tool's `parameters` JSON Schema in-place. Call before
 /// dispatching to the OpenAI Responses API.
+/// Tools the ACP bridge must not advertise, because only the built-in agent
+/// can carry them out.
+///
+/// Both live inside `builtin_wasm::Agent` and act on state that exists only
+/// there: `plan` stores a proposal the agent later asks the user to confirm,
+/// and `switch_model` changes the provider the built-in agent runs on — which
+/// an external ACP agent, running its own model, cannot meaningfully be given.
+///
+/// They were advertised anyway, because the catalogue handed to the bridge is
+/// the built-in agent's. Calling `plan` failed with "unknown tool: plan" after
+/// the model had already spent a turn deciding to use it.
+const ACP_UNSUPPORTED_TOOLS: &[&str] = &["plan", "switch_model"];
+
 fn sanitize_request_tools_for_openai_strict(request: &mut LlmChatRequest) {
     if let Some(ref mut tools) = request.tools {
         for tool in tools.iter_mut() {
@@ -3889,10 +3902,12 @@ async fn stream_acp_completion(
             }
         }
 
-        // Update tool definitions from request
+        // Update tool definitions from request, minus the ones only the
+        // built-in agent can honour (see `ACP_UNSUPPORTED_TOOLS`).
         if let Some(tools) = &request.tools {
             let mcp_tools: Vec<nevoflux_llm::providers::acp::mcp_bridge::McpToolDef> = tools
                 .iter()
+                .filter(|t| !ACP_UNSUPPORTED_TOOLS.contains(&t.name.as_str()))
                 .map(|t| nevoflux_llm::providers::acp::mcp_bridge::McpToolDef {
                     name: t.name.clone(),
                     description: t.description.clone(),
@@ -6112,6 +6127,28 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// The ACP bridge must not offer tools only the built-in agent can run.
+    ///
+    /// The catalogue handed to the bridge is the built-in agent's, so anything
+    /// that needs `builtin_wasm::Agent` state arrives by default. `plan` did:
+    /// the model spent a turn choosing it and got "unknown tool: plan" back.
+    #[test]
+    fn acp_does_not_advertise_builtin_only_tools() {
+        for name in ["plan", "switch_model"] {
+            assert!(
+                super::ACP_UNSUPPORTED_TOOLS.contains(&name),
+                "{name} needs built-in agent state and must not reach an ACP agent"
+            );
+        }
+        // Tools that do work over the bridge must not be caught by the filter.
+        for name in ["web_fetch", "browser_get_markdown", "tool_search", "think"] {
+            assert!(
+                !super::ACP_UNSUPPORTED_TOOLS.contains(&name),
+                "{name} works on the ACP path and must stay advertised"
+            );
+        }
+    }
     use super::*;
 
     #[test]

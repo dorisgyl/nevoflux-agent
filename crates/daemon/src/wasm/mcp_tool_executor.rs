@@ -825,7 +825,12 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         "extract_visual_identity" => Some(BrowserToolAction::ExtractVisualIdentity),
         "ask_user" => Some(BrowserToolAction::AskUser),
         "web_search" => Some(BrowserToolAction::WebSearch),
-        "fetch_page" => Some(BrowserToolAction::WebFetch),
+        // Both spellings reach the same action. `web_fetch` is the name the
+        // agent is given (and the one `protocol::READ_ONLY_TOOLS` classifies);
+        // `fetch_page` is what the dispatch was originally written against.
+        // Only accepting the second meant the advertised name resolved to
+        // nothing and fell through to "unknown tool".
+        "fetch_page" | "web_fetch" => Some(BrowserToolAction::WebFetch),
         // Browser input strategy engine (PR #2 + #2.5)
         "input" => Some(BrowserToolAction::Input),
         "probe" => Some(BrowserToolAction::Probe),
@@ -2664,6 +2669,36 @@ mod tests {
         };
         let err = resolve_attach_asset_payload(&req).await.unwrap_err();
         assert!(err.contains("must provide one of"), "got: {err}");
+    }
+
+    #[test]
+    /// Every browser-family tool the agent is offered must resolve to an
+    /// action. The dispatcher matches on the *suffix* after stripping
+    /// `browser_`/`canvas_`, so a name can look absent to a plain search of
+    /// this file and still work — and one can look present and not. Both
+    /// mistakes were made while auditing this list, so it is asserted from the
+    /// agent-facing names rather than the suffixes.
+    #[test]
+    fn advertised_browser_names_all_resolve() {
+        for name in [
+            "browser_screenshot",
+            "browser_get_markdown",
+            "browser_get_content",
+            "browser_get_tabs",
+            "browser_wait_for",
+            "browser_scroll",
+            "canvas_extract_visual_identity",
+            // Advertised as `web_fetch`; the dispatch was written against
+            // `fetch_page`, so only the alias makes the advertised name work.
+            "web_fetch",
+            "fetch_page",
+            "web_search",
+        ] {
+            assert!(
+                tool_name_to_browser_action(name).is_some(),
+                "{name} is advertised to the agent but resolves to no action"
+            );
+        }
     }
 
     #[test]
