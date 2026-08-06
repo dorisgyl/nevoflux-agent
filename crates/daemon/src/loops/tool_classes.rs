@@ -70,6 +70,19 @@ mod tests {
         assert!(!is_forbidden_in_iteration("schedule_list"));
     }
 
+    /// `orchestrate` is how a loop iteration reaches Code Mode, and Code Mode
+    /// is where the Monty interpreter — and every constraint documented in
+    /// `agent::code_mode::monty_capabilities` — actually applies.
+    ///
+    /// Forbidding it here would not merely remove a tool: it would silently
+    /// sever loops from Code Mode entirely, and no test elsewhere covers that,
+    /// because `code_mode` has no notion of running inside an iteration.
+    #[test]
+    fn orchestrate_stays_available_to_iterations() {
+        assert!(!is_forbidden_in_iteration("orchestrate"));
+        assert!(!iteration_forbidden_tools().contains(&"orchestrate".to_string()));
+    }
+
     #[test]
     fn forbidden_list_matches_predicate() {
         let list = iteration_forbidden_tools();
