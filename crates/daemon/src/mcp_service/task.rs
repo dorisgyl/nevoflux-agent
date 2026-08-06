@@ -15,8 +15,11 @@ pub(crate) fn task_tool_definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: RUN_BROWSER_TASK.to_string(),
         description: "Run a whole browser-automation task from a natural-language instruction \
-                      and return its result. Use this when you do not want to drive the browser \
-                      step by step yourself; use the browser_* tools when you do."
+                      and return its result. Runs on the machine serving this tool, in that \
+                      machine's own headless browser — NOT in the browser you are otherwise \
+                      driving, and it cannot see or reuse your open tabs, session or scroll \
+                      position. Use it to delegate a self-contained task to that machine. To \
+                      act on the browser you are already in, use the browser_* tools instead."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -83,6 +86,31 @@ impl ToolSource for TaskSource {
 
 #[cfg(test)]
 mod tests {
+    /// The description has to say *where* the task runs.
+    ///
+    /// A remote headless instance registered as an MCP server advertises this
+    /// tool into a local agent's catalogue under its bare name — external MCP
+    /// tools are not namespaced by server — so nothing else tells the model
+    /// that calling it drives a different machine's browser than the one it is
+    /// already working in. It reached for this tool to open tabs it had open
+    /// locally, and got a browser that had never seen them.
+    #[test]
+    fn description_says_it_is_not_the_callers_browser() {
+        let def = &task_tool_definitions()[0];
+        let d = def.description.to_lowercase();
+        assert!(
+            d.contains("not in the browser you are otherwise driving")
+                || d.contains("machine serving this tool"),
+            "must locate itself: {}",
+            def.description
+        );
+        assert!(
+            d.contains("browser_*"),
+            "must point at the alternative for driving the caller's own browser: {}",
+            def.description
+        );
+    }
+
     use super::*;
 
     #[test]
