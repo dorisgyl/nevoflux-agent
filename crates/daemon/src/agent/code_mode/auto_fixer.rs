@@ -63,12 +63,12 @@ impl MontyAutoFixer {
                 continue;
             }
 
-            // Strip decorator lines: lines starting with `@`. Monty rejects
-            // decorators outright as of v0.0.19; through v0.0.17 it accepted
-            // and silently ignored them, which quietly changed behaviour.
-            if trimmed.starts_with('@') {
-                continue;
-            }
+            // Decorators are NOT stripped. Monty rejects them outright as of
+            // v0.0.19, and letting that error through is the point: stripping
+            // `@memoize` leaves code that parses, runs, and quietly does
+            // something else. Measured on a real deployment — a decorated
+            // function returned the undecorated result with nothing logged,
+            // which is strictly worse than refusing to load.
 
             // Strip `# type: ignore` suffixes (with optional bracket annotations)
             if let Some(pos) = line.find("# type: ignore") {
@@ -704,19 +704,25 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_decorators() {
-        let code = "@dataclass\ndef make_item(name):\n    return {\"name\": name}";
-        let fixed = MontyAutoFixer::fix(code);
-        assert_eq!(fixed, "def make_item(name):\n    return {\"name\": name}");
-    }
-
-    #[test]
     fn test_strip_typing_annotations() {
         let code = "from typing import List, Dict\nx: List[int] = [1, 2]";
         let fixed = MontyAutoFixer::fix(code);
         // `typing` is native, so its import stays; the annotation still goes,
         // because Monty does not parse annotated assignments.
         assert_eq!(fixed, "from typing import List, Dict\nx = [1, 2]");
+    }
+
+    /// Decorators must reach Monty untouched so it can reject them.
+    ///
+    /// Stripping `@memoize` leaves code that parses and runs and quietly
+    /// returns the undecorated result. Measured on a real deployment: a
+    /// decorated function came back with the wrong value and nothing was
+    /// logged. Monty refuses decorators outright, and that refusal is the
+    /// useful outcome.
+    #[test]
+    fn test_decorators_are_not_stripped() {
+        let code = "@memoize\ndef f():\n    return 1";
+        assert_eq!(MontyAutoFixer::fix(code), code);
     }
 
     #[test]
@@ -734,22 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_multiple_decorators() {
-        let code = "@property\n@staticmethod\ndef foo():\n    pass";
-        let fixed = MontyAutoFixer::fix(code);
-        assert_eq!(fixed, "def foo():\n    pass");
-    }
-
-    #[test]
-    fn test_decorator_with_arguments() {
-        let code = "@app.route(\"/\")\ndef index():\n    return \"hello\"";
-        let fixed = MontyAutoFixer::fix(code);
-        assert_eq!(fixed, "def index():\n    return \"hello\"");
-    }
-
-    #[test]
     fn test_mixed_code() {
-        let code = "import functools\nfrom typing import List\n\n@dataclass\ndef process(items):\n    x = compute()  # type: ignore\n    return x";
+        let code = "import functools\nfrom typing import List\n\ndef process(items):\n    x = compute()  # type: ignore\n    return x";
         let fixed = MontyAutoFixer::fix(code);
         assert_eq!(
             fixed,

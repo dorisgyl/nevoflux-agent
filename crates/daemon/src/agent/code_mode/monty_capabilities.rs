@@ -167,11 +167,15 @@ pub const CAPABILITIES: &[Capability] = &[
     // decorator cannot tell "applied" from "silently dropped", and Monty did
     // silently drop them through v0.0.17 — so the obvious probe reported
     // support for a feature that was quietly changing program behaviour.
+    //
+    // The auto-fixer used to reproduce that same silence by stripping the `@`
+    // line. It no longer does: Monty's refusal is more useful than code that
+    // runs and returns the wrong answer.
     Capability {
         name: "decorator",
         code: "def d(f):\n    return lambda: 'ok'\n@d\ndef g():\n    return 'no'\nprint(g())\n",
         supported: false,
-        workaround: Some("auto_fixer phase 3 strips decorators"),
+        workaround: None,
     },
     // ---- agent.md:183 "Builtin limitations" ----
     Capability {
