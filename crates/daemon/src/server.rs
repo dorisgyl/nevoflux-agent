@@ -729,6 +729,48 @@ async fn managed_idle_watchdog(
 }
 
 /// Start the TCP server.
+
+/// The process-wide `tool_search` index, so the install wizard can add brain
+/// tools when it enables the brain without a daemon restart.
+///
+/// Startup skips those tools when no brain is configured (see
+/// [`crate::init_brain::brain_tools_available`]), which would otherwise leave a
+/// hot-enabled brain with a working dispatch path and nothing in the index to
+/// discover it by.
+pub static CURRENT_TOOL_SEARCH_INDEX: std::sync::OnceLock<
+    Arc<tokio::sync::RwLock<nevoflux_mcp::ToolSearchIndex>>,
+> = std::sync::OnceLock::new();
+
+/// Add the gbrain tool catalogue to `index`.
+///
+/// Idempotent in practice: `ToolSearchIndex::add` replaces an entry with the
+/// same name, so indexing twice (startup plus a wizard hot-reload) leaves one
+/// copy of each tool rather than duplicates.
+pub async fn index_brain_tools(index: &Arc<tokio::sync::RwLock<nevoflux_mcp::ToolSearchIndex>>) {
+    // Append Chinese keywords to each brain tool's *indexed* description so
+    // Chinese queries (e.g. "我的知识库有多少页") match the English-only
+    // descriptions in the BM25 index. The tool behavior is unchanged — this
+    // text only feeds tool_search ranking.
+    let brain_defs: Vec<nevoflux_mcp::ToolDefinition> = crate::brain_tools::tool_catalog()
+        .iter()
+        .map(|t| nevoflux_mcp::ToolDefinition {
+            name: t.nevoflux_name.clone(),
+            description: format!(
+                "{}{}{}",
+                t.description,
+                crate::brain_tools::chinese_search_keywords_base(),
+                crate::brain_tools::chinese_search_keywords(&t.nevoflux_name),
+            ),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+    let mut idx = index.write().await;
+    for def in &brain_defs {
+        idx.add(def);
+    }
+    info!("Indexed {} brain tools for tool_search", brain_defs.len());
+}
+
 pub async fn start_server(
     config: ServerConfig,
     router: Arc<Router>,
@@ -965,32 +1007,23 @@ pub async fn start_server(
     // discovers them with `tool_search` and invokes them through
     // `tool_call_dynamic`, which routes any `brain_*` name to gbrain.
     // Indexing here (Rust, hot-swappable via brain_tools.rs) means the
-    // 83-tool surface is exposed with no WASM rebuild. We seed these
+    // tool surface is exposed with no WASM rebuild. We seed these
     // first; the MCP background task below adds external MCP tools
     // additively (via `add`) so it does not clear the brain entries.
-    {
-        // Append Chinese keywords to each brain tool's *indexed* description so
-        // Chinese queries (e.g. "我的知识库有多少页") match the English-only
-        // descriptions in the BM25 index. The tool behavior is unchanged — this
-        // text only feeds tool_search ranking.
-        let brain_defs: Vec<nevoflux_mcp::ToolDefinition> = crate::brain_tools::tool_catalog()
-            .iter()
-            .map(|t| nevoflux_mcp::ToolDefinition {
-                name: t.nevoflux_name.clone(),
-                description: format!(
-                    "{}{}{}",
-                    t.description,
-                    crate::brain_tools::chinese_search_keywords_base(),
-                    crate::brain_tools::chinese_search_keywords(&t.nevoflux_name),
-                ),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
-        let mut idx = tool_search_index.write().await;
-        for def in &brain_defs {
-            idx.add(def);
-        }
-        info!("Indexed {} brain tools for tool_search", brain_defs.len());
+    //
+    // Skipped entirely when no brain is configured: a `brain_*` name the
+    // model can find but never call costs it a `tool_search` round and a
+    // failed call. Published globally so the install wizard can index them
+    // when it turns the brain on without a restart.
+    let _ = CURRENT_TOOL_SEARCH_INDEX.set(Arc::clone(&tool_search_index));
+    let brain_configured = {
+        let cfg = agent_config.read().unwrap();
+        crate::init_brain::brain_tools_available(&cfg.knowledge_base)
+    };
+    if brain_configured {
+        index_brain_tools(&tool_search_index).await;
+    } else {
+        info!("brain disabled -> not advertising brain tools to tool_search");
     }
 
     // Spawn background task: load MCP configs, connect servers, index tools.
@@ -1813,10 +1846,6 @@ pub async fn start_server(
     // wizard hot-reload immediately becomes visible to subsequent
     // tool calls without needing to rebuild services.
     services = services.with_brain_slot(brain_slot.clone());
-    info!(
-        "registered {} brain tools with the agent's MCP tool registry",
-        crate::brain_tools::tool_catalog().len()
-    );
     if let Some(computer) = crate::agent::computer_tools::create_computer() {
         services = services.with_computer_controller(Arc::new(computer));
         info!("Computer controller initialized");

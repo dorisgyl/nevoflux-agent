@@ -138,6 +138,21 @@ fn dur_secs_or(default: u64, configured: u64) -> Duration {
 /// the file just to turn the subprocess off for some of them. Accepts
 /// `1`/`true`/`yes` and `0`/`false`/`no`; anything else is ignored so a typo
 /// falls back to the configured value rather than silently flipping it.
+/// Whether brain tools should be advertised to the agent at all.
+///
+/// The same condition [`init_brain`] uses to decide whether to boot gbrain, so
+/// the catalogue cannot be advertised by a daemon that will never have a brain
+/// to serve it. Advertising them anyway costs the model a `tool_search` round
+/// that can only end in a failed `brain_*` call.
+///
+/// Deliberately reads the *configured intent* rather than whether the slot is
+/// filled: the slot is populated by a background task well after the tool
+/// index is built, so "is the brain up yet" would be false for a brain that is
+/// merely still starting.
+pub fn brain_tools_available(kb_config: &KnowledgeBaseConfig) -> bool {
+    kb_config.enabled && brain_enabled(kb_config.brain.enabled)
+}
+
 pub fn brain_enabled(configured: bool) -> bool {
     match std::env::var("NEVOFLUX_BRAIN_ENABLED")
         .ok()
@@ -553,5 +568,44 @@ mod tests {
             BootOutcome::Booted,
             "bun-not-found path must not spawn (expected Skipped or Failed)"
         );
+    }
+
+    /// The tool catalogue must be advertised on exactly the condition
+    /// `init_brain` boots a brain on. If these drift, either the model is
+    /// offered `brain_*` tools that can never work, or a working brain becomes
+    /// undiscoverable.
+    #[test]
+    #[serial_test::serial]
+    fn availability_tracks_what_init_brain_would_do() {
+        let cfg = |kb: bool, brain: bool| {
+            let mut c = crate::config::KnowledgeBaseConfig::default();
+            c.enabled = kb;
+            c.brain.enabled = brain;
+            c
+        };
+        let prev = std::env::var("NEVOFLUX_BRAIN_ENABLED").ok();
+        std::env::remove_var("NEVOFLUX_BRAIN_ENABLED");
+
+        assert!(brain_tools_available(&cfg(true, true)));
+        assert!(!brain_tools_available(&cfg(true, false)));
+        // The knowledge_base master switch wins regardless of the brain flag —
+        // init_brain returns before it ever consults `brain.enabled`.
+        assert!(!brain_tools_available(&cfg(false, true)));
+        assert!(!brain_tools_available(&cfg(false, false)));
+
+        // The env override reaches the catalogue too, which is the whole point
+        // for containers: NEVOFLUX_BRAIN_ENABLED=0 must not leave 90 dead tools
+        // advertised.
+        std::env::set_var("NEVOFLUX_BRAIN_ENABLED", "0");
+        assert!(!brain_tools_available(&cfg(true, true)));
+        std::env::set_var("NEVOFLUX_BRAIN_ENABLED", "1");
+        assert!(brain_tools_available(&cfg(true, false)));
+        // ...but it cannot resurrect a brain the master switch disabled.
+        assert!(!brain_tools_available(&cfg(false, true)));
+
+        match prev {
+            Some(v) => std::env::set_var("NEVOFLUX_BRAIN_ENABLED", v),
+            None => std::env::remove_var("NEVOFLUX_BRAIN_ENABLED"),
+        }
     }
 }

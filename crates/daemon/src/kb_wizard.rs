@@ -517,6 +517,18 @@ async fn hot_reload_brain() -> Result<(), String> {
         engine: boot.engine,
     });
 
+    // 7. Advertise the brain tools. A daemon that started with no brain
+    // configured skipped indexing them, so without this the hot-enabled brain
+    // has a working dispatch path and nothing in `tool_search` to find it by —
+    // the model would never discover a tool it can now call.
+    match crate::server::CURRENT_TOOL_SEARCH_INDEX.get() {
+        Some(index) => crate::server::index_brain_tools(index).await,
+        None => tracing::warn!(
+            "tool_search index not registered; brain tools will not be \
+             discoverable until the daemon restarts"
+        ),
+    }
+
     crumb(100, "supervisor running, engine installed");
     tracing::info!("brain hot-reload OK: supervisor running, engine installed");
     Ok(())
