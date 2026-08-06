@@ -47,6 +47,19 @@ init_gbrain_brain() {
   local bun="$HOME/.bun/bin/bun"
   local cli="$HOME/.nevoflux/brain-tool/node_modules/gbrain/src/cli.ts"
   local brain_dir="${GBRAIN_BRAIN_DIR:-$HOME/.gbrain}"
+  # NEVOFLUX_BRAIN_ENABLED=0 stops the daemon spawning `gbrain serve`, but this
+  # init runs before the daemon exists and would still pay its startup cost —
+  # up to 40s of waiting for a brain nothing will use. Only an explicit off
+  # value skips it: the authoritative setting lives in config.toml, which this
+  # script cannot read, so anything else must keep today's behaviour rather
+  # than disable a brain the daemon is about to want. Mirrors the accepted
+  # values in `init_brain::brain_enabled`.
+  case "$(printf '%s' "${NEVOFLUX_BRAIN_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    0|false|no)
+      echo "NEVOFLUX_BRAIN_ENABLED=${NEVOFLUX_BRAIN_ENABLED}; skipping gbrain brain init"
+      return 0
+      ;;
+  esac
   [ -x "$bun" ] && [ -f "$cli" ] || return 0            # gbrain not installed → skip
   [ -f "$brain_dir/config.json" ] && return 0           # already initialized → skip
   mkdir -p "$brain_dir"
