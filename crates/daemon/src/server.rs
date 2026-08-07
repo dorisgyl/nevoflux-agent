@@ -8118,6 +8118,7 @@ async fn handle_chat_message(
                                     "device_code": r.device_code,
                                     "user_code": r.user_code,
                                     "verification_uri": r.verification_uri,
+                                    "verification_uri_complete": r.verification_uri_complete,
                                     "interval_secs": r.interval_secs,
                                     "expires_in_secs": r.expires_in_secs
                                 }
