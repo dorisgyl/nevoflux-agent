@@ -579,6 +579,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_relays_no_peer_notice_is_ignored_but_does_not_wedge_the_gateway() {
+        // The relay now answers a sender whose message reached nobody. It holds
+        // no channel key (K2), so its notice arrives as plaintext on a channel
+        // that is otherwise ciphertext, and it is not a `WireMessage` at all.
+        // It must never become a turn — and swallowing it must not cost the
+        // next real frame either.
+        let gw = PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "sess",
+            None,
+            None,
+            "chan",
+        );
+        let inj = CollectInjector::default();
+        gw.on_wire_in(Wire::Text(r#"{"k":"no-peer"}"#.into()), "sess", &inj)
+            .await;
+        assert!(
+            inj.injected.lock().await.is_empty(),
+            "a relay notice is not a turn"
+        );
+
+        gw.on_wire_in(
+            frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
+            "sess",
+            &inj,
+        )
+        .await;
+        assert_eq!(
+            inj.injected.lock().await.len(),
+            1,
+            "the gateway still works after ignoring the notice"
+        );
+    }
+
+    #[tokio::test]
     async fn on_wire_in_resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
         let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
