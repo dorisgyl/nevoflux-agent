@@ -23,6 +23,11 @@ pub struct DeviceCodeResp {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
+    /// `verification_uri` with `?user_code=` already appended, when the auth
+    /// server supplies it (RFC 8628 §3.2 `verification_uri_complete`). The
+    /// device page reads that query parameter and prefills its input, so this
+    /// is the URL worth opening for the user.
+    pub verification_uri_complete: Option<String>,
     pub interval_secs: u64,
     pub expires_in_secs: u64,
 }
@@ -54,6 +59,7 @@ pub fn parse_device_code_resp(body: &Value) -> Result<DeviceCodeResp> {
             .or_else(|| s("verification_uri_complete"))
             .ok_or_else(|| miss("verification_uri"))?
             .to_string(),
+        verification_uri_complete: s("verification_uri_complete").map(String::from),
         interval_secs: body.get("interval").and_then(Value::as_u64).unwrap_or(5),
         expires_in_secs: body
             .get("expires_in")
@@ -260,6 +266,34 @@ mod tests {
     #[test]
     fn device_code_resp_missing_required_errors() {
         assert!(parse_device_code_resp(&json!({ "user_code": "U" })).is_err());
+    }
+
+    #[test]
+    fn device_code_resp_carries_complete_uri() {
+        let b = json!({
+            "device_code": "DC", "user_code": "U-1234",
+            "verification_uri": "https://nevoflux.app/device",
+            "verification_uri_complete": "https://nevoflux.app/device?user_code=U-1234"
+        });
+        let r = parse_device_code_resp(&b).unwrap();
+        assert_eq!(r.verification_uri, "https://nevoflux.app/device");
+        assert_eq!(
+            r.verification_uri_complete.as_deref(),
+            Some("https://nevoflux.app/device?user_code=U-1234"),
+            "the prefilled URL must survive parsing — it is what the sidebar opens"
+        );
+    }
+
+    #[test]
+    fn device_code_resp_complete_uri_absent_is_none() {
+        let b = json!({
+            "device_code": "DC", "user_code": "U",
+            "verification_uri": "https://nevoflux.app/device"
+        });
+        assert_eq!(
+            parse_device_code_resp(&b).unwrap().verification_uri_complete,
+            None
+        );
     }
 
     #[test]
