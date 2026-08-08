@@ -44,9 +44,16 @@ pub struct PortalGateway {
     pending_queries: Mutex<std::collections::HashSet<String>>,
     /// This channel's staging area for original images sent from the phone.
     uploads: Mutex<super::upload::UploadStore>,
-    /// Media the head holds for this channel, served on request rather than
+    /// Media the head holds for this session, served on request rather than
     /// written into the assistant's prose.
-    assets: Mutex<super::asset::AssetStore>,
+    ///
+    /// Shared with the capture point: a screenshot is taken deep in the agent
+    /// host, which knows a session id and nothing about portals. Both ends ask
+    /// the registry for the same store rather than threading one through.
+    assets: std::sync::Arc<std::sync::Mutex<super::asset::AssetStore>>,
+    /// Asset ids already announced, so a reference repeated across deltas does
+    /// not announce the same media twice.
+    announced: Mutex<std::collections::HashSet<String>>,
 }
 
 /// How much disk one remote session may occupy. With a 20 MB per-image cap
@@ -83,20 +90,24 @@ impl PortalGateway {
         execution_tier: Option<String>,
         channel_id: &str,
     ) -> Self {
+        let session_id: String = session_id.into();
+        let session_ref = session_id.clone();
         Self {
             session: Mutex::new(PortalSession::new(key, mode, execution_tier)),
             sink,
-            session_id: session_id.into(),
+            session_id,
             id: format!("portal:{channel_id}"),
             pending_queries: Mutex::new(std::collections::HashSet::new()),
             uploads: Mutex::new(super::upload::UploadStore::new(
                 super::upload::UploadStore::root_for(channel_id),
                 UPLOAD_QUOTA_BYTES,
             )),
-            assets: Mutex::new(super::asset::AssetStore::new(
+            assets: super::asset::store_for(
+                &session_ref,
                 super::asset::AssetStore::root_for(channel_id),
                 ASSET_QUOTA_BYTES,
-            )),
+            ),
+            announced: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -111,11 +122,14 @@ impl PortalGateway {
         name: &str,
         mime_type: &str,
     ) -> Option<String> {
-        let offer = match self.assets.lock().await.put(bytes, name, mime_type) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(target: "remote", error = %e, "asset refused");
-                return None;
+        let offer = {
+            let mut store = self.assets.lock().expect("asset store");
+            match store.put(bytes, name, mime_type) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(target: "remote", error = %e, "asset refused");
+                    return None;
+                }
             }
         };
         let id = offer.id.clone();
@@ -125,6 +139,39 @@ impl PortalGateway {
         let wire = self.session.lock().await.downlink_frame(frame);
         self.sink.send(wire).await;
         Some(id)
+    }
+
+    /// Announce any media the outgoing text refers to.
+    ///
+    /// The head writes `![alt](nevo-asset:<id>)` — the reference says *where*
+    /// to draw; this frame says *what* to draw, and the player needs the mime
+    /// type and the size before it can ask for a single byte. Announced once
+    /// per id: a reference split across deltas must not announce twice.
+    async fn announce_referenced(&self, payload: &serde_json::Value) {
+        let Some(text) = payload
+            .get("payload")
+            .and_then(|p| p.get("content"))
+            .and_then(|c| c.as_str())
+        else {
+            return;
+        };
+        for id in super::translate::asset_refs(text) {
+            if !self.announced.lock().await.insert(id.clone()) {
+                continue;
+            }
+            let offer = {
+                let store = self.assets.lock().expect("asset store");
+                store.offer(&id)
+            };
+            let Some(offer) = offer else { continue };
+            let frame = serde_json::json!({
+                "kind": "asset",
+                "streamId": self.session.lock().await.current_stream_id(),
+                "asset": offer,
+            });
+            let wire = self.session.lock().await.downlink_frame(frame);
+            self.sink.send(wire).await;
+        }
     }
 
     /// Answer one `asset_pull` with the range it asked for.
@@ -141,25 +188,28 @@ impl PortalGateway {
             .and_then(|v| v.as_u64())
             .unwrap_or(super::asset::CHUNK_BYTES as u64) as usize;
 
-        let store = self.assets.lock().await;
-        let out = match store.read(id, offset, length) {
-            Ok(bytes) => {
-                let eof = store.is_eof(id, offset, bytes.len());
-                use base64::Engine;
-                serde_json::json!({
-                    "kind": "asset_data",
-                    "id": id,
-                    "offset": offset,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    "eof": eof,
-                })
-            }
-            Err(e) => {
-                tracing::warn!(target: "remote", id, error = %e, "asset pull refused");
-                serde_json::json!({ "kind": "asset_error", "id": id, "reason": e.to_string() })
+        // Scoped so the guard cannot outlive the block: held across the await
+        // below it would make this future non-Send.
+        let out = {
+            let store = self.assets.lock().expect("asset store");
+            match store.read(id, offset, length) {
+                Ok(bytes) => {
+                    let eof = store.is_eof(id, offset, bytes.len());
+                    use base64::Engine;
+                    serde_json::json!({
+                        "kind": "asset_data",
+                        "id": id,
+                        "offset": offset,
+                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        "eof": eof,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(target: "remote", id, error = %e, "asset pull refused");
+                    serde_json::json!({ "kind": "asset_error", "id": id, "reason": e.to_string() })
+                }
             }
         };
-        drop(store);
         let wire = self.session.lock().await.downlink_frame(out);
         self.sink.send(wire).await;
     }
@@ -177,7 +227,10 @@ impl PortalGateway {
     #[cfg(test)]
     pub fn with_asset_root(self, root: std::path::PathBuf) -> Self {
         Self {
-            assets: Mutex::new(super::asset::AssetStore::new(root, ASSET_QUOTA_BYTES)),
+            assets: std::sync::Arc::new(std::sync::Mutex::new(super::asset::AssetStore::new(
+                root,
+                ASSET_QUOTA_BYTES,
+            ))),
             ..self
         }
     }
@@ -185,7 +238,7 @@ impl PortalGateway {
     /// End of session: remove everything this channel put on disk.
     pub async fn cleanup_uploads(&self) {
         self.uploads.lock().await.cleanup();
-        self.assets.lock().await.cleanup();
+        super::asset::forget_session(&self.session_id);
     }
 
     /// Apply one `upload_*` frame. A rejection goes back as an `error` frame so
@@ -367,6 +420,7 @@ impl RemoteGateway for PortalGateway {
                 "gateway.project: type={:?}",
                 env.payload.get("type").and_then(|v| v.as_str())
             );
+            self.announce_referenced(&env.payload).await;
             let wires = self.session.lock().await.on_chat(&env.payload);
             tracing::info!(target: "remote", "gateway.project: {} wire(s) out", wires.len());
             for w in wires {

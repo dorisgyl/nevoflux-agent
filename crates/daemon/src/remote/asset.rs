@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Per-asset ceiling. Generous next to a screenshot because this path also
 /// carries recordings, and refusing at the door beats truncating downstream.
@@ -309,5 +310,90 @@ mod tests {
             s.read(&offer.id, 0, 10),
             Err(AssetError::Unknown(_))
         ));
+    }
+}
+
+/// Every live session's media, so the capture point and the gateway can reach
+/// the same bytes.
+///
+/// A screenshot is taken deep in the agent host, which knows a session id and
+/// nothing about portals; the gateway that will serve it knows a channel and
+/// nothing about tools. Rather than thread one through to the other, both ask
+/// here for the store belonging to a session.
+///
+/// A `std::sync::Mutex` on purpose. The gateway holds it across a read, but a
+/// read is at most a chunk out of a local file — microseconds — and the
+/// alternative is making the capture point async for no gain.
+type Registry = Mutex<HashMap<String, Arc<Mutex<AssetStore>>>>;
+
+fn registry() -> &'static Registry {
+    static R: OnceLock<Registry> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The store for a session, created on first use.
+pub fn store_for(session_id: &str, root: std::path::PathBuf, quota: u64) -> Arc<Mutex<AssetStore>> {
+    let mut reg = registry().lock().expect("asset registry");
+    reg.entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(AssetStore::new(root, quota))))
+        .clone()
+}
+
+/// Take media for a session and return the id the model should refer to.
+///
+/// `None` when no portal is attached to this session — nothing is watching, so
+/// there is nothing to serve and no reason to spend the disk.
+pub fn put_for_session(
+    session_id: &str,
+    bytes: &[u8],
+    name: &str,
+    mime_type: &str,
+) -> Option<AssetOffer> {
+    let store = registry().lock().ok()?.get(session_id)?.clone();
+    let mut store = store.lock().ok()?;
+    match store.put(bytes, name, mime_type) {
+        Ok(offer) => Some(offer),
+        Err(e) => {
+            tracing::warn!(target: "remote", error = %e, "asset refused");
+            None
+        }
+    }
+}
+
+/// Drop a session's store when its gateway goes away.
+pub fn forget_session(session_id: &str) {
+    if let Some(store) = registry()
+        .lock()
+        .ok()
+        .and_then(|mut r| r.remove(session_id))
+    {
+        if let Ok(mut s) = store.lock() {
+            s.cleanup();
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_with_no_portal_stores_nothing() {
+        // Nothing is watching, so there is nothing to serve.
+        assert!(put_for_session("nobody-is-here", &[1, 2, 3], "x.png", "image/png").is_none());
+    }
+
+    #[test]
+    fn the_capture_point_and_the_gateway_see_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_for("sess-1", dir.path().to_path_buf(), 1024 * 1024);
+        let offer = put_for_session("sess-1", &[9u8; 64], "shot.png", "image/png").unwrap();
+        // The gateway reads out of its own handle to the same store.
+        assert_eq!(
+            store.lock().unwrap().read(&offer.id, 0, 64).unwrap(),
+            vec![9u8; 64]
+        );
+        forget_session("sess-1");
+        assert!(put_for_session("sess-1", &[1], "x", "image/png").is_none());
     }
 }
