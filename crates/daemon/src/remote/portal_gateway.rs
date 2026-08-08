@@ -155,7 +155,19 @@ impl PortalGateway {
         else {
             return;
         };
+        // Everything stored since the last turn, plus anything the text names.
+        // The stored ones are what make a picture appear at all; the named ones
+        // are usually the same offers and are deduped below.
+        let mut ids: Vec<String> = super::asset::take_pending_for_session(&self.session_id)
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
         for id in super::translate::asset_refs(text) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for id in ids {
             if !self.announced.lock().await.insert(id.clone()) {
                 continue;
             }

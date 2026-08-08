@@ -75,6 +75,15 @@ pub struct AssetStore {
     quota_bytes: u64,
     used: u64,
     assets: HashMap<String, Asset>,
+    /// Offers stored but not yet announced to the portal.
+    ///
+    /// The head is told the id and given the markdown to show it with, and it
+    /// does not always write it — it describes the page in prose instead, and
+    /// the picture never appears. Whether a picture is *shown* must not depend
+    /// on a model choosing to quote something. So every offer is announced;
+    /// the reference, when the head does write one, only decides where in the
+    /// text it is drawn.
+    pending: Vec<AssetOffer>,
 }
 
 impl AssetStore {
@@ -84,6 +93,7 @@ impl AssetStore {
             quota_bytes,
             used: 0,
             assets: HashMap::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -143,6 +153,7 @@ impl AssetStore {
             seekable: true,
         };
         self.used += size;
+        self.pending.push(offer.clone());
         self.assets.insert(
             id,
             Asset {
@@ -164,6 +175,12 @@ impl AssetStore {
             size: a.size,
             seekable: true,
         })
+    }
+
+    /// Offers not yet announced. Draining is what makes an announcement
+    /// happen once.
+    pub fn take_pending(&mut self) -> Vec<AssetOffer> {
+        std::mem::take(&mut self.pending)
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -302,6 +319,16 @@ mod tests {
     }
 
     #[test]
+    fn an_offer_is_pending_until_it_is_announced() {
+        // Announcing must not depend on a model quoting a reference.
+        let (mut s, _d) = store();
+        s.put(&[1u8; 10], "a.png", "image/png").unwrap();
+        s.put(&[2u8; 10], "b.png", "image/png").unwrap();
+        assert_eq!(s.take_pending().len(), 2);
+        assert!(s.take_pending().is_empty(), "draining announces once");
+    }
+
+    #[test]
     fn cleanup_takes_the_files_with_it() {
         let (mut s, _d) = store();
         let offer = s.put(&[1u8; 10], "x", "image/png").unwrap();
@@ -343,6 +370,16 @@ pub fn store_for(session_id: &str, root: std::path::PathBuf, quota: u64) -> Arc<
 ///
 /// `None` when no portal is attached to this session — nothing is watching, so
 /// there is nothing to serve and no reason to spend the disk.
+/// Which sessions currently have a store. For diagnosing a miss: a screenshot
+/// that finds nothing here is either on a session no portal is attached to, or
+/// on a different one than the gateway registered.
+pub fn registered_sessions() -> Vec<String> {
+    registry()
+        .lock()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 pub fn put_for_session(
     session_id: &str,
     bytes: &[u8],
@@ -358,6 +395,22 @@ pub fn put_for_session(
             None
         }
     }
+}
+
+/// Offers this session has stored but not yet announced.
+pub fn take_pending_for_session(session_id: &str) -> Vec<AssetOffer> {
+    let Some(store) = registry()
+        .lock()
+        .ok()
+        .and_then(|r| r.get(session_id).cloned())
+    else {
+        return Vec::new();
+    };
+    let mut store = match store.lock() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    store.take_pending()
 }
 
 /// Drop a session's store when its gateway goes away.
