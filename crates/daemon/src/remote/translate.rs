@@ -24,6 +24,13 @@ pub struct Translator {
     current_stream: Option<String>,
     /// Counter behind the synthesized ids.
     next_stream: u64,
+    /// Text held back because a markdown image is half-written.
+    ///
+    /// Deltas arrive a few characters at a time, so `![x](data:image/…` and
+    /// its closing bracket land in different ones and nothing can be decided
+    /// about it in isolation. Whatever follows an unclosed image is kept here
+    /// until the syntax settles or the turn ends.
+    holdback: String,
 }
 
 impl Translator {
@@ -271,16 +278,121 @@ impl Translator {
         }
 
         let content = p.get("content").and_then(Value::as_str).unwrap_or("");
-        if !content.is_empty() {
-            out.push(json!({ "kind": "stream_delta", "streamId": stream_id, "delta": content }));
+        let done = p.get("done").and_then(Value::as_bool).unwrap_or(false);
+        if !content.is_empty() || (done && !self.holdback.is_empty()) {
+            let delta = self.settle(content, done);
+            if !delta.is_empty() {
+                out.push(json!({ "kind": "stream_delta", "streamId": stream_id, "delta": delta }));
+            }
         }
 
-        if p.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        if done {
             out.push(json!({ "kind": "stream_end", "streamId": stream_id }));
             self.current_stream = None;
+            self.holdback.clear();
         }
         out
     }
+
+    /// Decide how much of the text so far can be sent.
+    ///
+    /// Everything up to a half-written markdown image goes now; the image
+    /// itself waits, because until its closing bracket lands there is no way
+    /// to tell an invented `data:` payload from a reference that is still
+    /// arriving. At the end of the turn whatever is left is settled anyway —
+    /// an image that never closed is not going to.
+    fn settle(&mut self, content: &str, done: bool) -> String {
+        self.holdback.push_str(content);
+        let combined = std::mem::take(&mut self.holdback);
+
+        if !done {
+            if let Some(at) = unclosed_image_at(&combined) {
+                self.holdback = combined[at..].to_string();
+                let (text, _) = strip_invented_data_urls(&combined[..at]);
+                return text;
+            }
+        }
+        let (text, dropped) = strip_invented_data_urls(&combined);
+        if dropped > 0 {
+            tracing::warn!(
+                target: "remote",
+                dropped,
+                "dropped invented inline image bytes from a turn"
+            );
+        }
+        text
+    }
+}
+
+/// Where a markdown image starts that has no closing bracket yet, if any.
+fn unclosed_image_at(text: &str) -> Option<usize> {
+    let start = text.rfind("![")?;
+    // `![alt](` has to have opened, and nothing may have closed it since.
+    let after = &text[start..];
+    let open = after.find('(')?;
+    if after[open..].contains(')') {
+        return None;
+    }
+    Some(start)
+}
+
+/// Take invented image bytes out of a turn's text.
+///
+/// The model cannot have read a screenshot as text — `wasm::llm` lifts the
+/// `screenshot` field out of the tool result and hands it over as a vision
+/// block — so a `data:image/…;base64,…` appearing in its prose was not copied
+/// from anywhere. It was produced token by token from nothing.
+///
+/// One that reached a phone had the standard JFIF header, a quantization table
+/// of nothing but 0xFF, some thousands of characters of `AKKKKACiiigAoooo`
+/// repeating, and the standard end-of-image marker — with a total length that
+/// was not a multiple of four. No encoder emits that. The browser held
+/// `naturalWidth` at 0 and drew nothing, and the reader saw a wall of base64
+/// where a picture should have been.
+///
+/// Whatever the head genuinely holds travels as an `asset` and is referred to
+/// by id. So anything still shaped like inline bytes at this point is
+/// invented, and the honest thing is to say so rather than forward it.
+pub fn strip_invented_data_urls(text: &str) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut removed = 0usize;
+
+    while let Some(at) = rest.find("data:image/") {
+        // Only inside a markdown image — `![alt](data:…)`. A data URL the
+        // reader is being *shown as text* (a log, an explanation of the
+        // format) is left exactly where it is.
+        let before = &rest[..at];
+        let Some(open) = before.rfind('(') else {
+            out.push_str(&rest[..at + 11]);
+            rest = &rest[at + 11..];
+            continue;
+        };
+        let is_image = before[..open].ends_with(']')
+            && before[open..].chars().skip(1).all(char::is_whitespace);
+        let Some(close) = rest[at..].find(')') else {
+            // Unterminated: the turn ended mid-forgery. Everything from the
+            // opening bracket on is dropped.
+            if is_image {
+                let start = before.rfind("![").unwrap_or(open);
+                out.push_str(&before[..start]);
+                removed += 1;
+            } else {
+                out.push_str(&rest[..at]);
+            }
+            return (out, removed);
+        };
+        if is_image {
+            let start = before.rfind("![").unwrap_or(open);
+            out.push_str(&before[..start]);
+            removed += 1;
+        } else {
+            out.push_str(&rest[..at + close]);
+        }
+        rest = &rest[at + close + 1..];
+    }
+    out.push_str(rest);
+    (out, removed)
 }
 
 /// Map a daemon tool event (`{"type":"tool_start"|"tool_auth"|"tool_end",…}`) to
@@ -541,6 +653,105 @@ pub fn uplink(
             }))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod invented_image_tests {
+    use super::*;
+
+    fn turn(t: &mut Translator, pieces: &[&str]) -> String {
+        let mut text = String::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            let done = i == pieces.len() - 1;
+            let payload = json!({
+                "type": "stream_chunk",
+                "payload": { "content": piece, "done": done }
+            });
+            for f in t.downlink(&payload) {
+                if f["kind"] == "stream_delta" {
+                    text.push_str(f["delta"].as_str().unwrap());
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn an_invented_inline_image_never_reaches_the_phone() {
+        // The reported defect: the model writes bytes it cannot have read, the
+        // browser refuses them, and the reader gets a wall of base64.
+        let mut t = Translator::new();
+        let got = turn(
+            &mut t,
+            &[
+                "这是截图：\n\n",
+                "![shot](data:image/jpeg;base64,/9j/4AAQ",
+                "SkZJRgABAQAAAQABAAD/2wBDAP//////",
+                "AKKKKACiiigAoooo/2Q==)",
+                "\n\n以上。",
+            ],
+        );
+        assert!(!got.contains("base64"), "base64 reached the phone: {got}");
+        assert!(!got.contains("/9j/4AAQ"));
+        assert!(got.contains("这是截图"), "the prose must survive: {got}");
+        assert!(got.contains("以上"));
+    }
+
+    #[test]
+    fn a_turn_that_ends_mid_forgery_still_settles() {
+        // Stop pressed, or the head died. Whatever was held back has to be
+        // resolved rather than left in the buffer forever.
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["看：\n\n![x](data:image/png;base64,iVBOR"]);
+        assert!(!got.contains("iVBOR"), "{got}");
+        assert!(got.contains("看"));
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched_and_arrives_whole() {
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["第一段。", "第二段 ", "`code`", " 结束。"]);
+        assert_eq!(got, "第一段。第二段 `code` 结束。");
+    }
+
+    #[test]
+    fn an_asset_reference_survives() {
+        // What the head is supposed to write instead. Twenty characters, no
+        // bytes, and it must not be mistaken for a forgery.
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["![截图](nevo-asset:", "a1b2c3)", " 看这里"]);
+        assert!(got.contains("nevo-asset:a1b2c3"), "{got}");
+    }
+
+    #[test]
+    fn a_data_url_shown_as_text_is_left_alone() {
+        // Not an image — someone is being shown the format. Only the
+        // `![alt](…)` shape is a claim that bytes are a picture.
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["写法是 data:image/png;base64,AAAA 这样"]);
+        assert!(got.contains("data:image/png;base64,AAAA"), "{got}");
+    }
+
+    #[test]
+    fn a_normal_markdown_image_is_left_alone() {
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["![logo](https://example.com/a.png) 好"]);
+        assert!(got.contains("https://example.com/a.png"), "{got}");
+    }
+
+    #[test]
+    fn text_after_a_forgery_is_not_swallowed() {
+        let mut t = Translator::new();
+        let got = turn(
+            &mut t,
+            &["A ![x](data:image/png;base64,QQQQ) B ![y](data:image/gif;base64,RRRR) C"],
+        );
+        assert!(
+            got.contains('A') && got.contains('B') && got.contains('C'),
+            "{got}"
+        );
+        assert!(!got.contains("QQQQ") && !got.contains("RRRR"), "{got}");
     }
 }
 

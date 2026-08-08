@@ -42,6 +42,10 @@ pub enum Inbound {
     /// `UploadStore`); this layer only classifies, so the sans-IO property
     /// documented at the top of this module still holds.
     Upload(Value),
+    /// An `asset_pull`. Reading bytes is IO and belongs to the gateway (which
+    /// owns the `AssetStore`), so this layer only classifies — the sans-IO
+    /// property documented at the top of this module still holds.
+    AssetPull(Value),
     /// Nothing to do (unknown frame, decode failure, or a downlink-only variant).
     Ignore,
 }
@@ -139,6 +143,7 @@ impl PortalSession {
         match msg {
             WireMessage::Frame { frame, .. } => match frame.get("kind").and_then(Value::as_str) {
                 Some("upload_begin" | "upload_chunk" | "upload_end") => Inbound::Upload(frame),
+                Some("asset_pull") => Inbound::AssetPull(frame),
                 _ => match translate::uplink(
                     &frame,
                     session_id,
@@ -160,7 +165,15 @@ impl PortalSession {
     /// an ErrorCard — a failed upload should not vanish the way a dropped
     /// attachment used to.
     pub fn error_frame(&mut self, message: &str) -> Wire {
-        let frame = serde_json::json!({ "kind": "error", "message": message });
+        self.downlink_frame(serde_json::json!({ "kind": "error", "message": message }))
+    }
+
+    /// Sequence and seal one downlink frame the gateway built itself.
+    ///
+    /// Asset bytes come this way: they are the answer to a request rather than
+    /// a translation of anything the daemon said, so they have no business
+    /// going through the downlink translator.
+    pub fn downlink_frame(&mut self, frame: Value) -> Wire {
         let wire = self.sequencer.tag(frame);
         self.encode(&wire)
     }
