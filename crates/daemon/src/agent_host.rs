@@ -6462,6 +6462,35 @@ impl DaemonHostFunctions {
     /// - Data URL string: `"data:image/png;base64,iVBORw0KGgo..."`
     /// - Object with "screenshot" key: `{"screenshot": "..."}`
     /// - Object with "data" key: `{"data": "..."}`
+    /// Hand a screenshot to whatever portal is watching this session, and
+    /// return the id it will be served under.
+    ///
+    /// `None` when nothing is watching, when the payload is not decodable, or
+    /// when the store refuses it — in every case the turn carries on with no
+    /// reference, which renders as no picture rather than a broken one.
+    fn offer_screenshot_asset(&self, raw: &str) -> Option<String> {
+        use base64::Engine;
+        let session = self.session_id.as_deref()?;
+        // Either a bare payload or a whole data URL; the sidebar sends both.
+        let (mime, b64) = match raw.strip_prefix("data:") {
+            Some(rest) => {
+                let (header, payload) = rest.split_once(',')?;
+                (
+                    header.split(';').next().unwrap_or("image/png").to_string(),
+                    payload,
+                )
+            }
+            None => ("image/png".to_string(), raw),
+        };
+        let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(clean)
+            .ok()?;
+        let ext = mime.rsplit('/').next().unwrap_or("png");
+        crate::remote::asset::put_for_session(session, &bytes, &format!("screenshot.{ext}"), &mime)
+            .map(|offer| offer.id)
+    }
+
     fn extract_screenshot_base64(result: &Option<serde_json::Value>) -> Option<String> {
         let value = result.as_ref()?;
 
@@ -6597,9 +6626,33 @@ impl DaemonHostFunctions {
                                 })
                             );
                         }
+                        // Put the bytes where a portal can fetch them and tell
+                        // the model the id, not the bytes.
+                        //
+                        // The model never had these as text — `wasm::llm` hands
+                        // the screenshot over as a vision block — yet one still
+                        // wrote a `data:` URL into its reply, and what reached
+                        // the phone was invented: the standard JFIF header, a
+                        // quantization table of nothing but 0xFF, thousands of
+                        // characters of one repeating run, and a length that was
+                        // not a multiple of four. A reference cannot be invented
+                        // into something plausible-but-wrong, so the model is
+                        // given one to use.
+                        let data = screenshot_base64
+                            .as_deref()
+                            .and_then(|raw| self.offer_screenshot_asset(raw))
+                            .map(|id| {
+                                serde_json::json!({
+                                    "asset_id": id,
+                                    "show_with": format!("![screenshot](nevo-asset:{id})"),
+                                    "note": "To show this to the user, write the markdown above. \
+                                             Never write image bytes or a data: URL — you do not \
+                                             have them and anything you produce will be discarded.",
+                                })
+                            });
                         Ok(BrowserToolResult {
                             success: true,
-                            data: None,
+                            data,
                             error: None,
                             screenshot: screenshot_base64,
                         })

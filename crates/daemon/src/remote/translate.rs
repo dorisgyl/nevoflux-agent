@@ -38,6 +38,11 @@ impl Translator {
         Self::default()
     }
 
+    /// The id of the turn currently open, or empty between turns.
+    pub fn current_stream_id(&self) -> String {
+        self.current_stream.clone().unwrap_or_default()
+    }
+
     /// Translate one daemon chat payload into 0+ portal `InboundFrame` values.
     ///
     /// `payload` is the raw `DaemonEnvelope.payload` — `{"type":…,"payload":{…}}`
@@ -322,6 +327,28 @@ impl Translator {
         }
         text
     }
+}
+
+/// Every `nevo-asset:<id>` the text refers to, in order, without repeats.
+///
+/// The id is validated to the same shape the portal will accept before it
+/// becomes a path segment there: anything else is not a reference this side
+/// minted, and announcing it would be announcing nothing.
+pub fn asset_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("nevo-asset:") {
+        let after = &rest[at + 11..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        let id = &after[..end];
+        if !id.is_empty() && id.len() <= 64 && !out.iter().any(|s| s == id) {
+            out.push(id.to_string());
+        }
+        rest = &after[end..];
+    }
+    out
 }
 
 /// Where a markdown image starts that has no closing bracket yet, if any.
@@ -653,6 +680,45 @@ pub fn uplink(
             }))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod asset_ref_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_ids_a_body_refers_to() {
+        assert_eq!(
+            asset_refs("看：\n\n![截图](nevo-asset:a1b2c3) 和 ![另一张](nevo-asset:d4e5f6)"),
+            vec!["a1b2c3", "d4e5f6"]
+        );
+    }
+
+    #[test]
+    fn announces_a_repeated_reference_once() {
+        // A reference split across deltas arrives more than once; announcing
+        // the same media twice would draw it twice.
+        assert_eq!(
+            asset_refs("![a](nevo-asset:x1) ![b](nevo-asset:x1)"),
+            vec!["x1"]
+        );
+    }
+
+    #[test]
+    fn refuses_an_id_that_is_not_one_this_side_minted() {
+        // The same shape the portal will accept before it becomes a path
+        // segment there. Anything else refers to nothing.
+        assert!(asset_refs("nevo-asset:").is_empty());
+        // The scan stops at the first character an id cannot contain, so a
+        // traversal names nothing rather than naming "..".
+        assert!(asset_refs("nevo-asset:../../etc/passwd").is_empty());
+        assert!(asset_refs(&format!("nevo-asset:{}", "a".repeat(65))).is_empty());
+    }
+
+    #[test]
+    fn ignores_text_that_merely_mentions_the_scheme() {
+        assert!(asset_refs("the scheme is called nevo-asset: and it takes an id").is_empty());
     }
 }
 

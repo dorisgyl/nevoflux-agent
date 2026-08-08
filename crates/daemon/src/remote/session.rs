@@ -173,6 +173,12 @@ impl PortalSession {
     /// Asset bytes come this way: they are the answer to a request rather than
     /// a translation of anything the daemon said, so they have no business
     /// going through the downlink translator.
+    /// The turn currently open, for hanging an asset off. Empty between turns,
+    /// which the portal's reducer treats as belonging to no message.
+    pub fn current_stream_id(&self) -> String {
+        self.translator.current_stream_id()
+    }
+
     pub fn downlink_frame(&mut self, frame: Value) -> Wire {
         let wire = self.sequencer.tag(frame);
         self.encode(&wire)
