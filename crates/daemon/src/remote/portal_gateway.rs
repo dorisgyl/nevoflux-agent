@@ -44,12 +44,19 @@ pub struct PortalGateway {
     pending_queries: Mutex<std::collections::HashSet<String>>,
     /// This channel's staging area for original images sent from the phone.
     uploads: Mutex<super::upload::UploadStore>,
+    /// Media the head holds for this channel, served on request rather than
+    /// written into the assistant's prose.
+    assets: Mutex<super::asset::AssetStore>,
 }
 
 /// How much disk one remote session may occupy. With a 20 MB per-image cap
 /// this allows a handful of pictures without letting a connected phone fill
 /// the cache volume.
 const UPLOAD_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// How much disk one session's downstream media may occupy. Larger than the
+/// upload quota because this side carries recordings, not just pictures.
+const ASSET_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The upload ids a frame declares. A non-string entry is skipped rather than
 /// failing the whole message.
@@ -86,7 +93,75 @@ impl PortalGateway {
                 super::upload::UploadStore::root_for(channel_id),
                 UPLOAD_QUOTA_BYTES,
             )),
+            assets: Mutex::new(super::asset::AssetStore::new(
+                super::asset::AssetStore::root_for(channel_id),
+                ASSET_QUOTA_BYTES,
+            )),
         }
+    }
+
+    /// Take media into this channel's store and announce it to the portal.
+    ///
+    /// Returns the id the body should refer to with `![alt](nevo-asset:<id>)`.
+    /// The bytes never enter the message: that is the whole point of this path.
+    pub async fn offer_asset(
+        &self,
+        stream_id: &str,
+        bytes: &[u8],
+        name: &str,
+        mime_type: &str,
+    ) -> Option<String> {
+        let offer = match self.assets.lock().await.put(bytes, name, mime_type) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(target: "remote", error = %e, "asset refused");
+                return None;
+            }
+        };
+        let id = offer.id.clone();
+        let frame = serde_json::json!({
+            "kind": "asset", "streamId": stream_id, "asset": offer,
+        });
+        let wire = self.session.lock().await.downlink_frame(frame);
+        self.sink.send(wire).await;
+        Some(id)
+    }
+
+    /// Answer one `asset_pull` with the range it asked for.
+    ///
+    /// One frame per request, capped at the store's chunk size. A larger range
+    /// simply takes several pulls — which is what lets the browser decide how
+    /// far ahead to read, and what keeps a big file from flooding the socket
+    /// the way a push loop would.
+    async fn apply_asset_pull(&self, frame: &serde_json::Value) {
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let offset = frame.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let length = frame
+            .get("length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(super::asset::CHUNK_BYTES as u64) as usize;
+
+        let store = self.assets.lock().await;
+        let out = match store.read(id, offset, length) {
+            Ok(bytes) => {
+                let eof = store.is_eof(id, offset, bytes.len());
+                use base64::Engine;
+                serde_json::json!({
+                    "kind": "asset_data",
+                    "id": id,
+                    "offset": offset,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "eof": eof,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(target: "remote", id, error = %e, "asset pull refused");
+                serde_json::json!({ "kind": "asset_error", "id": id, "reason": e.to_string() })
+            }
+        };
+        drop(store);
+        let wire = self.session.lock().await.downlink_frame(out);
+        self.sink.send(wire).await;
     }
 
     /// Point the staging area at a temporary directory (tests only).
@@ -98,9 +173,19 @@ impl PortalGateway {
         }
     }
 
+    /// Point the media store at a temporary directory (tests only).
+    #[cfg(test)]
+    pub fn with_asset_root(self, root: std::path::PathBuf) -> Self {
+        Self {
+            assets: Mutex::new(super::asset::AssetStore::new(root, ASSET_QUOTA_BYTES)),
+            ..self
+        }
+    }
+
     /// End of session: remove everything this channel put on disk.
     pub async fn cleanup_uploads(&self) {
         self.uploads.lock().await.cleanup();
+        self.assets.lock().await.cleanup();
     }
 
     /// Apply one `upload_*` frame. A rejection goes back as an `error` frame so
@@ -192,6 +277,7 @@ impl PortalGateway {
             .route(msg, session_id, &message_id, &local_files);
         match routed {
             Inbound::Upload(frame) => self.apply_upload(&frame).await,
+            Inbound::AssetPull(frame) => self.apply_asset_pull(&frame).await,
             Inbound::Uplink(payload) => {
                 // Remember what we asked, so the reply can be recognised as
                 // ours when it comes back without a session id.

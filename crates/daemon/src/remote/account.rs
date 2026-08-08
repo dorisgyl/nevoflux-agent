@@ -291,7 +291,9 @@ mod tests {
             "verification_uri": "https://nevoflux.app/device"
         });
         assert_eq!(
-            parse_device_code_resp(&b).unwrap().verification_uri_complete,
+            parse_device_code_resp(&b)
+                .unwrap()
+                .verification_uri_complete,
             None
         );
     }

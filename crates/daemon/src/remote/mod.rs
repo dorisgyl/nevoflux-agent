@@ -6,6 +6,7 @@
 //! trait + registry + WS transport + account wiring land in later phases.
 
 pub mod account;
+pub mod asset;
 pub mod connect_block;
 pub mod control_config;
 pub mod control_service;
