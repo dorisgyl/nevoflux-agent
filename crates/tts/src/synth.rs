@@ -54,19 +54,20 @@ impl Synthesizer {
         self.voices.ids()
     }
 
-    /// Synthesize, handing each chunk to `on_chunk` as it is produced.
+    /// Read the text out a chunk at a time, keeping none of it.
     ///
-    /// The callback exists so a caller can start delivering audio before the
-    /// whole utterance is done; the return value is still the whole thing,
-    /// because the video path needs one file and one duration. Those are two
-    /// real consumers with different needs, not one need served twice.
-    pub fn synthesize_each(
+    /// For a caller that is passing each chunk on as it arrives and has no
+    /// use for the join. Holding the whole reading costs four bytes a sample:
+    /// an hour is close to three hundred megabytes, and at the ceiling the
+    /// daemon allows, gigabytes — all of it to be dropped unread. What a
+    /// listener hears is the chunks, not the sum of them.
+    pub fn read_each(
         &self,
         text: &str,
         voice_id: Option<&str>,
         speed: f32,
         mut on_chunk: impl FnMut(&Audio, ChunkInfo),
-    ) -> Result<Audio, TtsError> {
+    ) -> Result<(), TtsError> {
         let available = self.voices.ids();
         let voice = resolve_voice(voice_id, &available)?;
 
@@ -81,7 +82,6 @@ impl Synthesizer {
         let chunks = split::pack(tokenized, MAX_TOKENS)?;
         let total = chunks.len();
 
-        let mut full = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
             let mut pcm = self.infer(chunk, &voice, speed)?;
             // The pause belongs to the chunk that precedes it, not to the seam
@@ -95,8 +95,30 @@ impl Synthesizer {
                 sample_rate: SAMPLE_RATE,
             };
             on_chunk(&audio, ChunkInfo { index, total });
-            full.extend_from_slice(&audio.pcm);
         }
+        Ok(())
+    }
+
+    /// Synthesize, handing each chunk to `on_chunk` as it is produced.
+    ///
+    /// The callback exists so a caller can start delivering audio before the
+    /// whole utterance is done; the return value is still the whole thing,
+    /// because the video path needs one file and one duration. Those are two
+    /// real consumers with different needs, not one need served twice — and a
+    /// caller with only the first need should reach for [`Self::read_each`],
+    /// which does not pay for the second.
+    pub fn synthesize_each(
+        &self,
+        text: &str,
+        voice_id: Option<&str>,
+        speed: f32,
+        mut on_chunk: impl FnMut(&Audio, ChunkInfo),
+    ) -> Result<Audio, TtsError> {
+        let mut full = Vec::new();
+        self.read_each(text, voice_id, speed, |audio, info| {
+            on_chunk(audio, info);
+            full.extend_from_slice(&audio.pcm);
+        })?;
         Ok(Audio {
             pcm: full,
             sample_rate: SAMPLE_RATE,
@@ -192,6 +214,42 @@ mod tests {
         let out = std::env::temp_dir().join("nevoflux-tts-check.wav");
         std::fs::write(&out, crate::wav::encode(&audio.pcm, audio.sample_rate)).unwrap();
         eprintln!("wrote {} — play it to judge quality", out.display());
+    }
+
+    /// Declining the join must not change a single sample of what is heard.
+    /// The listener gets the parts either way; only the caller's copy differs.
+    #[test]
+    #[ignore]
+    fn reading_without_keeping_gives_the_same_parts() {
+        let (m, v) = real_paths();
+        let synth =
+            Synthesizer::new(&m, &v, model::default_threads()).expect("synthesizer should build");
+        // Long enough to pack into several chunks: the budget works out to
+        // roughly 370 characters apiece, so a handful of sentences is one
+        // chunk and proves nothing about the seams.
+        let text = &"The quick brown fox jumps over the lazy dog, and then it \
+                     turns around and does the very same thing again. "
+            .repeat(12);
+
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let whole = synth
+            .synthesize_each(text, Some("af_heart"), 1.0, |a, _| kept.push(a.pcm.clone()))
+            .expect("synthesis should succeed");
+
+        let mut streamed: Vec<Vec<f32>> = Vec::new();
+        synth
+            .read_each(text, Some("af_heart"), 1.0, |a, _| {
+                streamed.push(a.pcm.clone())
+            })
+            .expect("reading should succeed");
+
+        assert!(kept.len() > 1, "one chunk would prove nothing");
+        assert_eq!(streamed, kept, "the parts must not depend on keeping the join");
+        assert_eq!(
+            whole.pcm.len(),
+            kept.iter().map(Vec::len).sum::<usize>(),
+            "the join is still exactly the parts"
+        );
     }
 
     /// The whole must equal the parts joined, byte for byte. The video path

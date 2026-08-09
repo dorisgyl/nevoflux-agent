@@ -151,10 +151,61 @@ fn synthesizer(
     Ok(SYNTH.get().cloned().unwrap_or(arc))
 }
 
+/// Hand one finished part to whoever is listening.
+///
+/// Free-standing so both readings — the one that keeps the join and the one
+/// that does not — offer parts by exactly the same rules.
+#[cfg(feature = "tts-local")]
+#[allow(clippy::too_many_arguments)]
+fn offer_part(
+    session: &str,
+    stream: Option<&str>,
+    group_slot: &std::sync::Mutex<Option<String>>,
+    chunk: &nevoflux_tts::Audio,
+    info: nevoflux_tts::ChunkInfo,
+) {
+    let bytes = nevoflux_tts::wav::encode(&chunk.pcm, chunk.sample_rate);
+    let previous = group_slot.lock().expect("group slot").clone();
+    let Some(offer) = crate::remote::asset::put_grouped_for_session(
+        session,
+        &bytes,
+        &format!("speech-{}.wav", info.index + 1),
+        "audio/wav",
+        previous,
+        info.index as u32,
+        info.total as u32,
+    ) else {
+        return;
+    };
+    *group_slot.lock().expect("group slot") = offer.group.clone();
+    let id = offer.id.clone();
+    let size = offer.size;
+    let mut frame = serde_json::json!({ "kind": "asset", "asset": offer });
+    if let Some(sid) = stream {
+        frame["streamId"] = serde_json::Value::String(sid.to_string());
+    }
+    let queued = crate::remote::push::send(session, frame);
+    // Every outcome distinguishable: a part that was made, addressed to
+    // nothing, or made for a portal that had gone. Silence here is what made
+    // the last rounds of this guesswork.
+    tracing::info!(
+        target: "remote",
+        %id, seq = info.index, of = info.total, bytes = size,
+        stream = stream.unwrap_or("<none>"),
+        queued,
+        "speech part offered"
+    );
+}
+
 /// Read the text out, handing each part to whoever is listening as it is made.
 ///
-/// Blocking from end to end — model load and inference both. Returns the whole
-/// reading and the name of the sequence it went out as, if it went out as one.
+/// Blocking from end to end — model load and inference both.
+///
+/// `keep` decides whether the join is built at all. A caller that answered
+/// before the reading started has no use for it and would pay four bytes a
+/// sample to assemble something nobody reads; one that must return the file
+/// needs every sample. Returns the reading when it was kept, and the name of
+/// the sequence it went out as, if it went out as one.
 #[cfg(feature = "tts-local")]
 fn speak(
     model_path: std::path::PathBuf,
@@ -164,51 +215,31 @@ fn speak(
     voice: Option<String>,
     session: Option<String>,
     stream: Option<String>,
-) -> Result<(nevoflux_tts::Audio, Option<String>), TtsError> {
+    keep: bool,
+) -> Result<(Option<nevoflux_tts::Audio>, Option<String>), TtsError> {
     let synth = synthesizer(&model_path, &voices_path, threads)?;
     // Written from inside the callback and read after it: the first part's id
     // names the group, and the end frame needs that name.
     let group_slot: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-    let result = synth.synthesize_each(&text, voice.as_deref(), 1.0, |chunk, info| {
-        // Nothing watching is the ordinary case, so this returns quietly: the
-        // whole utterance is still owed to the caller for the video path
-        // whether or not a portal is attached.
-        let Some(session) = session.as_deref() else {
-            return;
-        };
-        let bytes = nevoflux_tts::wav::encode(&chunk.pcm, chunk.sample_rate);
-        let previous = group_slot.lock().expect("group slot").clone();
-        let Some(offer) = crate::remote::asset::put_grouped_for_session(
-            session,
-            &bytes,
-            &format!("speech-{}.wav", info.index + 1),
-            "audio/wav",
-            previous,
-            info.index as u32,
-            info.total as u32,
-        ) else {
-            return;
-        };
-        *group_slot.lock().expect("group slot") = offer.group.clone();
-        let id = offer.id.clone();
-        let size = offer.size;
-        let mut frame = serde_json::json!({ "kind": "asset", "asset": offer });
-        if let Some(sid) = stream.as_deref() {
-            frame["streamId"] = serde_json::Value::String(sid.to_string());
+    // Nothing watching is the ordinary case, so this passes quietly: the
+    // reading is still owed to the caller for the video path whether or not a
+    // portal is attached.
+    let each = |chunk: &nevoflux_tts::Audio, info: nevoflux_tts::ChunkInfo| {
+        if let Some(session) = session.as_deref() {
+            offer_part(session, stream.as_deref(), &group_slot, chunk, info);
         }
-        let queued = crate::remote::push::send(session, frame);
-        // Every outcome distinguishable: a part that was made, addressed to
-        // nothing, or made for a portal that had gone. Silence here is what
-        // made the last two rounds of this guesswork.
-        tracing::info!(
-            target: "remote",
-            %id, seq = info.index, of = info.total, bytes = size,
-            stream = stream.as_deref().unwrap_or("<none>"),
-            queued,
-            "speech part offered"
-        );
-    });
+    };
+
+    let result = if keep {
+        synth
+            .synthesize_each(&text, voice.as_deref(), 1.0, each)
+            .map(Some)
+    } else {
+        synth
+            .read_each(&text, voice.as_deref(), 1.0, each)
+            .map(|()| None)
+    };
 
     // Whether it finished or failed, say so: a player that never hears the end
     // waits for a part that is not coming.
@@ -285,7 +316,11 @@ pub async fn synthesize_local(
         let chars = text.chars().count();
         let voice = requested_voice.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = speak(model_path, voices_path, threads, text, voice, session, stream) {
+            // `false`: the answer has gone, so the join would be assembled
+            // for nobody.
+            if let Err(e) = speak(
+                model_path, voices_path, threads, text, voice, session, stream, false,
+            ) {
                 // The caller has already been answered, so this is the only
                 // place it can be said at all.
                 tracing::warn!(target: "remote", error = %e, "speech failed while being read out");
@@ -304,8 +339,12 @@ pub async fn synthesize_local(
 
     let voice = requested_voice.clone();
     let (audio, group) = tokio::task::block_in_place(move || {
-        speak(model_path, voices_path, threads, text, voice, session, stream)
+        speak(
+            model_path, voices_path, threads, text, voice, session, stream, true,
+        )
     })?;
+    // `keep` was true, so there is a reading here.
+    let audio = audio.expect("a kept reading");
 
     // Real duration, not the chars/2.5 guess the HTTP path has to make.
     let duration_sec = audio.pcm.len() as f32 / audio.sample_rate as f32;
