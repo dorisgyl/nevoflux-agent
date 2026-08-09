@@ -10,7 +10,8 @@
 //! Design (buckets, least → most privileged; each tier adds the next bucket):
 //!   R  — read-only: browser observe/navigate/wait, web read (web_fetch/search)
 //!   B1 — browser interaction: click / type / fill / scroll / key-press
-//!   L0 — local file read: read_file / list_files / glob / grep
+//!   L0 — local file read: read_file / list_files / glob / grep /
+//!        play_local_file
 //!   X  — everything else: file write, exec, computer, memory writes, MCP,
 //!        plugins, browser eval-js, and anything unrecognized (safe default)
 
@@ -142,7 +143,17 @@ const B1_TOOLS: &[&str] = &[
 ];
 
 /// L0 bucket — local filesystem reads.
-const L0_TOOLS: &[&str] = &["read_file", "list_files", "glob", "grep"];
+const L0_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "glob",
+    "grep",
+    // Reads one file off the disk and hands it to whoever is watching. The
+    // reading is the risk and it is the same reading, so it answers to the
+    // same tier — anything else would be a second, quieter permission model
+    // for the same act.
+    "play_local_file",
+];
 
 /// Classify a tool call into its risk bucket. An `mcp__server__tool` wrapper
 /// prefix is stripped first (mirroring `is_read_only_tool`) so ACP-wrapped

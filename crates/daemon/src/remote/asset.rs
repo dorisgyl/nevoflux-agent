@@ -25,6 +25,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// carries recordings, and refusing at the door beats truncating downstream.
 pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Ceiling for a file this store adopts rather than copies.
+///
+/// Higher than [`MAX_ASSET_BYTES`] because it is guarding something else. That
+/// one bounds what the daemon writes: a caller hands over bytes it is holding,
+/// they are copied to disk, and both costs are real. An adopted file is
+/// already on disk and stays where it is — nothing is read until the portal
+/// asks for a range, and then only that range. What is left to bound is how
+/// much a viewer could be made to pull over the relay, and a feature-length
+/// film fits under this.
+pub const MAX_ADOPTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// The most one `asset_data` frame may carry, in source bytes. Base64 inflates
 /// by a third — 342 KB — which stays under the relay's ~900 KB frame ceiling
 /// with room for the envelope. Matches the phone's upload chunking.
@@ -144,6 +155,67 @@ impl AssetStore {
         mime_type: &str,
     ) -> Result<AssetOffer, AssetError> {
         self.store(bytes, name, mime_type, None, None, None)
+    }
+
+    /// Serve a file that already exists, without copying it.
+    ///
+    /// For media the machine is holding anyway — a recording, a download, a
+    /// film someone asked to watch. Copying it would double a gigabyte on disk
+    /// and read the whole thing into memory to do it, to produce a second copy
+    /// of a file that is not going anywhere. `read` already seeks into a path;
+    /// this simply records the path it was given.
+    ///
+    /// The file is not owned, so it is not counted against the quota — the
+    /// quota bounds what this store spends, and it spends nothing here. It is
+    /// also not guarded: something that deletes or truncates it mid-playback
+    /// turns the next range into a read error, which is the honest outcome. A
+    /// copy would only have moved that failure earlier.
+    pub fn adopt(
+        &mut self,
+        path: &std::path::Path,
+        name: &str,
+        mime_type: &str,
+    ) -> Result<AssetOffer, AssetError> {
+        let meta = std::fs::metadata(path).map_err(|e| AssetError::Io(e.to_string()))?;
+        if !meta.is_file() {
+            return Err(AssetError::Io(format!(
+                "{} is not a file",
+                path.display()
+            )));
+        }
+        let size = meta.len();
+        if size > MAX_ADOPTED_BYTES {
+            return Err(AssetError::TooLarge {
+                size,
+                max: MAX_ADOPTED_BYTES,
+            });
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let offer = AssetOffer {
+            id: id.clone(),
+            name: super::translate::sanitize_display_name(name),
+            mime_type: mime_type.to_string(),
+            size,
+            seekable: true,
+            group: None,
+            seq: None,
+            of: None,
+        };
+        self.pending.push(offer.clone());
+        self.assets.insert(
+            id,
+            Asset {
+                path: path.to_path_buf(),
+                name: offer.name.clone(),
+                mime_type: offer.mime_type.clone(),
+                size,
+                group: None,
+                seq: None,
+                of: None,
+            },
+        );
+        Ok(offer)
     }
 
     /// Store one part of a sequence.
@@ -368,6 +440,34 @@ mod tests {
     }
 
     #[test]
+    fn an_adopted_file_is_read_where_it_lies() {
+        let (mut s, d) = store();
+        let source = d.path().join("outside.mp4");
+        let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &bytes).unwrap();
+
+        let offer = s.adopt(&source, "outside.mp4", "video/mp4").unwrap();
+        assert_eq!(offer.size, 5000);
+        assert_eq!(s.read(&offer.id, 1000, 500).unwrap(), bytes[1000..1500]);
+        // Nothing was copied: the original is still the only file with these
+        // bytes, and the store's own directory did not grow.
+        assert!(source.exists());
+        assert_eq!(s.used, 0, "an adopted file spends none of the quota");
+    }
+
+    #[test]
+    fn an_adopted_file_that_goes_away_fails_the_read() {
+        // Nobody guards it, so this is the honest outcome rather than a
+        // silent zero-length answer.
+        let (mut s, d) = store();
+        let source = d.path().join("gone.mp4");
+        std::fs::write(&source, b"here for now").unwrap();
+        let offer = s.adopt(&source, "gone.mp4", "video/mp4").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert!(s.read(&offer.id, 0, 4).is_err());
+    }
+
+    #[test]
     fn put_then_read_returns_the_same_bytes() {
         let (mut s, _d) = store();
         let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
@@ -520,6 +620,23 @@ pub fn put_for_session(
             None
         }
     }
+}
+
+/// Serve a file already on disk to a session. `None` when no portal is
+/// attached — same contract as `put_for_session`.
+pub fn adopt_for_session(
+    session_id: &str,
+    path: &std::path::Path,
+    name: &str,
+    mime_type: &str,
+) -> Result<AssetOffer, AssetError> {
+    let store = registry()
+        .lock()
+        .ok()
+        .and_then(|r| r.get(session_id).cloned())
+        .ok_or_else(|| AssetError::Io("no portal is attached to this session".into()))?;
+    let mut store = store.lock().map_err(|_| AssetError::Io("store".into()))?;
+    store.adopt(path, name, mime_type)
 }
 
 /// Store one part of a sequence for a session. `None` when no portal is

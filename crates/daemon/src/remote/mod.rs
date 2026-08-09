@@ -15,6 +15,7 @@ pub mod gateway;
 pub mod identity;
 pub mod inject;
 pub mod portal_gateway;
+pub mod local_media;
 pub mod push;
 pub mod relay_protocol;
 pub mod session;
