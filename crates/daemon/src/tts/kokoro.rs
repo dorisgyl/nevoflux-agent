@@ -14,8 +14,22 @@ use crate::tts::error::TtsError;
 use nevoflux_protocol::tts::{SynthesizeRequest, SynthesizeResponse};
 use std::path::PathBuf;
 
-const MODEL_FILE: &str = "kokoro-v1.0.int8.onnx";
+/// Model filenames to look for, best first.
+///
+/// fp32 leads because int8 only wins on a CPU with VNNI; without it the
+/// quantized GEMM is emulated and comes out slower than fp32 — 0.85x realtime
+/// against 3.36x on an i7-7700K — for output that matches on peak and RMS to
+/// three decimals. int8 stays last so existing installs keep working, and
+/// `model_path` overrides all of it.
+const MODEL_FILES: [&str; 3] = [
+    "kokoro-v1.0.onnx",
+    "kokoro-v1.0.fp32.onnx",
+    "kokoro-v1.0.int8.onnx",
+];
 const VOICES_FILE: &str = "kokoro-voices-v1.0.bin";
+
+/// A name for the model in errors, when we cannot say which file was meant.
+const MODEL_FILE: &str = MODEL_FILES[0];
 
 /// Config path if given, else the default cache dir.
 fn resolve(configured: Option<&str>, filename: &str) -> Option<PathBuf> {
@@ -23,6 +37,22 @@ fn resolve(configured: Option<&str>, filename: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(expand_home(p)));
     }
     default_model_dir().map(|d| d.join(filename))
+}
+
+/// The model to load: config if set, else the best candidate present.
+///
+/// Returns the first *existing* candidate rather than the first name, so a
+/// machine with only the int8 weights still works.
+fn resolve_model(configured: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = configured.filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(expand_home(p)));
+    }
+    let dir = default_model_dir()?;
+    MODEL_FILES
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+        .or_else(|| Some(dir.join(MODEL_FILE)))
 }
 
 /// `~/.cache/nevoflux/models` — where the download instructions point.
@@ -94,8 +124,16 @@ pub async fn synthesize_local(
     let synth = match SYNTH.get() {
         Some(s) => s.clone(),
         None => {
+            let threads = cfg
+                .threads
+                .unwrap_or_else(nevoflux_tts::model::default_threads);
+            tracing::info!(
+                model = %model_path.display(),
+                threads,
+                "loading Kokoro; first call pays the model load, later ones do not"
+            );
             let built = tokio::task::block_in_place(|| {
-                nevoflux_tts::Synthesizer::new(&model_path, &voices_path)
+                nevoflux_tts::Synthesizer::new(&model_path, &voices_path, threads)
             })
             .map_err(map_err)?;
             let arc = Arc::new(built);
@@ -258,6 +296,7 @@ mod tests {
             model_path: Some("/nonexistent/kokoro.onnx".into()),
             voices_path: Some("/nonexistent/voices.bin".into()),
             default_voice: None,
+            threads: None,
         };
         let err = synthesize_local(&cfg, &req("hello")).await.unwrap_err();
         let msg = err.to_string();
@@ -280,10 +319,38 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_default_dir_when_unconfigured() {
-        let p = resolve(None, MODEL_FILE).unwrap();
+        let p = resolve(None, VOICES_FILE).unwrap();
         assert!(
-            p.ends_with("nevoflux/models/kokoro-v1.0.int8.onnx"),
+            p.ends_with("nevoflux/models/kokoro-voices-v1.0.bin"),
             "got {p:?}"
+        );
+    }
+
+    #[test]
+    fn configured_model_path_wins_over_every_candidate() {
+        let p = resolve_model(Some("/custom/my-kokoro.onnx")).unwrap();
+        assert_eq!(p, PathBuf::from("/custom/my-kokoro.onnx"));
+    }
+
+    #[test]
+    fn unconfigured_model_lands_on_a_known_candidate() {
+        let p = resolve_model(None).unwrap();
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            MODEL_FILES.contains(&name),
+            "{name} is not one of the candidates"
+        );
+    }
+
+    #[test]
+    fn fp32_is_preferred_over_int8() {
+        // The ordering is the whole point: int8 is slower without VNNI, so a
+        // machine holding both weights must not quietly pick the slow one.
+        let fp32 = MODEL_FILES.iter().position(|f| !f.contains("int8"));
+        let int8 = MODEL_FILES.iter().position(|f| f.contains("int8"));
+        assert!(
+            fp32 < int8,
+            "fp32 candidates must come first: {MODEL_FILES:?}"
         );
     }
 

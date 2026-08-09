@@ -26,9 +26,15 @@ pub struct Synthesizer {
 }
 
 impl Synthesizer {
-    pub fn new(model_path: &Path, voices_path: &Path) -> Result<Synthesizer, TtsError> {
+    /// Build a synthesizer. `threads` is the intra-op width; pass
+    /// [`model::default_threads`] unless config says otherwise.
+    pub fn new(
+        model_path: &Path,
+        voices_path: &Path,
+        threads: usize,
+    ) -> Result<Synthesizer, TtsError> {
         Ok(Synthesizer {
-            session: Mutex::new(model::load_session(model_path)?),
+            session: Mutex::new(model::load_session(model_path, threads)?),
             voices: VoiceBank::load(voices_path)?,
             g2p: EnglishG2p::new(),
         })
@@ -127,7 +133,8 @@ mod tests {
     #[ignore]
     fn speaks_english_end_to_end() {
         let (m, v) = real_paths();
-        let synth = Synthesizer::new(&m, &v).expect("synthesizer should build");
+        let synth =
+            Synthesizer::new(&m, &v, model::default_threads()).expect("synthesizer should build");
         let audio = synth
             .synthesize(
                 "Hello from NevoFlux. Local speech works.",
@@ -154,7 +161,7 @@ mod tests {
     #[ignore]
     fn refuses_chinese_voices() {
         let (m, v) = real_paths();
-        let synth = Synthesizer::new(&m, &v).unwrap();
+        let synth = Synthesizer::new(&m, &v, 1).unwrap();
         let err = synth
             .synthesize("你好", Some("zf_xiaoxiao"), 1.0)
             .unwrap_err();

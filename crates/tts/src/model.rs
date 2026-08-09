@@ -139,10 +139,12 @@ fn prepare_dylib() -> Result<(), TtsError> {
 
 /// Build an inference session for the Kokoro ONNX graph.
 ///
-/// Single-threaded on purpose: the daemon may run several turns at once and
-/// an 82M model per turn is cheap, whereas letting each session grab every
-/// core is not.
-pub fn load_session(path: &Path) -> Result<Session, TtsError> {
+/// `threads` is the intra-op width. It is a parameter rather than a constant
+/// because the useful value is the machine's *physical* core count and the
+/// curve past it slopes back down — measured on a 4-core/8-thread i7-7700K
+/// with the fp32 model: 1.45x realtime at one thread, 3.36x at four, then
+/// 2.66x at five. Hyperthreads are contention here, not capacity.
+pub fn load_session(path: &Path, threads: usize) -> Result<Session, TtsError> {
     if !path.exists() {
         return Err(TtsError::ModelNotFound(path.display().to_string()));
     }
@@ -152,7 +154,7 @@ pub fn load_session(path: &Path) -> Result<Session, TtsError> {
     let corrupt = |e: String| TtsError::ModelCorrupt(format!("{}: {e}", path.display()));
     let builder = Session::builder().map_err(|e| corrupt(e.to_string()))?;
     let builder = builder
-        .with_intra_threads(1)
+        .with_intra_threads(threads.max(1))
         .map_err(|e| corrupt(e.to_string()))?;
     let mut builder = builder
         .with_inter_threads(1)
@@ -160,6 +162,20 @@ pub fn load_session(path: &Path) -> Result<Session, TtsError> {
     builder
         .commit_from_file(path)
         .map_err(|e| corrupt(e.to_string()))
+}
+
+/// Intra-op width to use when config does not say.
+///
+/// Capped at four for two reasons: past the physical core count the measured
+/// throughput falls off, and a daemon serving several sessions wants the
+/// remaining cores for concurrency rather than for one utterance. Machines
+/// report logical cores, so on a hyperthreaded box this lands on roughly the
+/// physical count by accident of the cap — which is the number that matters.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
 }
 
 /// Where the model files live when config does not say.
@@ -176,7 +192,7 @@ mod tests {
 
     #[test]
     fn missing_model_reports_not_found() {
-        let err = load_session(Path::new("/nonexistent/kokoro.onnx")).unwrap_err();
+        let err = load_session(Path::new("/nonexistent/kokoro.onnx"), 1).unwrap_err();
         assert!(matches!(err, TtsError::ModelNotFound(_)), "got: {err}");
     }
 
@@ -184,8 +200,14 @@ mod tests {
     fn corrupt_model_reports_corrupt() {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), b"not an onnx file").unwrap();
-        let err = load_session(f.path()).unwrap_err();
+        let err = load_session(f.path(), 1).unwrap_err();
         assert!(matches!(err, TtsError::ModelCorrupt(_)), "got: {err}");
+    }
+
+    #[test]
+    fn default_threads_stays_in_the_useful_range() {
+        let t = default_threads();
+        assert!((1..=4).contains(&t), "got {t}");
     }
 
     #[cfg(feature = "ort-load-dynamic")]
@@ -227,7 +249,7 @@ mod tests {
     #[ignore]
     fn real_model_has_expected_signature() {
         let path = default_model_dir().unwrap().join("kokoro-v1.0.int8.onnx");
-        let session = load_session(&path).expect("model should load");
+        let session = load_session(&path, 1).expect("model should load");
         let inputs: Vec<_> = session
             .inputs()
             .iter()
