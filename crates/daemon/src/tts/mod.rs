@@ -34,10 +34,51 @@ pub use whisper::transcribe;
 /// ElevenLabs' ceiling per umbrella §7.8 — roughly 60 s of speech.
 pub const MAX_TEXT_LEN_API: usize = 600;
 
-/// Kokoro's ceiling. Lower than the API's because the model itself stops at
-/// 510 tokens; this character count is only a cheap pre-check, and
-/// `nevoflux-tts` enforces the real token limit after phonemization.
-pub const MAX_TEXT_LEN_LOCAL: usize = 510;
+/// A ceiling on one call, not the model's limit.
+///
+/// This was 510 to mirror the model's 510-token window, which read as though
+/// a passage had to be cut up before it could be spoken. It does not:
+/// `nevoflux-tts` cuts on sentence boundaries and synthesizes chunk by chunk,
+/// and that chunking is what lets a reading reach a listener while the rest
+/// of it is still being made. Capping at the window taught the caller to do
+/// the cutting instead, and a passage split across calls is several
+/// recordings rather than one — several players, none of them the whole
+/// thing.
+///
+/// What is left is a backstop against a runaway argument, not a limit anyone
+/// should plan around. It sits far above any prose a person means to sit and
+/// listen to: at roughly 12.7 characters per second of speech this is about
+/// seven hours. Inference is synchronous and the reading accumulates in
+/// memory as it goes, so a call anywhere near the ceiling owns a runtime
+/// thread for hours and holds gigabytes. The caller is trusted to ask for
+/// something sane; this only stops a number that was never meant to be a
+/// length.
+pub const MAX_TEXT_LEN_LOCAL: usize = 327680;
+
+/// Take the recording out of a response whose bytes have already been sent.
+///
+/// `audio_b64` is the whole reading as text. It is there for callers with
+/// nowhere else to get the audio: a composition that needs it written into
+/// its files map, and a session with no portal attached. When the reading
+/// has already gone out part by part as an asset group, handing it over a
+/// second time puts it in the model's context — which is the failure this
+/// whole path was built to remove. A model holding base64 will sometimes try
+/// to write it back out, and it never survives the trip intact.
+///
+/// It mattered less when one call was capped at 510 characters and the
+/// duplicate was a couple of megabytes. At `MAX_TEXT_LEN_LOCAL` it would be
+/// upward of a hundred and sixty.
+pub fn strip_delivered_audio(resp: &mut serde_json::Value, wanted_by_composition: bool) {
+    if wanted_by_composition {
+        return;
+    }
+    if resp.get("asset_group").and_then(|v| v.as_str()).is_none() {
+        return;
+    }
+    if let Some(obj) = resp.as_object_mut() {
+        obj.remove("audio_b64");
+    }
+}
 
 /// Synthesize speech via the ElevenLabs HTTP API. Returns audio bytes
 /// + metadata; caller decides whether to also write to a composition's
@@ -93,6 +134,7 @@ pub async fn synthesize_api(
         voice_id: voice_id.to_string(),
         wrote_to_files: None, // dispatch layer fills this if composition_id set
         asset_group: None,    // the HTTP path delivers one file, not a sequence
+        speaking: None,       // and it is finished by the time it answers
     })
 }
 
@@ -187,5 +229,37 @@ mod tests {
         };
         let err = synthesize_api(&cfg, &req).await.unwrap_err();
         assert!(matches!(err, TtsError::ConfigMissing(_)));
+    }
+
+    fn response(group: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({ "audio_b64": "QUJD", "duration_sec": 1.0 });
+        if let Some(g) = group {
+            v["asset_group"] = serde_json::Value::String(g.into());
+        }
+        v
+    }
+
+    #[test]
+    fn keeps_audio_when_nothing_else_delivered_it() {
+        let mut v = response(None);
+        strip_delivered_audio(&mut v, false);
+        assert_eq!(v["audio_b64"], "QUJD", "no group means nobody else has it");
+    }
+
+    #[test]
+    fn drops_audio_the_listener_already_has() {
+        let mut v = response(Some("abc123"));
+        strip_delivered_audio(&mut v, false);
+        assert!(v.get("audio_b64").is_none());
+        assert_eq!(v["asset_group"], "abc123", "how to reach it must survive");
+    }
+
+    #[test]
+    fn keeps_audio_a_composition_still_needs() {
+        // The group went to the portal; the artifact's files map is written
+        // from this field, so taking it out would leave the video silent.
+        let mut v = response(Some("abc123"));
+        strip_delivered_audio(&mut v, true);
+        assert_eq!(v["audio_b64"], "QUJD");
     }
 }
