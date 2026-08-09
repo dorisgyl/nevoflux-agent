@@ -5335,10 +5335,12 @@ impl HostFunctions for DaemonHostFunctions {
                 Ok::<_, HostError>(resp)
             })
         })?;
-        serde_json::to_value(&resp).map_err(|e| HostError {
+        let mut out = serde_json::to_value(&resp).map_err(|e| HostError {
             code: 4,
             message: format!("serialize tts_synthesize_api response: {e}"),
-        })
+        })?;
+        self.offer_tts_asset(&mut out);
+        Ok(out)
     }
 
     fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
@@ -5352,8 +5354,7 @@ impl HostFunctions for DaemonHostFunctions {
         let database = self.services.as_ref().map(|s| s.database.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                let mut resp =
-                    crate::tts::synthesize_local(&cfg, &req, session_for_tts.as_deref())
+                let mut resp = crate::tts::synthesize_local(&cfg, &req, session_for_tts.as_deref())
                     .await
                     .map_err(|e| HostError {
                         code: e.code() as i32,
@@ -5379,10 +5380,12 @@ impl HostFunctions for DaemonHostFunctions {
                 Ok::<_, HostError>(resp)
             })
         })?;
-        serde_json::to_value(&resp).map_err(|e| HostError {
+        let mut out = serde_json::to_value(&resp).map_err(|e| HostError {
             code: 4,
             message: format!("serialize tts_synthesize_local response: {e}"),
-        })
+        })?;
+        self.offer_tts_asset(&mut out);
+        Ok(out)
     }
 
     fn tts_voices(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
@@ -6509,9 +6512,82 @@ impl DaemonHostFunctions {
     /// `None` when nothing is watching, when the payload is not decodable, or
     /// when the store refuses it — in every case the turn carries on with no
     /// reference, which renders as no picture rather than a broken one.
+    /// Offer synthesized speech to whatever portal is watching, and note the
+    /// id on the response.
+    ///
+    /// Same reason as a screenshot: `audio_b64` is hundreds of kilobytes of
+    /// base64, and a model that has it in context will sometimes try to write
+    /// it out. An id cannot be mistyped into something plausible-but-wrong.
+    ///
+    /// `audio_b64` is deliberately left in place — the artifact renderer reads
+    /// it — so this does not yet keep the bytes away from the model the way
+    /// the screenshot path does. It makes the audio *reachable*; taking the
+    /// payload out belongs with a change to the artifact path.
+    fn offer_tts_asset(&self, resp: &mut serde_json::Value) {
+        use base64::Engine;
+        // Already handed over part by part while it was being made. Offering
+        // the whole thing as well would put a second player on the same turn,
+        // saying the same words.
+        if resp.get("asset_group").and_then(|v| v.as_str()).is_some() {
+            return;
+        }
+        let Some(session) = self.session_id.as_deref() else {
+            return;
+        };
+        let Some(b64) = resp.get("audio_b64").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let mime = resp
+            .get("mime_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("audio/wav")
+            .to_string();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            tracing::warn!(target: "remote", "speech not offered: undecodable base64");
+            return;
+        };
+        let ext = if mime.contains("mpeg") { "mp3" } else { "wav" };
+        let Some(offer) =
+            crate::remote::asset::put_for_session(session, &bytes, &format!("speech.{ext}"), &mime)
+        else {
+            return;
+        };
+        tracing::info!(
+            target: "remote",
+            id = %offer.id, bytes = offer.size, session = %session,
+            "speech offered as an asset"
+        );
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert(
+                "asset_id".into(),
+                serde_json::Value::String(offer.id.clone()),
+            );
+            obj.insert(
+                "show_with".into(),
+                serde_json::Value::String(format!("![speech](nevo-asset:{})", offer.id)),
+            );
+        }
+    }
+
     fn offer_screenshot_asset(&self, raw: &str) -> Option<String> {
         use base64::Engine;
-        let session = self.session_id.as_deref()?;
+        let Some(session) = self.session_id.as_deref() else {
+            tracing::warn!(target: "remote", "screenshot not offered: host has no session id");
+            return None;
+        };
+        // Said out loud because a miss here is invisible otherwise: the turn
+        // simply carries on with no picture, and the log shows the screenshot
+        // succeeding. Which session is attached is the fact that settles it.
+        let attached = crate::remote::asset::registered_sessions();
+        if !attached.iter().any(|s| s == session) {
+            tracing::warn!(
+                target: "remote",
+                session = %session,
+                attached = ?attached,
+                "screenshot not offered: no portal store for this session"
+            );
+            return None;
+        }
         // Either a bare payload or a whole data URL; the sidebar sends both.
         let (mime, b64) = match raw.strip_prefix("data:") {
             Some(rest) => {
@@ -6524,12 +6600,26 @@ impl DaemonHostFunctions {
             None => ("image/png".to_string(), raw),
         };
         let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(clean)
-            .ok()?;
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(clean) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "remote", error = %e, "screenshot not offered: undecodable base64");
+                return None;
+            }
+        };
         let ext = mime.rsplit('/').next().unwrap_or("png");
-        crate::remote::asset::put_for_session(session, &bytes, &format!("screenshot.{ext}"), &mime)
-            .map(|offer| offer.id)
+        let offer = crate::remote::asset::put_for_session(
+            session,
+            &bytes,
+            &format!("screenshot.{ext}"),
+            &mime,
+        )?;
+        tracing::info!(
+            target: "remote",
+            id = %offer.id, bytes = offer.size, session = %session,
+            "screenshot offered as an asset instead of inline bytes"
+        );
+        Some(offer.id)
     }
 
     fn extract_screenshot_base64(result: &Option<serde_json::Value>) -> Option<String> {
