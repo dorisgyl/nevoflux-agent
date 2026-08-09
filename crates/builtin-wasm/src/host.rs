@@ -656,6 +656,16 @@ pub trait HostFunctions {
         })
     }
 
+    /// List the local voice bank. Takes no arguments; the daemon reads
+    /// `[tts.kokoro] voices_path` and reports what the bank actually holds
+    /// rather than a hard-coded list, since the file can be swapped.
+    fn tts_voices(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "tts_voices not supported by this host".into(),
+        })
+    }
+
     /// Transcribe audio via local Whisper ONNX (P5b-3). Backs auto-
     /// caption generation in P5c. Daemon reads `[tts.whisper] model_path`;
     /// returns ConfigMissing until configured.

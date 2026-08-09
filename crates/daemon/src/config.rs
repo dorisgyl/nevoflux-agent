@@ -125,18 +125,25 @@ pub struct TtsConfig {
 /// [tts.kokoro]
 /// model_path  = "~/.cache/nevoflux/models/kokoro-v1.0.int8.onnx"
 /// voices_path = "~/.cache/nevoflux/models/kokoro-voices-v1.0.bin"
-/// default_voice = "af"  # American female
+/// default_voice = "af_heart"  # full voice id; a bare "af" works as an alias
 /// ```
+///
+/// Both paths are optional: when unset the daemon looks in
+/// `~/.cache/nevoflux/models/` for the stock filenames.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KokoroConfig {
-    /// Filesystem path to the Kokoro ONNX model. None → tool returns
-    /// ConfigMissing with download instructions.
+    /// Filesystem path to the Kokoro ONNX model. None → look in
+    /// `~/.cache/nevoflux/models/`, and if it is not there either, the tool
+    /// returns ConfigMissing with download instructions.
     #[serde(default)]
     pub model_path: Option<String>,
     /// Filesystem path to the Kokoro voice bank.
     #[serde(default)]
     pub voices_path: Option<String>,
-    /// Default voice tag (`af` / `am` / `bf` / `bm` / `zf` / `zm`).
+    /// Default voice. Kokoro ships 54 full ids such as `af_heart`,
+    /// `am_michael` or `bm_george`; a bare two-letter prefix like `af` is
+    /// accepted as an alias for the first voice under it. Only af/am/bf/bm
+    /// (English) can be spoken today — see `tts_voices` for the list.
     #[serde(default)]
     pub default_voice: Option<String>,
 }

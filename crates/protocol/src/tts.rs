@@ -24,7 +24,8 @@ pub struct SynthesizeRequest {
     pub text: String,
     /// Voice identifier. Format depends on backend:
     /// - ElevenLabs: 20-char voice ID (e.g. `21m00Tcm4TlvDq8ikWAM`)
-    /// - Kokoro: short tag (e.g. `af`, `am`, `zf`, `zm`)
+    /// - Kokoro: full voice id (e.g. `af_heart`, `am_michael`); a bare
+    ///   two-letter prefix such as `af` is accepted as an alias
     /// When omitted, daemon falls back to the backend's default voice
     /// from config.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]

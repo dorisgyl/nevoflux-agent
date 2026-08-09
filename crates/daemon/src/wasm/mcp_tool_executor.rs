@@ -558,6 +558,9 @@ async fn execute_mcp_tool_inner(
     if name == "tts_synthesize_api" {
         return execute_tts_synthesize_api(arguments, services).await;
     }
+    if name == "tts_voices" {
+        return execute_tts_voices(services).await;
+    }
     if name == "tts_synthesize_local" {
         return execute_tts_synthesize_local(arguments, services).await;
     }
@@ -2070,11 +2073,59 @@ async fn execute_tts_synthesize_local(
         .as_ref()
         .map(|c| c.kokoro.clone())
         .unwrap_or_default();
-    let resp = crate::tts::synthesize_local(&cfg, &req)
+    let mut resp = crate::tts::synthesize_local(&cfg, &req)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Same composition write the API arm does, with Kokoro's extension.
+    // Without this the local path cannot feed the video pipeline at all.
+    if let Some(comp_id) = req.composition_id.as_deref() {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        let repo = ArtifactRepository::new(&services.database);
+        match repo.get(comp_id) {
+            Ok(Some(record)) => {
+                let mut files = record.files.unwrap_or_default();
+                files.insert("narration.wav".to_string(), resp.audio_b64.clone());
+                let entry = record.entry.unwrap_or_else(|| "index.html".to_string());
+                let content = files
+                    .get(&entry)
+                    .cloned()
+                    .unwrap_or_else(|| record.content.clone());
+                if let Err(e) = repo.update_files(comp_id, &files, &content) {
+                    tracing::warn!(
+                        "tts_synthesize_local: failed to write narration.wav into {}: {}",
+                        comp_id,
+                        e
+                    );
+                } else {
+                    resp.wrote_to_files = Some("narration.wav".into());
+                }
+            }
+            Ok(None) => tracing::warn!(
+                "tts_synthesize_local: composition_id {} not found; returning audio only",
+                comp_id
+            ),
+            Err(e) => tracing::warn!("tts_synthesize_local: artifact get for {}: {}", comp_id, e),
+        }
+    }
+
     serde_json::to_string(&resp)
         .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
+}
+
+/// MCP/ACP dispatch arm for `tts_voices`. Reports what the configured voice
+/// bank holds; takes no arguments.
+async fn execute_tts_voices(services: &HostServices) -> Result<String, String> {
+    let cfg = services
+        .tts_config
+        .as_ref()
+        .map(|c| c.kokoro.clone())
+        .unwrap_or_default();
+    let voices = crate::tts::list_voices(&cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&serde_json::json!({ "voices": voices }))
+        .map_err(|e| format!("serialize tts_voices response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_transcribe` (P5b-3). Reads

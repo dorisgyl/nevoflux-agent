@@ -5317,7 +5317,8 @@ impl HostFunctions for DaemonHostFunctions {
                         })?;
                 // Optionally write into composition's files map.
                 if let (Some(comp_id), Some(db)) = (req.composition_id.as_deref(), database) {
-                    if let Err(e) = write_audio_to_composition(&db, comp_id, &resp.audio_b64).await
+                    if let Err(e) =
+                        write_audio_to_composition(&db, comp_id, &resp.audio_b64, "mp3").await
                     {
                         // Don't fail the whole call if write fails — still
                         // return audio_b64 to the LLM, just record the
@@ -5347,20 +5348,58 @@ impl HostFunctions for DaemonHostFunctions {
                 message: format!("invalid tts_synthesize_local args: {e}"),
             })?;
         let cfg = self.config.tts.kokoro.clone();
+        let database = self.services.as_ref().map(|s| s.database.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                crate::tts::synthesize_local(&cfg, &req)
+                let mut resp = crate::tts::synthesize_local(&cfg, &req)
                     .await
                     .map_err(|e| HostError {
                         code: e.code() as i32,
                         message: e.to_string(),
-                    })
+                    })?;
+                // Kokoro emits WAV, so the narration entry is `narration.wav`;
+                // the renderer accepts either extension.
+                if let (Some(comp_id), Some(db)) = (req.composition_id.as_deref(), database) {
+                    if let Err(e) =
+                        write_audio_to_composition(&db, comp_id, &resp.audio_b64, "wav").await
+                    {
+                        // A failed write must not lose the audio: the caller
+                        // still gets audio_b64, the problem just gets logged.
+                        tracing::warn!(
+                            "tts_synthesize_local: failed to write audio into {}: {}",
+                            comp_id,
+                            e
+                        );
+                    } else {
+                        resp.wrote_to_files = Some("narration.wav".into());
+                    }
+                }
+                Ok::<_, HostError>(resp)
             })
         })?;
         serde_json::to_value(&resp).map_err(|e| HostError {
             code: 4,
             message: format!("serialize tts_synthesize_local response: {e}"),
         })
+    }
+
+    fn tts_voices(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        let cfg = self.config.tts.kokoro.clone();
+        let voices = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                crate::tts::list_voices(&cfg).await.map_err(|e| HostError {
+                    code: e.code() as i32,
+                    message: e.to_string(),
+                })
+            })
+        })?;
+        serde_json::json!({ "voices": voices })
+            .as_object()
+            .map(|o| serde_json::Value::Object(o.clone()))
+            .ok_or_else(|| HostError {
+                code: 4,
+                message: "serialize tts_voices response".into(),
+            })
     }
 
     fn tts_transcribe(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
@@ -7260,14 +7299,19 @@ fn extract_domain_from_url(url: &str) -> Option<String> {
 }
 
 /// Decode the base64 audio payload from a TTS response and write it into
-/// the named composition's files map as `narration.mp3` (preserving any
+/// the named composition's files map as `narration.<ext>` (preserving any
 /// existing files; only adds/overwrites the narration entry). Used by
-/// `tts_synthesize_api` and future `tts_synthesize_local` when the caller
-/// supplied `composition_id`.
+/// `tts_synthesize_api` and `tts_synthesize_local` when the caller supplied
+/// `composition_id`.
+///
+/// `ext` is `mp3` for ElevenLabs and `wav` for Kokoro; the render pipeline
+/// looks for both names, so the extension has to match what was synthesized
+/// rather than being assumed.
 async fn write_audio_to_composition(
     database: &nevoflux_storage::Database,
     composition_id: &str,
     audio_b64: &str,
+    ext: &str,
 ) -> Result<(), String> {
     use nevoflux_storage::repositories::ArtifactRepository;
     let repo = ArtifactRepository::new(database);
@@ -7282,7 +7326,7 @@ async fn write_audio_to_composition(
     // raw bytes (SQLite TEXT is UTF-8, raw MP3 isn't valid UTF-8). The
     // render pipeline / browser code that consumes the audio will base64-
     // decode at use time.
-    files.insert("narration.mp3".to_string(), audio_b64.to_string());
+    files.insert(format!("narration.{ext}"), audio_b64.to_string());
     let entry = record.entry.unwrap_or_else(|| "index.html".to_string());
     let content = files
         .get(&entry)
