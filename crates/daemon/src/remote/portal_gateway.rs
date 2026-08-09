@@ -54,6 +54,8 @@ pub struct PortalGateway {
     /// Asset ids already announced, so a reference repeated across deltas does
     /// not announce the same media twice.
     announced: Mutex<std::collections::HashSet<String>>,
+    /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
+    push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
 }
 
 /// How much disk one remote session may occupy. With a 20 MB per-image cap
@@ -108,7 +110,34 @@ impl PortalGateway {
                 ASSET_QUOTA_BYTES,
             ),
             announced: Mutex::new(std::collections::HashSet::new()),
+            push_rx: Mutex::new(Some(super::push::register(&session_ref))),
         }
+    }
+
+    /// Start draining pushed frames onto the wire.
+    ///
+    /// Separate from `new` because encryption lives behind an async lock and
+    /// the constructor is not async. Calling it twice is harmless.
+    pub async fn spawn_pump(self: &std::sync::Arc<Self>) {
+        let Some(mut rx) = self.push_rx.lock().await.take() else {
+            return;
+        };
+        let gw = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(mut frame) = rx.recv().await {
+                // The producer knows a session, not which stream is open. That
+                // is session state, so it is filled in here rather than being
+                // threaded out to every tool that might push something.
+                if frame.get("streamId").is_none() {
+                    let sid = gw.session.lock().await.current_stream_id();
+                    if let Some(obj) = frame.as_object_mut() {
+                        obj.insert("streamId".into(), serde_json::Value::String(sid));
+                    }
+                }
+                let wire = gw.session.lock().await.downlink_frame(frame);
+                gw.sink.send(wire).await;
+            }
+        });
     }
 
     /// Take media into this channel's store and announce it to the portal.
@@ -248,9 +277,15 @@ impl PortalGateway {
     }
 
     /// End of session: remove everything this channel put on disk.
+    ///
+    /// The push channel goes with it. Not a `Drop` impl: the builder methods
+    /// here move out of `self` with struct update syntax, which `Drop` forbids
+    /// outright — and this is the point where the session is actually over,
+    /// whereas the value can outlive it in a registry.
     pub async fn cleanup_uploads(&self) {
         self.uploads.lock().await.cleanup();
         super::asset::forget_session(&self.session_id);
+        super::push::forget(&self.session_id);
     }
 
     /// Apply one `upload_*` frame. A rejection goes back as an `error` frame so
