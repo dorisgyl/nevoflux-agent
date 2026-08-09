@@ -561,6 +561,9 @@ async fn execute_mcp_tool_inner(
     if name == "tts_voices" {
         return execute_tts_voices(services).await;
     }
+    if name == "play_local_file" {
+        return execute_play_local_file(arguments, services);
+    }
     if name == "tts_synthesize_local" {
         return execute_tts_synthesize_local(arguments, services).await;
     }
@@ -2158,6 +2161,25 @@ async fn execute_tts_synthesize_api(
     }
 
     serde_json::to_string(&resp).map_err(|e| format!("serialize tts_synthesize_api response: {e}"))
+}
+
+/// MCP/ACP dispatch arm for `play_local_file`.
+///
+/// No permission call of its own: this path is gated before dispatch by
+/// `McpBridge::request_permission`, which classifies the name through the same
+/// `execution_tier` table the native gate uses. Asking twice would show the
+/// reader two dialogs for one act.
+fn execute_play_local_file(
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let path_arg = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "play_local_file: `path` is required".to_string())?;
+    let (path, mime) = crate::remote::local_media::resolve(path_arg)?;
+    let out = crate::remote::local_media::offer(&services.session_id, &path, mime)?;
+    serde_json::to_string(&out).map_err(|e| format!("serialize play_local_file response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_synthesize_local` (P5b-2). Reads

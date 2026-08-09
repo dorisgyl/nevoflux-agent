@@ -645,6 +645,15 @@ pub trait HostFunctions {
         })
     }
 
+    /// Serve a media file from this machine to whoever is watching the
+    /// session. Hosts with no remote viewer inherit the default Unsupported.
+    fn play_local_file(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "play_local_file not supported by this host".into(),
+        })
+    }
+
     /// Synthesize speech via local Kokoro ONNX inference (P5b-2).
     /// Daemon-side reads `[tts.kokoro] model_path / voices_path` and
     /// returns ConfigMissing until the model files exist. Hosts without

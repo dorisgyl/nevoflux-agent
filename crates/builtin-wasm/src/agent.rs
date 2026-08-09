@@ -2448,6 +2448,11 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "play_local_file" => {
+                let resp = self.host.play_local_file(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             "tts_synthesize_local" => {
                 let resp = self.host.tts_synthesize_local(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
@@ -2619,6 +2624,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "canvas_create_from_visual_identity"
                 | "canvas_attach_asset"
                 | "canvas_inspect_layout"
+                | "play_local_file"
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_voices"
@@ -3488,6 +3494,17 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                         "composition_id": { "type": "string", "description": "If set, the synthesized MP3 is written into this artifact's files map as 'narration.mp3'." }
                     },
                     "required": ["text"]
+                }),
+            },
+            ToolDefinition {
+                name: "play_local_file".into(),
+                description: "Play a media file from this machine on the screen of whoever is watching this session, without copying it or reading it into the reply. Use this when asked to play, show or watch something by path -- do NOT read the file, base64 it, or run a local player like ffplay/mpv, none of which reach a remote viewer. Serves mp4/m4v/mov/webm/mkv, mp3/m4a/aac/wav/ogg/opus/flac, png/jpg/gif/webp/avif; anything else is refused. The file is served where it lies and streamed on demand, so size costs nothing up front, and it must stay put while it is being watched. Needs a viewer attached and the same permission as read_file. Returns asset_id and show_with -- putting show_with in your reply decides where the player is drawn; it appears either way.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path to the file, or one starting with ~/." }
+                    },
+                    "required": ["path"]
                 }),
             },
             ToolDefinition {
