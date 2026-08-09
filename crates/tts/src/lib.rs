@@ -13,7 +13,7 @@ pub mod voices;
 pub mod wav;
 
 pub use error::TtsError;
-pub use synth::{Audio, Synthesizer};
+pub use synth::{Audio, ChunkInfo, Synthesizer};
 
 // Mirrors the gate in `nevoflux-llm`'s embedding.rs: `ort` cannot find a
 // runtime unless exactly one linking strategy is chosen, and the failure

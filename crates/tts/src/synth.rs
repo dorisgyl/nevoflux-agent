@@ -19,6 +19,16 @@ pub struct Audio {
     pub sample_rate: u32,
 }
 
+/// Where a chunk sits in the utterance.
+///
+/// `total` is known before any inference runs because packing happens first,
+/// so the very first chunk can already say how many are coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkInfo {
+    pub index: usize,
+    pub total: usize,
+}
+
 pub struct Synthesizer {
     session: Mutex<Session>,
     voices: VoiceBank,
@@ -44,11 +54,18 @@ impl Synthesizer {
         self.voices.ids()
     }
 
-    pub fn synthesize(
+    /// Synthesize, handing each chunk to `on_chunk` as it is produced.
+    ///
+    /// The callback exists so a caller can start delivering audio before the
+    /// whole utterance is done; the return value is still the whole thing,
+    /// because the video path needs one file and one duration. Those are two
+    /// real consumers with different needs, not one need served twice.
+    pub fn synthesize_each(
         &self,
         text: &str,
         voice_id: Option<&str>,
         speed: f32,
+        mut on_chunk: impl FnMut(&Audio, ChunkInfo),
     ) -> Result<Audio, TtsError> {
         let available = self.voices.ids();
         let voice = resolve_voice(voice_id, &available)?;
@@ -62,18 +79,38 @@ impl Synthesizer {
             return Err(TtsError::TextTooLong("nothing to speak".into()));
         }
         let chunks = split::pack(tokenized, MAX_TOKENS)?;
+        let total = chunks.len();
 
-        let mut pcm = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            if i > 0 {
+        let mut full = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut pcm = self.infer(chunk, &voice, speed)?;
+            // The pause belongs to the chunk that precedes it, not to the seam
+            // between chunks. That is what keeps the whole equal to the parts
+            // joined — a chunk played on its own carries its own trailing rest.
+            if index + 1 < total {
                 pcm.extend(std::iter::repeat_n(0.0, JOIN_SILENCE));
             }
-            pcm.extend(self.infer(chunk, &voice, speed)?);
+            let audio = Audio {
+                pcm,
+                sample_rate: SAMPLE_RATE,
+            };
+            on_chunk(&audio, ChunkInfo { index, total });
+            full.extend_from_slice(&audio.pcm);
         }
         Ok(Audio {
-            pcm,
+            pcm: full,
             sample_rate: SAMPLE_RATE,
         })
+    }
+
+    /// Synthesize the whole utterance, ignoring chunk boundaries.
+    pub fn synthesize(
+        &self,
+        text: &str,
+        voice_id: Option<&str>,
+        speed: f32,
+    ) -> Result<Audio, TtsError> {
+        self.synthesize_each(text, voice_id, speed, |_, _| {})
     }
 
     fn infer(&self, tokens: &[i64], voice: &str, speed: f32) -> Result<Vec<f32>, TtsError> {
@@ -155,6 +192,53 @@ mod tests {
         let out = std::env::temp_dir().join("nevoflux-tts-check.wav");
         std::fs::write(&out, crate::wav::encode(&audio.pcm, audio.sample_rate)).unwrap();
         eprintln!("wrote {} — play it to judge quality", out.display());
+    }
+
+    /// The whole must equal the parts joined, byte for byte. The video path
+    /// gets the whole and the players get the parts; if they drift, subtitles
+    /// line up against one and not the other.
+    #[test]
+    #[ignore]
+    fn whole_equals_parts_joined() {
+        let (m, v) = real_paths();
+        let synth = Synthesizer::new(&m, &v, 1).unwrap();
+        let mut parts: Vec<f32> = Vec::new();
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let full = synth
+            .synthesize_each("One. Two. Three.", Some("af_heart"), 1.0, |a, info| {
+                parts.extend_from_slice(&a.pcm);
+                seen.push((info.index, info.total));
+            })
+            .expect("synthesis should succeed");
+        assert_eq!(
+            full.pcm, parts,
+            "concatenation must match the callback stream"
+        );
+        assert!(!seen.is_empty(), "callback should fire");
+        let total = seen[0].1;
+        assert_eq!(seen.len(), total, "callback count must equal total");
+        assert_eq!(
+            seen.iter().map(|s| s.0).collect::<Vec<_>>(),
+            (0..total).collect::<Vec<_>>(),
+            "indices must be 0..total in order"
+        );
+    }
+
+    /// A single short sentence must still produce exactly one chunk — that is
+    /// the shape the old behaviour degenerates to.
+    #[test]
+    #[ignore]
+    fn one_sentence_is_one_chunk() {
+        let (m, v) = real_paths();
+        let synth = Synthesizer::new(&m, &v, 1).unwrap();
+        let mut count = 0;
+        synth
+            .synthesize_each("Hello.", Some("af_heart"), 1.0, |_, i| {
+                count += 1;
+                assert_eq!(i.total, 1);
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
