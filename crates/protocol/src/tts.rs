@@ -46,6 +46,11 @@ pub struct SynthesizeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesizeResponse {
     /// Base64-encoded audio bytes (MP3 or WAV depending on backend).
+    ///
+    /// Absent when there is nothing for the caller to do with it: the whole
+    /// reading already went to the listener part by part, or it is still
+    /// being read out and this answer did not wait for it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audio_b64: String,
     /// Audio mime type — `audio/mpeg` for ElevenLabs MP3, `audio/wav`
     /// for Kokoro WAV.
@@ -67,6 +72,13 @@ pub struct SynthesizeResponse {
     /// players on the same turn saying the same words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_group: Option<String>,
+    /// The answer came back before the reading had finished.
+    ///
+    /// The listener is already hearing it — parts reach them as they are
+    /// made — so there is nothing to wait for and nothing further to do.
+    /// `duration_sec` is an estimate in this case; nothing has measured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaking: Option<bool>,
 }
 
 /// One TTS voice descriptor — listed by `tts_voices` (future P5b-2).
@@ -157,6 +169,7 @@ mod tests {
             voice_id: "Rachel".into(),
             wrote_to_files: Some("narration.mp3".into()),
             asset_group: None,
+            speaking: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: SynthesizeResponse = serde_json::from_str(&json).unwrap();

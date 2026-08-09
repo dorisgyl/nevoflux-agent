@@ -91,7 +91,8 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
     }
     if req.text.chars().count() > super::MAX_TEXT_LEN_LOCAL {
         return Err(TtsError::InvalidRequest(format!(
-            "tts_synthesize_local: text length {} exceeds {} char limit",
+            "tts_synthesize_local: text length {} exceeds the {} char ceiling \
+             for a single call; send it as separate readings",
             req.text.chars().count(),
             super::MAX_TEXT_LEN_LOCAL
         )));
@@ -110,6 +111,129 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
     Ok((model_path, voices_path))
 }
 
+/// Roughly how long a passage takes to say.
+///
+/// 12.7 characters a second, measured off Kokoro's own output rather than
+/// guessed. Only used when the answer is given before the reading has
+/// finished, so nothing has counted the samples yet.
+#[cfg(feature = "tts-local")]
+fn estimate_seconds(chars: usize) -> f32 {
+    (chars as f32 / 12.7).max(0.5)
+}
+
+/// The loaded model, kept for the life of the process.
+///
+/// Blocking. The caller decides which thread pays for it: the first call
+/// loads 92 MB, and whether that is worth waiting for depends on whether
+/// anybody is waiting.
+#[cfg(feature = "tts-local")]
+fn synthesizer(
+    model_path: &std::path::Path,
+    voices_path: &std::path::Path,
+    threads: usize,
+) -> Result<std::sync::Arc<nevoflux_tts::Synthesizer>, TtsError> {
+    use std::sync::{Arc, OnceLock};
+    static SYNTH: OnceLock<Arc<nevoflux_tts::Synthesizer>> = OnceLock::new();
+
+    if let Some(s) = SYNTH.get() {
+        return Ok(s.clone());
+    }
+    tracing::info!(
+        model = %model_path.display(),
+        threads,
+        "loading Kokoro; first call pays the model load, later ones do not"
+    );
+    let built = nevoflux_tts::Synthesizer::new(model_path, voices_path, threads).map_err(map_err)?;
+    let arc = Arc::new(built);
+    // A concurrent first call may have won the race; either Arc is equally
+    // usable, so take whichever landed.
+    let _ = SYNTH.set(arc.clone());
+    Ok(SYNTH.get().cloned().unwrap_or(arc))
+}
+
+/// Read the text out, handing each part to whoever is listening as it is made.
+///
+/// Blocking from end to end — model load and inference both. Returns the whole
+/// reading and the name of the sequence it went out as, if it went out as one.
+#[cfg(feature = "tts-local")]
+fn speak(
+    model_path: std::path::PathBuf,
+    voices_path: std::path::PathBuf,
+    threads: usize,
+    text: String,
+    voice: Option<String>,
+    session: Option<String>,
+    stream: Option<String>,
+) -> Result<(nevoflux_tts::Audio, Option<String>), TtsError> {
+    let synth = synthesizer(&model_path, &voices_path, threads)?;
+    // Written from inside the callback and read after it: the first part's id
+    // names the group, and the end frame needs that name.
+    let group_slot: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    let result = synth.synthesize_each(&text, voice.as_deref(), 1.0, |chunk, info| {
+        // Nothing watching is the ordinary case, so this returns quietly: the
+        // whole utterance is still owed to the caller for the video path
+        // whether or not a portal is attached.
+        let Some(session) = session.as_deref() else {
+            return;
+        };
+        let bytes = nevoflux_tts::wav::encode(&chunk.pcm, chunk.sample_rate);
+        let previous = group_slot.lock().expect("group slot").clone();
+        let Some(offer) = crate::remote::asset::put_grouped_for_session(
+            session,
+            &bytes,
+            &format!("speech-{}.wav", info.index + 1),
+            "audio/wav",
+            previous,
+            info.index as u32,
+            info.total as u32,
+        ) else {
+            return;
+        };
+        *group_slot.lock().expect("group slot") = offer.group.clone();
+        let id = offer.id.clone();
+        let size = offer.size;
+        let mut frame = serde_json::json!({ "kind": "asset", "asset": offer });
+        if let Some(sid) = stream.as_deref() {
+            frame["streamId"] = serde_json::Value::String(sid.to_string());
+        }
+        let queued = crate::remote::push::send(session, frame);
+        // Every outcome distinguishable: a part that was made, addressed to
+        // nothing, or made for a portal that had gone. Silence here is what
+        // made the last two rounds of this guesswork.
+        tracing::info!(
+            target: "remote",
+            %id, seq = info.index, of = info.total, bytes = size,
+            stream = stream.as_deref().unwrap_or("<none>"),
+            queued,
+            "speech part offered"
+        );
+    });
+
+    // Whether it finished or failed, say so: a player that never hears the end
+    // waits for a part that is not coming.
+    let group = group_slot.lock().expect("group slot").clone();
+    if let (Some(session), Some(name)) = (session.as_deref(), group.as_deref()) {
+        let mut frame = serde_json::json!({
+            "kind": "asset_group_end",
+            "group": name,
+            "complete": result.is_ok(),
+        });
+        if let Some(sid) = stream.as_deref() {
+            frame["streamId"] = serde_json::Value::String(sid.to_string());
+        }
+        let queued = crate::remote::push::send(session, frame);
+        tracing::info!(
+            target: "remote",
+            group = name, complete = result.is_ok(),
+            stream = stream.as_deref().unwrap_or("<none>"),
+            queued,
+            "speech sequence ended"
+        );
+    }
+    result.map(|audio| (audio, group)).map_err(map_err)
+}
+
 /// Synthesize speech via the local Kokoro ONNX backend.
 #[cfg(feature = "tts-local")]
 pub async fn synthesize_local(
@@ -117,33 +241,10 @@ pub async fn synthesize_local(
     req: &SynthesizeRequest,
     session: Option<&str>,
 ) -> Result<SynthesizeResponse, TtsError> {
-    use std::sync::{Arc, OnceLock};
-    static SYNTH: OnceLock<Arc<nevoflux_tts::Synthesizer>> = OnceLock::new();
-
     let (model_path, voices_path) = prepare(cfg, req)?;
-
-    let synth = match SYNTH.get() {
-        Some(s) => s.clone(),
-        None => {
-            let threads = cfg
-                .threads
-                .unwrap_or_else(nevoflux_tts::model::default_threads);
-            tracing::info!(
-                model = %model_path.display(),
-                threads,
-                "loading Kokoro; first call pays the model load, later ones do not"
-            );
-            let built = tokio::task::block_in_place(|| {
-                nevoflux_tts::Synthesizer::new(&model_path, &voices_path, threads)
-            })
-            .map_err(map_err)?;
-            let arc = Arc::new(built);
-            // A concurrent first call may have won the race; either Arc is
-            // equally usable, so take whichever landed.
-            let _ = SYNTH.set(arc.clone());
-            SYNTH.get().cloned().unwrap_or(arc)
-        }
-    };
+    let threads = cfg
+        .threads
+        .unwrap_or_else(nevoflux_tts::model::default_threads);
 
     let requested_voice = req
         .voice_id
@@ -151,70 +252,86 @@ pub async fn synthesize_local(
         .or(cfg.default_voice.as_deref())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let voice_id = || {
+        requested_voice
+            .clone()
+            .unwrap_or_else(|| nevoflux_tts::g2p::DEFAULT_VOICE.to_string())
+    };
     let text = req.text.clone();
-    let voice_for_call = requested_voice.clone();
-    let session_for_end = session.map(|s| s.to_string());
-    let session = session_for_end.clone();
-    // Written to from inside the callback and read after it: the first part's
-    // id names the group, and the end frame needs that name.
-    let group_slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    let group_out = group_slot.clone();
+    let session = session.map(|s| s.to_string());
+    // The turn this reading belongs to, read before a note of it is sung.
+    // Synthesis outlives the reply that asked for it, so a part stamped when
+    // it is pushed would be addressed to a turn that has already ended — and
+    // the portal, finding no message by that name, drops it without a word.
+    let stream = session.as_deref().and_then(crate::remote::push::stream_now);
 
-    let result = tokio::task::block_in_place(move || {
-        synth.synthesize_each(&text, voice_for_call.as_deref(), 1.0, |chunk, info| {
-            // Nothing watching is the ordinary case, so this returns quietly:
-            // the whole utterance is still owed to the caller for the video
-            // path whether or not a portal is attached.
-            let Some(session) = session.as_deref() else {
-                return;
-            };
-            let bytes = nevoflux_tts::wav::encode(&chunk.pcm, chunk.sample_rate);
-            let previous = group_slot.lock().expect("group slot").clone();
-            let Some(offer) = crate::remote::asset::put_grouped_for_session(
-                session,
-                &bytes,
-                &format!("speech-{}.wav", info.index + 1),
-                "audio/wav",
-                previous,
-                info.index as u32,
-                info.total as u32,
-            ) else {
-                return;
-            };
-            *group_slot.lock().expect("group slot") = offer.group.clone();
-            crate::remote::push::send(
-                session,
-                serde_json::json!({ "kind": "asset", "asset": offer }),
-            );
-        })
-    });
+    // A reading already on its way needs nobody to wait for it.
+    //
+    // Inference runs a few times faster than speech, so a long passage still
+    // takes minutes, and the caller's patience is not ours to spend: Claude
+    // Code gives an MCP call sixty seconds and then reports it finished with
+    // no output, which is both wrong and unrecoverable. Waiting bought
+    // nothing anyway — the listener hears each sentence as it is made, and
+    // the finished file was already being dropped from the answer.
+    //
+    // Only when the audio has nowhere else to go is it still worth waiting
+    // for: no portal attached, or a composition that wants the file itself.
+    let live = session
+        .as_deref()
+        .is_some_and(crate::remote::push::attached)
+        && req.composition_id.is_none();
 
-    // Whether it finished or failed, say so: a player that never hears the end
-    // waits for a part that is not coming.
-    let group = group_out.lock().expect("group slot").clone();
-    if let (Some(session), Some(group)) = (session_for_end.as_deref(), group.as_deref()) {
-        crate::remote::push::send(
-            session,
-            serde_json::json!({
-                "kind": "asset_group_end",
-                "group": group,
-                "complete": result.is_ok(),
-            }),
-        );
+    if live {
+        let chars = text.chars().count();
+        let voice = requested_voice.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = speak(model_path, voices_path, threads, text, voice, session, stream) {
+                // The caller has already been answered, so this is the only
+                // place it can be said at all.
+                tracing::warn!(target: "remote", error = %e, "speech failed while being read out");
+            }
+        });
+        return Ok(SynthesizeResponse {
+            audio_b64: String::new(),
+            mime_type: "audio/wav".into(),
+            duration_sec: estimate_seconds(chars),
+            voice_id: voice_id(),
+            wrote_to_files: None,
+            asset_group: None,
+            speaking: Some(true),
+        });
     }
-    let audio = result.map_err(map_err)?;
+
+    let voice = requested_voice.clone();
+    let (audio, group) = tokio::task::block_in_place(move || {
+        speak(model_path, voices_path, threads, text, voice, session, stream)
+    })?;
 
     // Real duration, not the chars/2.5 guess the HTTP path has to make.
     let duration_sec = audio.pcm.len() as f32 / audio.sample_rate as f32;
-    let bytes = nevoflux_tts::wav::encode(&audio.pcm, audio.sample_rate);
+
+    // Encoding the whole reading a second time is only worth its memory if
+    // somebody is going to read it. Once it has gone out part by part and no
+    // composition wants a copy, the WAV and the base64 half again its size
+    // would be built here and then dropped by `strip_delivered_audio` — at
+    // the ceiling this call now allows, gigabytes spent to produce nothing.
+    // The condition is written the same way in both places so they cannot
+    // drift apart.
+    let wanted_whole = group.is_none() || req.composition_id.is_some();
+    let audio_b64 = if wanted_whole {
+        super::base64_encode(&nevoflux_tts::wav::encode(&audio.pcm, audio.sample_rate))
+    } else {
+        String::new()
+    };
 
     Ok(SynthesizeResponse {
-        audio_b64: super::base64_encode(&bytes),
+        audio_b64,
         mime_type: "audio/wav".into(),
         duration_sec,
-        voice_id: requested_voice.unwrap_or_else(|| nevoflux_tts::g2p::DEFAULT_VOICE.to_string()),
+        voice_id: voice_id(),
         wrote_to_files: None, // dispatch layer fills this if composition_id set
         asset_group: group,
+        speaking: None,
     })
 }
 
