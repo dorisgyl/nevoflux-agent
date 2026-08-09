@@ -115,6 +115,7 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
 pub async fn synthesize_local(
     cfg: &KokoroConfig,
     req: &SynthesizeRequest,
+    session: Option<&str>,
 ) -> Result<SynthesizeResponse, TtsError> {
     use std::sync::{Arc, OnceLock};
     static SYNTH: OnceLock<Arc<nevoflux_tts::Synthesizer>> = OnceLock::new();
@@ -152,10 +153,56 @@ pub async fn synthesize_local(
         .map(|s| s.to_string());
     let text = req.text.clone();
     let voice_for_call = requested_voice.clone();
-    let audio = tokio::task::block_in_place(move || {
-        synth.synthesize(&text, voice_for_call.as_deref(), 1.0)
-    })
-    .map_err(map_err)?;
+    let session_for_end = session.map(|s| s.to_string());
+    let session = session_for_end.clone();
+    // Written to from inside the callback and read after it: the first part's
+    // id names the group, and the end frame needs that name.
+    let group_slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let group_out = group_slot.clone();
+
+    let result = tokio::task::block_in_place(move || {
+        synth.synthesize_each(&text, voice_for_call.as_deref(), 1.0, |chunk, info| {
+            // Nothing watching is the ordinary case, so this returns quietly:
+            // the whole utterance is still owed to the caller for the video
+            // path whether or not a portal is attached.
+            let Some(session) = session.as_deref() else {
+                return;
+            };
+            let bytes = nevoflux_tts::wav::encode(&chunk.pcm, chunk.sample_rate);
+            let previous = group_slot.lock().expect("group slot").clone();
+            let Some(offer) = crate::remote::asset::put_grouped_for_session(
+                session,
+                &bytes,
+                &format!("speech-{}.wav", info.index + 1),
+                "audio/wav",
+                previous,
+                info.index as u32,
+                info.total as u32,
+            ) else {
+                return;
+            };
+            *group_slot.lock().expect("group slot") = offer.group.clone();
+            crate::remote::push::send(
+                session,
+                serde_json::json!({ "kind": "asset", "asset": offer }),
+            );
+        })
+    });
+
+    // Whether it finished or failed, say so: a player that never hears the end
+    // waits for a part that is not coming.
+    let group = group_out.lock().expect("group slot").clone();
+    if let (Some(session), Some(group)) = (session_for_end.as_deref(), group.as_deref()) {
+        crate::remote::push::send(
+            session,
+            serde_json::json!({
+                "kind": "asset_group_end",
+                "group": group,
+                "complete": result.is_ok(),
+            }),
+        );
+    }
+    let audio = result.map_err(map_err)?;
 
     // Real duration, not the chars/2.5 guess the HTTP path has to make.
     let duration_sec = audio.pcm.len() as f32 / audio.sample_rate as f32;
@@ -167,6 +214,7 @@ pub async fn synthesize_local(
         duration_sec,
         voice_id: requested_voice.unwrap_or_else(|| nevoflux_tts::g2p::DEFAULT_VOICE.to_string()),
         wrote_to_files: None, // dispatch layer fills this if composition_id set
+        asset_group: group,
     })
 }
 
@@ -176,7 +224,9 @@ pub async fn synthesize_local(
 pub async fn synthesize_local(
     cfg: &KokoroConfig,
     req: &SynthesizeRequest,
+    session: Option<&str>,
 ) -> Result<SynthesizeResponse, TtsError> {
+    let _ = session;
     let _ = prepare(cfg, req)?;
     Err(TtsError::ConfigMissing(
         "this build was compiled without the `tts-local` feature, so local \
@@ -276,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_text() {
         let cfg = KokoroConfig::default();
-        let err = synthesize_local(&cfg, &req("   ")).await.unwrap_err();
+        let err = synthesize_local(&cfg, &req("   "), None).await.unwrap_err();
         assert!(matches!(err, TtsError::InvalidRequest(_)));
     }
 
@@ -284,7 +334,7 @@ mod tests {
     async fn rejects_oversize_text() {
         let cfg = KokoroConfig::default();
         let big = "a".repeat(super::super::MAX_TEXT_LEN_LOCAL + 1);
-        let err = synthesize_local(&cfg, &req(&big)).await.unwrap_err();
+        let err = synthesize_local(&cfg, &req(&big), None).await.unwrap_err();
         assert!(matches!(err, TtsError::InvalidRequest(_)));
     }
 
@@ -298,13 +348,31 @@ mod tests {
             default_voice: None,
             threads: None,
         };
-        let err = synthesize_local(&cfg, &req("hello")).await.unwrap_err();
+        let err = synthesize_local(&cfg, &req("hello"), None)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, TtsError::ConfigMissing(_)), "got: {msg}");
         assert!(
             msg.contains("Download"),
             "should tell the user what to do: {msg}"
         );
+    }
+
+    /// The ordinary case for a local sidebar turn: nothing is watching, so
+    /// there is nobody to push to. Synthesis must still be attempted.
+    #[tokio::test]
+    async fn no_session_means_no_pushes_and_no_panic() {
+        let cfg = KokoroConfig {
+            model_path: Some("/nonexistent/kokoro.onnx".into()),
+            voices_path: Some("/nonexistent/voices.bin".into()),
+            default_voice: None,
+            threads: None,
+        };
+        let err = synthesize_local(&cfg, &req("hello"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TtsError::ConfigMissing(_)), "got: {err}");
     }
 
     #[test]

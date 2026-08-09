@@ -60,6 +60,13 @@ pub struct SynthesizeResponse {
     /// `composition_id` was provided. None otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrote_to_files: Option<String>,
+    /// The sequence this audio was already offered as, part by part.
+    ///
+    /// When set, the whole thing has been delivered as a playable group while
+    /// it was being made, and offering it again as one file would put two
+    /// players on the same turn saying the same words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_group: Option<String>,
 }
 
 /// One TTS voice descriptor — listed by `tts_voices` (future P5b-2).
@@ -149,6 +156,7 @@ mod tests {
             duration_sec: 12.4,
             voice_id: "Rachel".into(),
             wrote_to_files: Some("narration.mp3".into()),
+            asset_group: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: SynthesizeResponse = serde_json::from_str(&json).unwrap();

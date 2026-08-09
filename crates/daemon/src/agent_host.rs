@@ -5348,10 +5348,12 @@ impl HostFunctions for DaemonHostFunctions {
                 message: format!("invalid tts_synthesize_local args: {e}"),
             })?;
         let cfg = self.config.tts.kokoro.clone();
+        let session_for_tts = self.session_id.clone();
         let database = self.services.as_ref().map(|s| s.database.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                let mut resp = crate::tts::synthesize_local(&cfg, &req)
+                let mut resp =
+                    crate::tts::synthesize_local(&cfg, &req, session_for_tts.as_deref())
                     .await
                     .map_err(|e| HostError {
                         code: e.code() as i32,

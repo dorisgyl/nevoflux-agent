@@ -92,6 +92,7 @@ pub async fn synthesize_api(
         duration_sec,
         voice_id: voice_id.to_string(),
         wrote_to_files: None, // dispatch layer fills this if composition_id set
+        asset_group: None,    // the HTTP path delivers one file, not a sequence
     })
 }
 

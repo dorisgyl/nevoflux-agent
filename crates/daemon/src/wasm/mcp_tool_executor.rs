@@ -2073,7 +2073,7 @@ async fn execute_tts_synthesize_local(
         .as_ref()
         .map(|c| c.kokoro.clone())
         .unwrap_or_default();
-    let mut resp = crate::tts::synthesize_local(&cfg, &req)
+    let mut resp = crate::tts::synthesize_local(&cfg, &req, Some(&services.session_id))
         .await
         .map_err(|e| e.to_string())?;
 
