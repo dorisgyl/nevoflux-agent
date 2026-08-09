@@ -212,7 +212,15 @@ impl PortalGateway {
                 let store = self.assets.lock().expect("asset store");
                 store.offer(&id)
             };
-            let Some(offer) = offer else { continue };
+            let Some(offer) = offer else {
+                tracing::warn!(target: "remote", %id, "asset announced but the store has no such id");
+                continue;
+            };
+            tracing::info!(
+                target: "remote",
+                %id, bytes = offer.size, mime = %offer.mime_type,
+                "asset announced"
+            );
             let frame = serde_json::json!({
                 "kind": "asset",
                 "streamId": self.session.lock().await.current_stream_id(),
@@ -244,6 +252,15 @@ impl PortalGateway {
             match store.read(id, offset, length) {
                 Ok(bytes) => {
                     let eof = store.is_eof(id, offset, bytes.len());
+                    // Logged on the way out as well as on refusal. Twice now a
+                    // range that never arrived has been indistinguishable from
+                    // one served without complaint, and each time it cost a
+                    // build and a restart to find out which.
+                    tracing::info!(
+                        target: "remote",
+                        id, offset, asked = length, served = bytes.len(), eof,
+                        "asset range served"
+                    );
                     use base64::Engine;
                     serde_json::json!({
                         "kind": "asset_data",
