@@ -60,6 +60,19 @@ pub struct AssetOffer {
     /// still producing would say false, and the portal would stop offering to
     /// seek rather than seek into bytes that do not exist yet.
     pub seekable: bool,
+    /// Which sequence this belongs to, when it is one part of several. Equal
+    /// to the first part's id, so the body's single `nevo-asset:` reference
+    /// still names something real and the head never has to order anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Position within the group, from zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
+    /// How many parts the group will have, when that is known up front. A
+    /// producer that cannot know yet leaves it out; it drives a progress label
+    /// and nothing else, so absence costs only the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub of: Option<u32>,
 }
 
 struct Asset {
@@ -67,6 +80,12 @@ struct Asset {
     name: String,
     mime_type: String,
     size: u64,
+    /// Kept so `offer` can rebuild what `put_grouped` said. Without these a
+    /// re-announcement quietly demotes a part back to a standalone file, and
+    /// the player loses the rest of the sequence mid-playback.
+    group: Option<String>,
+    seq: Option<u32>,
+    of: Option<u32>,
 }
 
 /// One remote session's media, on disk under a per-channel directory.
@@ -124,6 +143,34 @@ impl AssetStore {
         name: &str,
         mime_type: &str,
     ) -> Result<AssetOffer, AssetError> {
+        self.store(bytes, name, mime_type, None, None, None)
+    }
+
+    /// Store one part of a sequence.
+    ///
+    /// Pass `group: None` for the first part: the id is minted inside, so only
+    /// this can name the group after it.
+    pub fn put_grouped(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        mime_type: &str,
+        group: Option<String>,
+        seq: u32,
+        of: u32,
+    ) -> Result<AssetOffer, AssetError> {
+        self.store(bytes, name, mime_type, group, Some(seq), Some(of))
+    }
+
+    fn store(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        mime_type: &str,
+        group: Option<String>,
+        seq: Option<u32>,
+        of: Option<u32>,
+    ) -> Result<AssetOffer, AssetError> {
         let size = bytes.len() as u64;
         if size > MAX_ASSET_BYTES {
             return Err(AssetError::TooLarge {
@@ -151,9 +198,19 @@ impl AssetStore {
             mime_type: mime_type.to_string(),
             size,
             seekable: true,
+            // A first part names the group after itself.
+            group: group.or_else(|| seq.map(|_| id.clone())),
+            seq,
+            of,
         };
         self.used += size;
-        self.pending.push(offer.clone());
+        // An ungrouped asset waits for the next outgoing text to be announced.
+        // A grouped one was already announced by whoever pushed it, so queuing
+        // it here would send it twice — and the second announcement rebuilds
+        // from disk, where the sequence fields would be missing.
+        if seq.is_none() {
+            self.pending.push(offer.clone());
+        }
         self.assets.insert(
             id,
             Asset {
@@ -161,6 +218,9 @@ impl AssetStore {
                 name: offer.name.clone(),
                 mime_type: offer.mime_type.clone(),
                 size,
+                group: offer.group.clone(),
+                seq,
+                of,
             },
         );
         Ok(offer)
@@ -174,6 +234,9 @@ impl AssetStore {
             mime_type: a.mime_type.clone(),
             size: a.size,
             seekable: true,
+            group: a.group.clone(),
+            seq: a.seq,
+            of: a.of,
         })
     }
 
@@ -240,6 +303,68 @@ mod tests {
             AssetStore::new(dir.path().to_path_buf(), 10 * 1024 * 1024),
             dir,
         )
+    }
+
+    #[test]
+    fn an_ungrouped_put_carries_no_sequence_fields() {
+        let (mut s, _d) = store();
+        let offer = s.put(b"hello", "a.wav", "audio/wav").unwrap();
+        assert!(offer.group.is_none());
+        assert!(offer.seq.is_none());
+        assert!(offer.of.is_none());
+    }
+
+    #[test]
+    fn the_first_part_becomes_the_group_id() {
+        let (mut s, _d) = store();
+        // The caller cannot know the id before the put, so passing None for the
+        // first part is what lets the group name itself.
+        let first = s
+            .put_grouped(b"one", "0.wav", "audio/wav", None, 0, 3)
+            .unwrap();
+        assert_eq!(first.group.as_deref(), Some(first.id.as_str()));
+        assert_eq!(first.seq, Some(0));
+        assert_eq!(first.of, Some(3));
+
+        let second = s
+            .put_grouped(b"two", "1.wav", "audio/wav", first.group.clone(), 1, 3)
+            .unwrap();
+        assert_eq!(second.group, first.group);
+        assert_eq!(second.seq, Some(1));
+        assert_ne!(second.id, first.id, "each part is its own asset");
+    }
+
+    #[test]
+    fn offer_rebuilds_the_sequence_fields() {
+        let (mut s, _d) = store();
+        let first = s
+            .put_grouped(b"one", "0.wav", "audio/wav", None, 0, 2)
+            .unwrap();
+        // This is the path a re-announcement takes — from the body naming the
+        // id, or from the pending queue. Rebuilding without the sequence would
+        // demote the part to a standalone file and lose the rest of the group.
+        let again = s.offer(&first.id).expect("offer should rebuild");
+        assert_eq!(again.group, first.group);
+        assert_eq!(again.seq, Some(0));
+        assert_eq!(again.of, Some(2));
+    }
+
+    #[test]
+    fn a_grouped_part_does_not_queue_for_the_next_text() {
+        let (mut s, _d) = store();
+        s.put_grouped(b"one", "0.wav", "audio/wav", None, 0, 1)
+            .unwrap();
+        assert!(
+            s.take_pending().is_empty(),
+            "whoever pushed it already announced it"
+        );
+    }
+
+    #[test]
+    fn an_ungrouped_put_still_queues() {
+        let (mut s, _d) = store();
+        s.put(b"x", "a.png", "image/png").unwrap();
+        assert_eq!(s.take_pending().len(), 1);
     }
 
     #[test]
@@ -392,6 +517,28 @@ pub fn put_for_session(
         Ok(offer) => Some(offer),
         Err(e) => {
             tracing::warn!(target: "remote", error = %e, "asset refused");
+            None
+        }
+    }
+}
+
+/// Store one part of a sequence for a session. `None` when no portal is
+/// attached — same contract as `put_for_session`.
+pub fn put_grouped_for_session(
+    session_id: &str,
+    bytes: &[u8],
+    name: &str,
+    mime_type: &str,
+    group: Option<String>,
+    seq: u32,
+    of: u32,
+) -> Option<AssetOffer> {
+    let store = registry().lock().ok()?.get(session_id)?.clone();
+    let mut store = store.lock().ok()?;
+    match store.put_grouped(bytes, name, mime_type, group, seq, of) {
+        Ok(offer) => Some(offer),
+        Err(e) => {
+            tracing::warn!(target: "remote", error = %e, "asset part refused");
             None
         }
     }

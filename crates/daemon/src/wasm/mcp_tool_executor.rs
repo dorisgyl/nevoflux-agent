@@ -558,6 +558,9 @@ async fn execute_mcp_tool_inner(
     if name == "tts_synthesize_api" {
         return execute_tts_synthesize_api(arguments, services).await;
     }
+    if name == "tts_voices" {
+        return execute_tts_voices(services).await;
+    }
     if name == "tts_synthesize_local" {
         return execute_tts_synthesize_local(arguments, services).await;
     }
@@ -949,6 +952,9 @@ async fn execute_browser_tool(
         .map_err(|_| "browser response channel closed".to_string())?;
 
     if response.success {
+        if action == BrowserToolAction::Screenshot {
+            return Ok(screenshot_result(&response.result, &browser_ctx.session_id));
+        }
         Ok(response
             .result
             .map(|v| serde_json::to_string(&v).unwrap_or_default())
@@ -959,6 +965,104 @@ async fn execute_browser_tool(
             .map(|e| format!("{}: {}", e.code, e.message))
             .unwrap_or_else(|| "unknown tool error".to_string()))
     }
+}
+
+/// The base64 a screenshot response carries, whatever key it used.
+///
+/// The extension has answered with a bare string, with `data`, and with
+/// `screenshot` at different times; taking whichever is present beats
+/// depending on one.
+fn screenshot_payload(result: &Option<serde_json::Value>) -> Option<String> {
+    let value = result.as_ref()?;
+    if let Some(s) = value.as_str() {
+        return (!s.is_empty()).then(|| s.to_string());
+    }
+    let obj = value.as_object()?;
+    for key in ["screenshot", "data", "data_url", "image", "base64"] {
+        if let Some(serde_json::Value::String(s)) = obj.get(key) {
+            if !s.is_empty() {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Turn a screenshot response into what the model should be given.
+///
+/// It used to be given the bytes. This path returned the extension's reply
+/// verbatim, and that reply puts the picture under `data` — while the vision
+/// lift in `wasm::llm` looks for `screenshot`, so it never fired here and
+/// twenty thousand characters of base64 went into the model's context as
+/// text. What came back out was that text re-emitted token by token, with a
+/// couple of thousand characters missing from the middle: the phone got a
+/// JPEG whose length was not a multiple of four and which no browser would
+/// decode.
+///
+/// So: the bytes go to the asset store and the model gets an id, plus the
+/// markdown to write with it and a sentence telling it not to write bytes.
+/// The payload is also re-keyed to `screenshot`, which is what makes the
+/// vision lift fire — the model still sees the picture, it just no longer
+/// holds a transcript of it.
+fn screenshot_result(result: &Option<serde_json::Value>, session_id: &str) -> String {
+    let Some(payload) = screenshot_payload(result) else {
+        return result
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_default();
+    };
+
+    let asset = store_screenshot(&payload, session_id);
+    let mut out = serde_json::Map::new();
+    out.insert("success".into(), serde_json::Value::Bool(true));
+    out.insert("screenshot".into(), serde_json::Value::String(payload));
+    if let Some(id) = asset {
+        out.insert("asset_id".into(), serde_json::Value::String(id.clone()));
+        out.insert(
+            "show_with".into(),
+            serde_json::Value::String(format!("![screenshot](nevo-asset:{id})")),
+        );
+        out.insert(
+            "note".into(),
+            serde_json::Value::String(
+                "To show this to the user, write the markdown in show_with. Never write image                  bytes or a data: URL — anything you produce will be discarded."
+                    .into(),
+            ),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(out)).unwrap_or_default()
+}
+
+/// Put a screenshot where a portal can fetch it. `None` when none is watching.
+fn store_screenshot(raw: &str, session_id: &str) -> Option<String> {
+    use base64::Engine;
+    let (mime, b64) = match raw.strip_prefix("data:") {
+        Some(rest) => {
+            let (header, payload) = rest.split_once(',')?;
+            (
+                header.split(';').next().unwrap_or("image/png").to_string(),
+                payload,
+            )
+        }
+        None => ("image/jpeg".to_string(), raw),
+    };
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(clean)
+        .ok()?;
+    let ext = mime.rsplit('/').next().unwrap_or("png");
+    let offer = crate::remote::asset::put_for_session(
+        session_id,
+        &bytes,
+        &format!("screenshot.{ext}"),
+        &mime,
+    )?;
+    tracing::info!(
+        target: "remote",
+        id = %offer.id, bytes = offer.size, session = %session_id,
+        "screenshot offered as an asset instead of inline bytes"
+    );
+    Some(offer.id)
 }
 
 /// Dispatch PR #2 orchestrated browser tools (browser_input / browser_probe).
@@ -2070,11 +2174,59 @@ async fn execute_tts_synthesize_local(
         .as_ref()
         .map(|c| c.kokoro.clone())
         .unwrap_or_default();
-    let resp = crate::tts::synthesize_local(&cfg, &req)
+    let mut resp = crate::tts::synthesize_local(&cfg, &req, Some(&services.session_id))
         .await
         .map_err(|e| e.to_string())?;
+
+    // Same composition write the API arm does, with Kokoro's extension.
+    // Without this the local path cannot feed the video pipeline at all.
+    if let Some(comp_id) = req.composition_id.as_deref() {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        let repo = ArtifactRepository::new(&services.database);
+        match repo.get(comp_id) {
+            Ok(Some(record)) => {
+                let mut files = record.files.unwrap_or_default();
+                files.insert("narration.wav".to_string(), resp.audio_b64.clone());
+                let entry = record.entry.unwrap_or_else(|| "index.html".to_string());
+                let content = files
+                    .get(&entry)
+                    .cloned()
+                    .unwrap_or_else(|| record.content.clone());
+                if let Err(e) = repo.update_files(comp_id, &files, &content) {
+                    tracing::warn!(
+                        "tts_synthesize_local: failed to write narration.wav into {}: {}",
+                        comp_id,
+                        e
+                    );
+                } else {
+                    resp.wrote_to_files = Some("narration.wav".into());
+                }
+            }
+            Ok(None) => tracing::warn!(
+                "tts_synthesize_local: composition_id {} not found; returning audio only",
+                comp_id
+            ),
+            Err(e) => tracing::warn!("tts_synthesize_local: artifact get for {}: {}", comp_id, e),
+        }
+    }
+
     serde_json::to_string(&resp)
         .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
+}
+
+/// MCP/ACP dispatch arm for `tts_voices`. Reports what the configured voice
+/// bank holds; takes no arguments.
+async fn execute_tts_voices(services: &HostServices) -> Result<String, String> {
+    let cfg = services
+        .tts_config
+        .as_ref()
+        .map(|c| c.kokoro.clone())
+        .unwrap_or_default();
+    let voices = crate::tts::list_voices(&cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&serde_json::json!({ "voices": voices }))
+        .map_err(|e| format!("serialize tts_voices response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_transcribe` (P5b-3). Reads
@@ -2768,6 +2920,57 @@ mod tests {
                 "{name} is advertised to the agent but resolves to no action"
             );
         }
+    }
+
+    #[test]
+    fn a_screenshot_result_carries_an_id_not_a_transcript() {
+        // The extension answers under `data`, and the vision lift in wasm::llm
+        // looks for `screenshot` — so the bytes used to reach the model as
+        // text and come back re-typed with a chunk missing. Re-keying is what
+        // makes the lift fire; the id is what the model writes instead.
+        let raw = serde_json::json!({ "success": true, "data": "aGVsbG8=" });
+        let out = screenshot_result(&Some(raw), "no-portal-attached");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["screenshot"], "aGVsbG8=");
+        assert!(
+            v.get("data").is_none(),
+            "the old key must not survive: {out}"
+        );
+    }
+
+    #[test]
+    fn a_screenshot_payload_is_found_under_any_key_the_extension_has_used() {
+        for key in ["screenshot", "data", "data_url", "image", "base64"] {
+            let v = serde_json::json!({ key: "QUJD" });
+            assert_eq!(
+                screenshot_payload(&Some(v)).as_deref(),
+                Some("QUJD"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            screenshot_payload(&Some(serde_json::json!("QUJD"))).as_deref(),
+            Some("QUJD")
+        );
+        assert!(screenshot_payload(&Some(serde_json::json!({ "data": "" }))).is_none());
+        assert!(screenshot_payload(&None).is_none());
+    }
+
+    #[test]
+    fn a_response_with_no_picture_in_it_is_passed_through() {
+        let raw = serde_json::json!({ "success": true, "note": "nothing here" });
+        let out = screenshot_result(&Some(raw.clone()), "s");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn nothing_is_stored_when_no_portal_is_watching() {
+        // Nothing to serve it to, so no id and no disk spent — and the turn
+        // carries on with the picture, just without a reference.
+        assert!(store_screenshot("aGVsbG8=", "nobody-here").is_none());
     }
 
     #[test]

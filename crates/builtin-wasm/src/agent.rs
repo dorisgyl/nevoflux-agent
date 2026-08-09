@@ -2453,6 +2453,11 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "tts_voices" => {
+                let resp = self.host.tts_voices(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             "tts_transcribe" => {
                 let resp = self.host.tts_transcribe(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
@@ -2616,6 +2621,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "canvas_inspect_layout"
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
+                | "tts_voices"
                 | "tts_transcribe"
                 | "loop_create"
                 | "loop_list"
@@ -3486,15 +3492,24 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_synthesize_local".into(),
-                description: "Synthesize speech via local Kokoro-82M ONNX (no API key); returns base64 WAV. REGISTERED but ONNX inference not yet wired -- returns ConfigMissing today; prefer tts_synthesize_api for narration that must ship now. See skill_load(\"video\").".into(),
+                description: "Synthesize speech via local Kokoro-82M ONNX (no API key, no network); returns base64 WAV at 24kHz. English voices only (af/am/bf/bm) -- other languages return a clear error, use tts_synthesize_api for those. Pass composition_id to also write the WAV into that artifact as narration.wav, then add <audio src=\"narration.wav\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. duration_sec is measured, not estimated. Limit: text <=510 chars. Call tts_voices for the voice list. See skill_load(\"video\").".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "text":           { "type": "string", "description": "Text to speak. Max 600 chars." },
-                        "voice_id":       { "type": "string", "description": "Kokoro voice tag: af / am / bf / bm / zf / zm. Defaults to config." },
+                        "text":           { "type": "string", "description": "Text to speak. Max 510 chars." },
+                        "voice_id":       { "type": "string", "description": "Kokoro voice id such as 'af_heart' or 'bm_george'; a bare prefix like 'af' also works. Defaults to config, then af_heart." },
                         "composition_id": { "type": "string", "description": "If set, the synthesized WAV is written into this artifact's files map as 'narration.wav'." }
                     },
                     "required": ["text"]
+                }),
+            },
+            ToolDefinition {
+                name: "tts_voices".into(),
+                description: "List the local Kokoro voices this build can speak. No arguments. Returns id, name, gender, language and backend for each. Voice ids look like 'af_heart'; only af/am/bf/bm (English) can be spoken today.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }),
             },
             ToolDefinition {

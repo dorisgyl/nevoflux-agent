@@ -127,6 +127,7 @@ pub async fn open_channel_with_token(
         &req.channel_id,
     ));
     registry.lock().await.register(gateway.clone());
+    gateway.spawn_pump().await;
 
     let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
         msg_tx.clone(),

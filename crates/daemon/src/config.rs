@@ -125,20 +125,41 @@ pub struct TtsConfig {
 /// [tts.kokoro]
 /// model_path  = "~/.cache/nevoflux/models/kokoro-v1.0.int8.onnx"
 /// voices_path = "~/.cache/nevoflux/models/kokoro-voices-v1.0.bin"
-/// default_voice = "af"  # American female
+/// default_voice = "af_heart"  # full voice id; a bare "af" works as an alias
+/// threads = 4                 # intra-op width; omit to pick automatically
 /// ```
+///
+/// Both paths are optional: when unset the daemon looks in
+/// `~/.cache/nevoflux/models/` for the stock filenames.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KokoroConfig {
-    /// Filesystem path to the Kokoro ONNX model. None → tool returns
-    /// ConfigMissing with download instructions.
+    /// Filesystem path to the Kokoro ONNX model. None → look in
+    /// `~/.cache/nevoflux/models/`, preferring the fp32 weights over the int8
+    /// ones, and if neither is there the tool returns ConfigMissing with
+    /// download instructions.
+    ///
+    /// Which weights matter more than they look. int8 only pays off on a CPU
+    /// with VNNI; without it the quantized GEMM is emulated and lands *slower*
+    /// than fp32 — measured 0.85x realtime against 3.36x on an i7-7700K, for
+    /// audio that matches to three decimal places on peak and RMS. The cost of
+    /// fp32 is resident memory: roughly 310 MB against 92 MB.
     #[serde(default)]
     pub model_path: Option<String>,
     /// Filesystem path to the Kokoro voice bank.
     #[serde(default)]
     pub voices_path: Option<String>,
-    /// Default voice tag (`af` / `am` / `bf` / `bm` / `zf` / `zm`).
+    /// Default voice. Kokoro ships 54 full ids such as `af_heart`,
+    /// `am_michael` or `bm_george`; a bare two-letter prefix like `af` is
+    /// accepted as an alias for the first voice under it. Only af/am/bf/bm
+    /// (English) can be spoken today — see `tts_voices` for the list.
     #[serde(default)]
     pub default_voice: Option<String>,
+    /// ONNX intra-op thread count. None → `nevoflux_tts::model::default_threads`,
+    /// which is the logical core count capped at four. Raise it only after
+    /// measuring: past the physical core count throughput falls off, and a
+    /// daemon serving several sessions wants those cores for concurrency.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 /// Whisper transcription config.

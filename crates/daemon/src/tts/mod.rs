@@ -28,11 +28,16 @@ use nevoflux_protocol::tts::{SynthesizeRequest, SynthesizeResponse};
 
 /// Re-export so dispatch arms can call `tts::synthesize_local` /
 /// `tts::transcribe` symmetric to `tts::synthesize_api`.
-pub use kokoro::synthesize_local;
+pub use kokoro::{list_voices, synthesize_local};
 pub use whisper::transcribe;
 
-/// Hard limits per umbrella §7.8.
-pub const MAX_TEXT_LEN: usize = 600;
+/// ElevenLabs' ceiling per umbrella §7.8 — roughly 60 s of speech.
+pub const MAX_TEXT_LEN_API: usize = 600;
+
+/// Kokoro's ceiling. Lower than the API's because the model itself stops at
+/// 510 tokens; this character count is only a cheap pre-check, and
+/// `nevoflux-tts` enforces the real token limit after phonemization.
+pub const MAX_TEXT_LEN_LOCAL: usize = 510;
 
 /// Synthesize speech via the ElevenLabs HTTP API. Returns audio bytes
 /// + metadata; caller decides whether to also write to a composition's
@@ -49,11 +54,11 @@ pub async fn synthesize_api(
             "tts_synthesize_api: text is empty".into(),
         ));
     }
-    if req.text.chars().count() > MAX_TEXT_LEN {
+    if req.text.chars().count() > MAX_TEXT_LEN_API {
         return Err(TtsError::InvalidRequest(format!(
             "tts_synthesize_api: text length {} exceeds {} char limit (≈60s of speech)",
             req.text.chars().count(),
-            MAX_TEXT_LEN
+            MAX_TEXT_LEN_API
         )));
     }
     let api_key = cfg.api_key.as_deref().filter(|s| !s.is_empty()).ok_or(
@@ -87,12 +92,13 @@ pub async fn synthesize_api(
         duration_sec,
         voice_id: voice_id.to_string(),
         wrote_to_files: None, // dispatch layer fills this if composition_id set
+        asset_group: None,    // the HTTP path delivers one file, not a sequence
     })
 }
 
 /// Standard base64 encoder (no line wrapping). Inlined to avoid pulling
 /// in a base64 crate just for this one call site.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
@@ -161,7 +167,7 @@ mod tests {
             ..Default::default()
         };
         let req = SynthesizeRequest {
-            text: "a".repeat(MAX_TEXT_LEN + 1),
+            text: "a".repeat(MAX_TEXT_LEN_API + 1),
             voice_id: None,
             model_id: None,
             composition_id: None,
