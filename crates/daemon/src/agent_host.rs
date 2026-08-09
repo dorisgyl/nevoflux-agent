@@ -5352,6 +5352,8 @@ impl HostFunctions for DaemonHostFunctions {
         let cfg = self.config.tts.kokoro.clone();
         let session_for_tts = self.session_id.clone();
         let database = self.services.as_ref().map(|s| s.database.clone());
+        // Read before the request moves into the synthesis task.
+        let wanted_by_composition = req.composition_id.is_some();
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
                 let mut resp = crate::tts::synthesize_local(&cfg, &req, session_for_tts.as_deref())
@@ -5385,6 +5387,9 @@ impl HostFunctions for DaemonHostFunctions {
             message: format!("serialize tts_synthesize_local response: {e}"),
         })?;
         self.offer_tts_asset(&mut out);
+        // After the offer, which reads the bytes on the paths that still need
+        // to hand them over as one file.
+        crate::tts::strip_delivered_audio(&mut out, wanted_by_composition);
         Ok(out)
     }
 
@@ -6534,7 +6539,13 @@ impl DaemonHostFunctions {
         let Some(session) = self.session_id.as_deref() else {
             return;
         };
-        let Some(b64) = resp.get("audio_b64").and_then(|v| v.as_str()) else {
+        // Absent, or present and empty because the reading is still being
+        // read out: either way there is no file here to offer.
+        let Some(b64) = resp
+            .get("audio_b64")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
             return;
         };
         let mime = resp

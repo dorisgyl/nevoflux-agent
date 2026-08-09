@@ -15,7 +15,20 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-type Registry = Mutex<HashMap<String, UnboundedSender<serde_json::Value>>>;
+type Registry = Mutex<HashMap<String, Channel>>;
+
+/// A session's push channel, and which turn that session is in the middle of.
+///
+/// The turn is kept here because a producer needs it *before* it starts. A
+/// tool that runs for a minute finishes after the turn that called it has
+/// ended, and a frame stamped at send time would then be addressed to no turn
+/// at all — or, if the reader has already asked something else, to the wrong
+/// one.
+struct Channel {
+    tx: UnboundedSender<serde_json::Value>,
+    /// The open turn, or empty between turns.
+    stream: String,
+}
 
 fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
@@ -25,11 +38,46 @@ fn registry() -> &'static Registry {
 /// Claim the push channel for a session. The caller owns the pump.
 pub fn register(session_id: &str) -> UnboundedReceiver<serde_json::Value> {
     let (tx, rx) = unbounded_channel();
+    registry().lock().expect("push registry").insert(
+        session_id.to_string(),
+        Channel {
+            tx,
+            stream: String::new(),
+        },
+    );
+    rx
+}
+
+/// Report which turn is open, so a producer starting now can learn it.
+/// Called by the gateway every time it translates something downlink.
+pub fn set_stream(session_id: &str, stream: Option<&str>) {
+    if let Some(ch) = registry().lock().expect("push registry").get_mut(session_id) {
+        ch.stream = stream.unwrap_or_default().to_string();
+    }
+}
+
+/// Whether a portal is attached to this session at all.
+///
+/// Distinct from having a session id, which the daemon always has. A producer
+/// asks this to decide whether its output has somewhere to go on its own — if
+/// it does, the caller need not wait for it.
+pub fn attached(session_id: &str) -> bool {
+    registry().lock().expect("push registry").contains_key(session_id)
+}
+
+/// The turn open on this session right now, for a producer to stamp what it
+/// is about to make.
+///
+/// `None` between turns, and deliberately not the turn that just ended: a
+/// producer that starts with nothing open belongs to whatever opens next, and
+/// guessing backwards would hang its output off an older message.
+pub fn stream_now(session_id: &str) -> Option<String> {
     registry()
         .lock()
         .expect("push registry")
-        .insert(session_id.to_string(), tx);
-    rx
+        .get(session_id)
+        .map(|ch| ch.stream.clone())
+        .filter(|s| !s.is_empty())
 }
 
 /// Queue one frame. `false` means nobody is listening — no portal attached, or
@@ -42,7 +90,7 @@ pub fn register(session_id: &str) -> UnboundedReceiver<serde_json::Value> {
 pub fn send(session_id: &str, frame: serde_json::Value) -> bool {
     let reg = registry().lock().expect("push registry");
     match reg.get(session_id) {
-        Some(tx) => tx.send(frame).is_ok(),
+        Some(ch) => ch.tx.send(frame).is_ok(),
         None => false,
     }
 }
@@ -63,6 +111,38 @@ mod tests {
         let got = rx.recv().await.expect("frame should arrive");
         assert_eq!(got["kind"], "ping");
         forget("sess-a");
+    }
+
+    #[tokio::test]
+    async fn a_session_reports_the_turn_it_is_in() {
+        let _rx = register("sess-turn");
+        assert_eq!(stream_now("sess-turn"), None, "no turn open yet");
+        set_stream("sess-turn", Some("s7"));
+        assert_eq!(stream_now("sess-turn"), Some("s7".into()));
+        set_stream("sess-turn", None);
+        assert_eq!(
+            stream_now("sess-turn"),
+            None,
+            "between turns a producer should be told nothing, not the last one"
+        );
+        forget("sess-turn");
+    }
+
+    #[tokio::test]
+    async fn attachment_is_about_a_portal_not_a_session_id() {
+        // The daemon always has a session id. Whether anyone is listening to
+        // it is a different question, and the one that decides whether a
+        // producer's output has somewhere to go without the caller waiting.
+        assert!(!attached("sess-detached"));
+        let _rx = register("sess-detached");
+        assert!(attached("sess-detached"));
+        forget("sess-detached");
+        assert!(!attached("sess-detached"));
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_session_has_no_turn() {
+        assert_eq!(stream_now("sess-never"), None);
     }
 
     #[tokio::test]

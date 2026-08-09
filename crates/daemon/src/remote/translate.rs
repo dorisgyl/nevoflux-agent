@@ -22,6 +22,13 @@ use serde_json::{json, Value};
 pub struct Translator {
     /// Synthesized id of the turn currently open, if any.
     current_stream: Option<String>,
+    /// The last turn to have opened, whether or not it is still open.
+    ///
+    /// A tool can outlive the turn that called it — synthesis runs for a
+    /// minute and the reply is finished long before it is. What it produces
+    /// still belongs to that turn's message, which is still on screen, so
+    /// between turns this is a better answer than none.
+    last_stream: Option<String>,
     /// Counter behind the synthesized ids.
     next_stream: u64,
     /// Text held back because a markdown image is half-written.
@@ -38,9 +45,22 @@ impl Translator {
         Self::default()
     }
 
-    /// The id of the turn currently open, or empty between turns.
+    /// Which turn a frame produced now belongs to.
+    ///
+    /// Falls back to the turn that just ended, because that is where work
+    /// started during it belongs. Empty only before the first turn, or after
+    /// a clear took the messages away.
     pub fn current_stream_id(&self) -> String {
-        self.current_stream.clone().unwrap_or_default()
+        self.current_stream
+            .clone()
+            .or_else(|| self.last_stream.clone())
+            .unwrap_or_default()
+    }
+
+    /// The turn open *right now*, with no fallback — what a producer about to
+    /// start needs, where guessing backwards would be wrong.
+    pub fn open_stream_id(&self) -> Option<String> {
+        self.current_stream.clone()
     }
 
     /// Translate one daemon chat payload into 0+ portal `InboundFrame` values.
@@ -64,6 +84,8 @@ impl Translator {
             // the next turn's deltas off a message that no longer exists.
             Some("session_cleared") => {
                 self.current_stream = None;
+                // The message a late frame would have landed on is gone too.
+                self.last_stream = None;
                 vec![json!({ "kind": "session_cleared" })]
             }
             // A stopped turn ends here and nowhere else. `stop_generation`
@@ -262,6 +284,7 @@ impl Translator {
                 let id = format!("s{}", self.next_stream);
                 self.next_stream += 1;
                 self.current_stream = Some(id.clone());
+                self.last_stream = Some(id.clone());
                 out.push(json!({ "kind": "stream_start", "streamId": id }));
                 id
             }
@@ -834,6 +857,38 @@ mod tests {
     /// sends. Testing through them is what hid this for so long.
     fn chunk(content: &str, done: bool) -> Value {
         json!({ "type": "stream_chunk", "payload": { "content": content, "done": done } })
+    }
+
+    #[test]
+    fn a_frame_made_after_the_turn_still_names_that_turn() {
+        // Synthesis outlives the reply that asked for it. The message is
+        // still on screen, so the parts that arrive late belong on it.
+        let mut t = Translator::new();
+        t.downlink(&chunk("hi", false));
+        t.downlink(&chunk("", true));
+        assert_eq!(t.current_stream_id(), "s0", "the turn ended, not the message");
+    }
+
+    #[test]
+    fn nothing_is_open_between_turns() {
+        let mut t = Translator::new();
+        t.downlink(&chunk("hi", false));
+        assert_eq!(t.open_stream_id(), Some("s0".into()));
+        t.downlink(&chunk("", true));
+        assert_eq!(
+            t.open_stream_id(),
+            None,
+            "a producer starting now belongs to the turn that opens next"
+        );
+    }
+
+    #[test]
+    fn clearing_the_session_leaves_nothing_to_land_on() {
+        let mut t = Translator::new();
+        t.downlink(&chunk("hi", false));
+        t.downlink(&chunk("", true));
+        t.downlink(&json!({ "type": "session_cleared" }));
+        assert_eq!(t.current_stream_id(), "", "the message it named is gone");
     }
 
     #[test]
