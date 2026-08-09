@@ -179,6 +179,10 @@ impl PortalSession {
         self.translator.current_stream_id()
     }
 
+    pub fn open_stream_id(&self) -> Option<String> {
+        self.translator.open_stream_id()
+    }
+
     pub fn downlink_frame(&mut self, frame: Value) -> Wire {
         let wire = self.sequencer.tag(frame);
         self.encode(&wire)

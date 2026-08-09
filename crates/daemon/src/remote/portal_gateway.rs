@@ -128,12 +128,20 @@ impl PortalGateway {
                 // The producer knows a session, not which stream is open. That
                 // is session state, so it is filled in here rather than being
                 // threaded out to every tool that might push something.
-                if frame.get("streamId").is_none() {
+                let stamped = frame.get("streamId").is_some();
+                if !stamped {
                     let sid = gw.session.lock().await.current_stream_id();
                     if let Some(obj) = frame.as_object_mut() {
                         obj.insert("streamId".into(), serde_json::Value::String(sid));
                     }
                 }
+                tracing::info!(
+                    target: "remote",
+                    kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+                    stream = frame.get("streamId").and_then(|v| v.as_str()).unwrap_or(""),
+                    stamped_at_source = stamped,
+                    "push frame downlink"
+                );
                 let wire = gw.session.lock().await.downlink_frame(frame);
                 gw.sink.send(wire).await;
             }
@@ -468,7 +476,14 @@ impl RemoteGateway for PortalGateway {
                 env.payload.get("type").and_then(|v| v.as_str())
             );
             self.announce_referenced(&env.payload).await;
-            let wires = self.session.lock().await.on_chat(&env.payload);
+            let (wires, open) = {
+                let mut session = self.session.lock().await;
+                let wires = session.on_chat(&env.payload);
+                (wires, session.open_stream_id())
+            };
+            // So a tool starting during this turn can stamp what it makes
+            // later with the turn that asked for it.
+            super::push::set_stream(&self.session_id, open.as_deref());
             tracing::info!(target: "remote", "gateway.project: {} wire(s) out", wires.len());
             for w in wires {
                 self.sink.send(w).await;
