@@ -127,10 +127,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml is the single source of truth for the compiler.
+      # It must drive this step too: rustup honours the file's override for
+      # every cargo invocation, so installing the target std under a *different*
+      # toolchain leaves the resolved one with only its host std, and any
+      # non-host target (macOS x86_64 on an arm64 runner, Windows aarch64 on an
+      # x64 runner) dies with E0463 "can't find crate for `core`". Hardcoding
+      # the version here silently rotted the moment the file was bumped.
+      - name: Resolve toolchain from rust-toolchain.toml
+        id: toolchain
+        shell: bash
+        run: |
+          CHANNEL=$(sed -ne 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$CHANNEL" ]; then
+            echo "::error::Could not read [toolchain] channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "Toolchain from rust-toolchain.toml: ${CHANNEL}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.91.0"
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
