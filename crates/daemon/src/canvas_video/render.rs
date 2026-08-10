@@ -16,9 +16,9 @@
 //!      job is cancelled).
 //!   5. Finalize the MP4 and publish progress / terminal events.
 
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::canvas_video::ffmpeg::{image2pipe_cmd, resolve_ffmpeg};
@@ -28,10 +28,25 @@ use crate::canvas_video::CanvasVideoService;
 use crate::error::{DaemonError, Result};
 use nevoflux_protocol::canvas_video::{RenderStartRequest, RenderStartResponse};
 
-/// If the page goes silent for this long without completing the job, we
-/// bail and mark the job failed. Pull-model render should never have a
-/// frame-to-frame gap longer than a few seconds at 1080p.
-const PAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for the render page to deliver its *first* frame.
+///
+/// Reaching frame 0 costs far more than the steady-state cadence: the tab has
+/// to open, fetch the composition, run the lint gate, load the srcdoc iframe
+/// (including any cross-origin ESM the composition imports — the canvas
+/// runtime resolves react/vue/svelte/gsap through esm.sh by design), register
+/// with the parent actor, and capture the first snapshot. Budgeting that with
+/// the same value as a frame-to-frame gap made a slow bring-up indistinguishable
+/// from a hung page, and failed jobs before any frame arrived — the page then
+/// POSTs its first frame into a dead job and gets a 409.
+const STARTUP_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Budget between two consecutive frames once the page has started delivering.
+/// Pull-model render should never have a frame-to-frame gap longer than a few
+/// seconds at 1080p.
+const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Number of trailing ffmpeg output lines kept for diagnostics.
+const FFMPEG_LOG_TAIL: usize = 40;
 
 pub async fn render_start(
     svc: &Arc<CanvasVideoService>,
@@ -57,6 +72,10 @@ pub async fn render_start(
                 .set_error(&job_id_clone, err_msg.clone())
                 .await;
             svc_clone.emit_failed(&job_id_clone, &err_msg).await;
+            // Render is non-blocking, so nothing else tells the user the job
+            // died — the tool call returned a job_id minutes ago and the
+            // Canvas progress view may not even be open.
+            svc_clone.notify_user("Render failed", &err_msg).await;
         }
         svc_clone.cleanup_job_channels(&job_id_clone).await;
     });
@@ -115,6 +134,23 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
         .take_stdin()
         .ok_or_else(|| DaemonError::InternalError("ffmpeg stdin not available".into()))?;
 
+    // `FfmpegCommand::new_with_path` pipes stdin AND stdout AND stderr
+    // unconditionally, and ffmpeg writes a progress line to stderr every few
+    // frames. Nothing here consumes stdout/stderr, so without these drains the
+    // OS pipe buffer fills, ffmpeg blocks writing its own progress, stops
+    // reading stdin, and our frame write blocks forever — a hard deadlock
+    // partway through any render long enough to fill a few KB of progress.
+    let ffmpeg_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stderr_drain = ffmpeg_child
+        .take_stderr()
+        .map(|r| drain_pipe(r, ffmpeg_log.clone()));
+    // stdout carries nothing when encoding to a file, but it is piped all the
+    // same and must be drained. Its lines go to a throwaway sink so they can't
+    // dilute the stderr tail we surface on failure.
+    let stdout_drain = ffmpeg_child
+        .take_stdout()
+        .map(|r| drain_pipe(r, Arc::new(Mutex::new(Vec::new()))));
+
     // Expected frame count is derived from the composition spec so we can
     // surface progress ratios even though the page drives the loop.
     let snap = svc
@@ -136,7 +172,15 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
             }
         }
 
-        let sig = match tokio::time::timeout(PAGE_IDLE_TIMEOUT, rx.recv()).await {
+        // Page bring-up and steady-state capture are different costs; see the
+        // constants above for why they can't share one budget.
+        let (idle_budget, phase) = if frames_written == 0 {
+            (STARTUP_IDLE_TIMEOUT, "awaiting first frame")
+        } else {
+            (FRAME_IDLE_TIMEOUT, "mid-render")
+        };
+
+        let sig = match tokio::time::timeout(idle_budget, rx.recv()).await {
             Ok(Some(sig)) => sig,
             Ok(None) => {
                 // Sender dropped unexpectedly — treat as failure.
@@ -148,16 +192,34 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
             Err(_) => {
                 let _ = ffmpeg_child.kill();
                 return Err(DaemonError::InternalError(format!(
-                    "render page idle > {:?} (frames_written={})",
-                    PAGE_IDLE_TIMEOUT, frames_written
+                    "render page idle > {:?} while {} (frames_written={})",
+                    idle_budget, phase, frames_written
                 )));
             }
         };
 
         match sig {
             FrameSignal::Frame { frame_idx: _, png } => {
-                ffmpeg_stdin.write_all(&png).map_err(|e| {
-                    DaemonError::InternalError(format!("write frame to ffmpeg: {}", e))
+                // `ChildStdin::write_all` is a blocking syscall and a 1080p PNG
+                // runs to a few MB, so writing inline parks a tokio worker for
+                // the length of the pipe write. Hand the pipe to the blocking
+                // pool per frame and take it back; awaiting each write keeps
+                // frame order and ffmpeg's backpressure intact.
+                let (stdin_back, write_res) = tokio::task::spawn_blocking(move || {
+                    let res = ffmpeg_stdin.write_all(&png);
+                    (ffmpeg_stdin, res)
+                })
+                .await
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("ffmpeg frame writer task: {}", e))
+                })?;
+                ffmpeg_stdin = stdin_back;
+                write_res.map_err(|e| {
+                    DaemonError::InternalError(format!(
+                        "write frame to ffmpeg: {} ({})",
+                        e,
+                        ffmpeg_log_tail(&ffmpeg_log)
+                    ))
                 })?;
                 frames_written += 1;
                 svc.jobs()
@@ -183,11 +245,33 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
         }
     }
 
-    // EOF ffmpeg stdin and wait for the encoder to finish.
+    // EOF ffmpeg stdin so the encoder can flush and write the moov atom.
     drop(ffmpeg_stdin);
-    ffmpeg_child
-        .wait()
+    let status = tokio::task::spawn_blocking(move || ffmpeg_child.wait())
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("ffmpeg wait task: {}", e)))?
         .map_err(|e| DaemonError::InternalError(format!("ffmpeg wait: {}", e)))?;
+
+    // Both drains hit EOF as soon as ffmpeg exits; joining makes sure the tail
+    // below includes whatever ffmpeg wrote on its way out.
+    if let Some(h) = stderr_drain {
+        let _ = h.join();
+    }
+    if let Some(h) = stdout_drain {
+        let _ = h.join();
+    }
+
+    // A non-zero exit means the MP4 on disk is absent or truncated. Reporting
+    // success here is how a half-written file (ftyp + partial mdat, no moov)
+    // reached the user as a finished render.
+    if !status.success() {
+        return Err(DaemonError::InternalError(format!(
+            "ffmpeg exited with {} after {} frame(s): {}",
+            status,
+            frames_written,
+            ffmpeg_log_tail(&ffmpeg_log)
+        )));
+    }
 
     let size_bytes = std::fs::metadata(&output_path)
         .map(|m| m.len())
@@ -201,7 +285,107 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
     let path_str = output_path.to_string_lossy().into_owned();
     svc.emit_succeeded(&job_id, &path_str, size_bytes).await;
 
+    // The full path leads the body: it is the one thing the user cannot get
+    // anywhere else, and it stays selectable/copyable in the toast.
+    svc.notify_user(
+        "Render complete",
+        &format!(
+            "{}\n{} frames · {}",
+            path_str,
+            frames_written,
+            format_size(size_bytes)
+        ),
+    )
+    .await;
+
     Ok(())
+}
+
+/// Human-readable byte size for the completion notification.
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg pipe draining
+// ---------------------------------------------------------------------------
+
+/// Consume a child pipe to EOF on a dedicated OS thread, keeping the last
+/// [`FFMPEG_LOG_TAIL`] lines in `tail`.
+///
+/// The thread exits when the pipe closes, which happens when ffmpeg exits or
+/// is killed — so callers don't need to signal it. Reading is unconditional:
+/// the point is to keep the pipe buffer empty so ffmpeg never blocks on its
+/// own output, and the retained tail is a diagnostics bonus.
+fn drain_pipe<R: IoRead + Send + 'static>(
+    mut reader: R,
+    tail: Arc<Mutex<Vec<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut pending = String::new();
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            push_complete_lines(&mut pending, &tail);
+            // ffmpeg always delimits its output; a stream that somehow doesn't
+            // must not grow this buffer without bound.
+            if pending.len() > 64 * 1024 {
+                pending.clear();
+            }
+        }
+        // Retain a trailing line that never got its delimiter — on a crash
+        // that fragment is often the actual error.
+        pending.push('\n');
+        push_complete_lines(&mut pending, &tail);
+    })
+}
+
+/// Split every complete line out of `pending` and append it to `tail`,
+/// evicting from the front once the tail is full.
+///
+/// ffmpeg separates progress updates with `\r` and log records with `\n`, so
+/// both count as delimiters. Blank segments (the `\n` of a `\r\n` pair, or
+/// ffmpeg's padding) are dropped.
+fn push_complete_lines(pending: &mut String, tail: &Arc<Mutex<Vec<String>>>) {
+    while let Some(idx) = pending.find(['\r', '\n']) {
+        // `idx` points at a one-byte delimiter, so `..=idx` is on a boundary.
+        let line: String = pending.drain(..=idx).collect();
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(mut t) = tail.lock() {
+            if t.len() >= FFMPEG_LOG_TAIL {
+                t.remove(0);
+            }
+            t.push(line.to_string());
+        }
+    }
+}
+
+/// Render the retained ffmpeg output as a single line for an error message.
+fn ffmpeg_log_tail(log: &Arc<Mutex<Vec<String>>>) -> String {
+    match log.lock() {
+        Ok(lines) if lines.is_empty() => "<no ffmpeg output captured>".to_string(),
+        Ok(lines) => lines.join(" | "),
+        Err(_) => "<ffmpeg log unavailable>".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +583,94 @@ fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod ffmpeg_drain_tests {
+    use super::*;
+
+    fn tail_of(chunks: &[&[u8]]) -> Vec<String> {
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let joined: Vec<u8> = chunks.concat();
+        drain_pipe(std::io::Cursor::new(joined), tail.clone())
+            .join()
+            .unwrap();
+        let out = tail.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn test_splits_on_newline_and_carriage_return() {
+        // ffmpeg overwrites its progress line with '\r' and logs with '\n'.
+        let lines = tail_of(&[b"frame=  1 fps=0.0\rframe=  2 fps=25\rdone\n"]);
+        assert_eq!(lines, vec!["frame=  1 fps=0.0", "frame=  2 fps=25", "done"]);
+    }
+
+    #[test]
+    fn test_crlf_does_not_emit_blank_lines() {
+        let lines = tail_of(&[b"first\r\nsecond\r\n"]);
+        assert_eq!(lines, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn test_line_split_across_reads_is_rejoined() {
+        let lines = tail_of(&[b"Error while opening enc", b"oder: -22\n"]);
+        assert_eq!(lines, vec!["Error while opening encoder: -22"]);
+    }
+
+    #[test]
+    fn test_trailing_fragment_without_delimiter_is_kept() {
+        // The last thing a crashing ffmpeg writes often has no newline.
+        let lines = tail_of(&[b"Conversion failed!"]);
+        assert_eq!(lines, vec!["Conversion failed!"]);
+    }
+
+    #[test]
+    fn test_tail_is_capped_and_keeps_the_newest() {
+        let body: String = (0..FFMPEG_LOG_TAIL + 10)
+            .map(|i| format!("line{i}\n"))
+            .collect();
+        let lines = tail_of(&[body.as_bytes()]);
+        assert_eq!(lines.len(), FFMPEG_LOG_TAIL);
+        assert_eq!(lines[0], "line10");
+        assert_eq!(
+            lines[FFMPEG_LOG_TAIL - 1],
+            format!("line{}", FFMPEG_LOG_TAIL + 9)
+        );
+    }
+
+    #[test]
+    fn test_log_tail_message_when_empty() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(ffmpeg_log_tail(&log), "<no ffmpeg output captured>");
+    }
+
+    #[test]
+    fn test_log_tail_joins_lines() {
+        let log = Arc::new(Mutex::new(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(ffmpeg_log_tail(&log), "a | b");
+    }
+
+    #[test]
+    fn test_format_size_units() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(477_081), "466 KB");
+        assert_eq!(format_size(12_699_447), "12.1 MB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn test_format_size_boundaries() {
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1 KB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn test_startup_budget_exceeds_frame_budget() {
+        // The whole point of the split: bring-up gets more room than a gap.
+        assert!(STARTUP_IDLE_TIMEOUT > FRAME_IDLE_TIMEOUT);
+    }
 }
 
 #[cfg(test)]

@@ -952,6 +952,26 @@ impl CanvasVideoService {
         .await;
     }
 
+    /// Surface a render outcome to the user as a sidebar toast, plus an OS
+    /// notification when no browser window is focused.
+    ///
+    /// This deliberately does NOT go through [`Self::emit`]. The
+    /// `jobs:render:<job_id>` topic only feeds the Canvas UI's progress view,
+    /// so a user who navigated away — which is the normal case, since render
+    /// is non-blocking and takes minutes — never learns the job finished or
+    /// where the file landed. The render tool returns only a `job_id`, so the
+    /// agent cannot report the path either.
+    ///
+    /// `source` must stay `"notify_user"`: `background.js` gates the OS
+    /// notification on exactly that value (`data.source !== 'notify_user'`
+    /// returns early), and widening that gate would mean a browser rebuild.
+    pub async fn notify_user(&self, title: &str, body: &str) {
+        if let Some(bus) = &self.event_bus {
+            crate::notify::publish_user_notification(bus, Some(title), body, "notify_user", None)
+                .await;
+        }
+    }
+
     pub async fn emit_failed(&self, job_id: &str, error: &str) {
         self.emit(
             job_id,
