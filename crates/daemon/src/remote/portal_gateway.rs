@@ -216,14 +216,15 @@ impl PortalGateway {
                 tracing::warn!(target: "remote", %id, "asset announced but the store has no such id");
                 continue;
             };
+            let stream = self.session.lock().await.current_stream_id();
             tracing::info!(
                 target: "remote",
-                %id, bytes = offer.size, mime = %offer.mime_type,
+                %id, bytes = offer.size, mime = %offer.mime_type, stream = %stream,
                 "asset announced"
             );
             let frame = serde_json::json!({
                 "kind": "asset",
-                "streamId": self.session.lock().await.current_stream_id(),
+                "streamId": stream,
                 "asset": offer,
             });
             let wire = self.session.lock().await.downlink_frame(frame);
@@ -492,7 +493,6 @@ impl RemoteGateway for PortalGateway {
                 "gateway.project: type={:?}",
                 env.payload.get("type").and_then(|v| v.as_str())
             );
-            self.announce_referenced(&env.payload).await;
             let (wires, open) = {
                 let mut session = self.session.lock().await;
                 let wires = session.on_chat(&env.payload);
@@ -505,6 +505,17 @@ impl RemoteGateway for PortalGateway {
             for w in wires {
                 self.sink.send(w).await;
             }
+            // After the turn's own frames, and not before them.
+            //
+            // A tool can finish before the head has written a word — asked to
+            // play a file, it calls the tool first and describes it after — so
+            // announcing ahead of this payload named a turn that had not
+            // opened yet. The name fell back to the turn before, which is a
+            // message that does exist, and the player appeared above the
+            // request that asked for it. Ordering also matters to the reader:
+            // the message an asset belongs to has to have been started before
+            // anything can be hung off it.
+            self.announce_referenced(&env.payload).await;
         }
     }
 }
