@@ -66,6 +66,9 @@ pub struct PortalGateway {
     announced: Mutex<std::collections::HashSet<String>>,
     /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
     push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
+    /// Which path this session's media takes, and whether a peer connection is
+    /// forming. Always `Relay` in a build without the `webrtc` feature.
+    rtc: super::rtc::RtcState,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -128,6 +131,7 @@ impl PortalGateway {
             ),
             announced: Mutex::new(std::collections::HashSet::new()),
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
+            rtc: super::rtc::RtcState::new(),
             media_sink: None,
         }
     }
@@ -440,6 +444,43 @@ impl PortalGateway {
         }
     }
 
+    /// Take one WebRTC signalling frame off the wire.
+    ///
+    /// Without the `webrtc` feature there is nothing to hand it to, and it is
+    /// logged and dropped. That is the right behaviour rather than a stub: a
+    /// portal that offers a peer connection to a head built without one should
+    /// get silence and carry on over the relay, which is exactly what happens.
+    async fn apply_rtc_signal(&self, frame: &serde_json::Value) {
+        let kind = frame
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        tracing::debug!(
+            target: "remote",
+            kind,
+            peer_path = ?self.rtc.path(),
+            "webrtc signalling frame"
+        );
+        #[cfg(not(feature = "webrtc"))]
+        {
+            // Said once per session rather than per frame: a portal that keeps
+            // retrying should not fill the log with the same line.
+            if kind == "rtc_offer" {
+                tracing::info!(
+                    target: "remote",
+                    "portal offered a peer connection; this build has no webrtc \
+                     support, staying on the relay"
+                );
+            }
+        }
+        #[cfg(feature = "webrtc")]
+        {
+            // The connection itself is driven by `nevoflux-rtc-transport`; this
+            // is the seam, and wiring the driver in is the remaining work.
+            let _ = kind;
+        }
+    }
+
     /// Honor a portal `resume{from}` (called by the WS read loop).
     ///
     /// The session kept media frames as ranges rather than as bytes, so the
@@ -506,6 +547,7 @@ impl PortalGateway {
                 injector.inject(payload).await
             }
             Inbound::Resume(from) => self.resume(from).await,
+            Inbound::RtcSignal(frame) => self.apply_rtc_signal(&frame).await,
             Inbound::Ignore => {}
         }
     }

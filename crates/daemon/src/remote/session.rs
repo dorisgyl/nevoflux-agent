@@ -46,6 +46,13 @@ pub enum Inbound {
     /// owns the `AssetStore`), so this layer only classifies — the sans-IO
     /// property documented at the top of this module still holds.
     AssetPull(Value),
+    /// WebRTC signalling: an offer, answer, candidate or close.
+    ///
+    /// Passed through opaque. What it means is `remote::rtc`'s business, and a
+    /// build without the `webrtc` feature classifies it here all the same — so
+    /// that it is *dropped* rather than handed to the chat translator, which
+    /// would read an SDP as something the user typed.
+    RtcSignal(Value),
     /// Nothing to do (unknown frame, decode failure, or a downlink-only variant).
     Ignore,
 }
@@ -191,6 +198,11 @@ impl PortalSession {
             WireMessage::Frame { frame, .. } => match frame.get("kind").and_then(Value::as_str) {
                 Some("upload_begin" | "upload_chunk" | "upload_end") => Inbound::Upload(frame),
                 Some("asset_pull") => Inbound::AssetPull(frame),
+                // Routed before the translator gets a look. Falling through to
+                // it would try to read an `rtc_offer` as something the user
+                // typed, and an SDP injected into the conversation is a
+                // spectacular way to fail.
+                Some(k) if super::rtc::is_signal_kind(k) => Inbound::RtcSignal(frame),
                 _ => match translate::uplink(
                     &frame,
                     session_id,
@@ -452,6 +464,39 @@ mod tests {
             true,
             "eof is recomputed at resend time, not remembered"
         );
+    }
+
+    #[test]
+    fn signalling_never_reaches_the_chat_translator() {
+        // The failure this rules out: an SDP injected into the conversation as
+        // if the user had typed it. Loud, embarrassing, and only visible once
+        // someone opens the transcript.
+        let s = PortalSession::new(None, None, None);
+        for kind in ["rtc_offer", "rtc_answer", "rtc_candidate", "rtc_close"] {
+            let msg = WireMessage::Frame {
+                seq: None,
+                frame: json!({ "kind": kind, "sdp": "v=0\r\n" }),
+            };
+            assert!(
+                matches!(s.route(msg, "sess", "m1", &[]), Inbound::RtcSignal(_)),
+                "{kind} was not routed as signalling"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_message_is_still_chat() {
+        // The other direction of the same check: the signalling predicate must
+        // not swallow anything the user actually sent.
+        let s = PortalSession::new(None, None, None);
+        let msg = WireMessage::Frame {
+            seq: None,
+            frame: json!({ "kind": "user_message", "text": "hello" }),
+        };
+        assert!(matches!(
+            s.route(msg, "sess", "m1", &[]),
+            Inbound::Uplink(_)
+        ));
     }
 
     #[test]

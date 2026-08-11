@@ -3851,6 +3851,7 @@ dependencies = [
  "nevoflux-mcp",
  "nevoflux-pack",
  "nevoflux-protocol",
+ "nevoflux-rtc-transport",
  "nevoflux-skills",
  "nevoflux-storage",
  "nevoflux-testing",
