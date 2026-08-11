@@ -65,12 +65,20 @@ const MEDIA_STUB_COST: usize = 96;
 enum Retained {
     /// The frame itself. Chat deltas, asset offers, errors — all small.
     Frame(Value),
-    /// A media range, kept as the three values that can rebuild it.
+    /// A media range, kept as the values that can rebuild it.
     ///
     /// The bytes are still on disk in the `AssetStore` and are read back on
     /// demand, so retaining the encoded body would be keeping a second, far
     /// more expensive copy of something already durable.
-    Media { id: String, offset: u64, len: usize },
+    Media {
+        id: String,
+        offset: u64,
+        len: usize,
+        /// Which encoding this went out as. A resend has to match: the portal
+        /// that asked for bytes is decoding bytes, and one that asked for
+        /// base64 would not recognise a binary frame.
+        binary: bool,
+    },
 }
 
 /// One frame to resend, and whether the caller still has to fetch its bytes.
@@ -85,6 +93,8 @@ pub enum Resend {
         id: String,
         offset: u64,
         len: usize,
+        /// Re-encode the way it first went out; see [`Retained::Media`].
+        binary: bool,
     },
 }
 
@@ -134,9 +144,19 @@ impl SendSequencer {
 
         self.buffer.push_back((seq, retained, cost));
         self.bytes = self.bytes.saturating_add(cost);
-        // Always keep the newest entry, however large: dropping the frame we
-        // are in the middle of sending would make resume permanently unable to
-        // reach the present.
+        self.evict();
+
+        WireMessage::Frame {
+            seq: Some(seq),
+            frame,
+        }
+    }
+
+    /// Drop the oldest entries until the buffer is back inside its budget.
+    ///
+    /// Always keeps the newest entry, however large: dropping the frame just
+    /// taken would make resume permanently unable to reach the present.
+    fn evict(&mut self) {
         while self.buffer.len() > 1
             && (self.bytes > SEND_BUFFER_BYTES || self.buffer.len() > SEND_BUFFER_CAP)
         {
@@ -144,11 +164,29 @@ impl SendSequencer {
                 self.bytes = self.bytes.saturating_sub(dropped);
             }
         }
+    }
 
-        WireMessage::Frame {
-            seq: Some(seq),
-            frame,
-        }
+    /// Claim a seq for a media range going out as bytes.
+    ///
+    /// The binary path has no JSON frame for [`tag`](Self::tag) to inspect, so
+    /// it says outright what that one has to infer. Retention is identical —
+    /// a range and a format, never the payload.
+    pub fn tag_media(&mut self, id: &str, offset: u64, len: usize) -> u64 {
+        let seq = self.next;
+        self.next += 1;
+        self.buffer.push_back((
+            seq,
+            Retained::Media {
+                id: id.to_string(),
+                offset,
+                len,
+                binary: true,
+            },
+            MEDIA_STUB_COST,
+        ));
+        self.bytes = self.bytes.saturating_add(MEDIA_STUB_COST);
+        self.evict();
+        seq
     }
 
     /// The next seq that will be assigned.
@@ -179,11 +217,17 @@ impl SendSequencer {
                             seq: Some(*s),
                             frame: f.clone(),
                         }),
-                        Retained::Media { id, offset, len } => Resend::Media {
+                        Retained::Media {
+                            id,
+                            offset,
+                            len,
+                            binary,
+                        } => Resend::Media {
                             seq: *s,
                             id: id.clone(),
                             offset: *offset,
                             len: *len,
+                            binary: *binary,
                         },
                     })
                     .collect(),
@@ -212,7 +256,12 @@ fn media_stub(frame: &Value) -> Option<Retained> {
     let id = frame.get("id").and_then(Value::as_str)?.to_string();
     let offset = frame.get("offset").and_then(Value::as_u64)?;
     let len = base64_source_len(frame.get("data").and_then(Value::as_str)?);
-    Some(Retained::Media { id, offset, len })
+    Some(Retained::Media {
+        id,
+        offset,
+        len,
+        binary: false,
+    })
 }
 
 #[cfg(test)]
@@ -388,10 +437,55 @@ mod tests {
                 id: "asset-7".into(),
                 offset: 512,
                 len: 1000,
+                binary: false,
             }],
             "the range has to come back exactly, or the portal splices a \
              differently-sized chunk into the file it is reassembling"
         );
+    }
+
+    #[test]
+    fn a_binary_media_range_resends_as_binary() {
+        // Format has to survive into the resend. The portal that asked for
+        // bytes is decoding bytes; base64 would be a frame it cannot read, on
+        // the one seq it is blocked waiting for.
+        let mut seq = SendSequencer::new();
+        seq.tag_media("asset-9", 8192, 4096);
+        assert_eq!(
+            seq.resend_from(0).unwrap(),
+            vec![Resend::Media {
+                seq: 0,
+                id: "asset-9".into(),
+                offset: 8192,
+                len: 4096,
+                binary: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_binary_media_range_is_no_more_expensive_to_retain() {
+        let mut seq = SendSequencer::new();
+        for i in 0..2_000u64 {
+            seq.tag_media("asset-9", i * 256 * 1024, 256 * 1024);
+        }
+        assert!(
+            seq.retained_bytes() <= SEND_BUFFER_BYTES,
+            "retained {} bytes",
+            seq.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn the_two_media_paths_share_one_seq_space() {
+        // They go out the same socket, so the portal orders them together. Two
+        // counters would hand it duplicate seqs and stall its tracker.
+        let mut seq = SendSequencer::new();
+        seq.tag(frame("chat"));
+        seq.tag_media("a", 0, 10);
+        seq.tag(media_frame("b", 0, 10));
+        assert_eq!(resent_seqs(&seq.resend_from(0).unwrap()), vec![0, 1, 2]);
+        assert_eq!(seq.next_seq(), 3);
     }
 
     #[test]

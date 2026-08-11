@@ -139,6 +139,7 @@ impl PortalSession {
                     id,
                     offset,
                     len,
+                    binary,
                 } => {
                     let Some((bytes, eof)) = read_media(&id, offset, len) else {
                         tracing::warn!(
@@ -149,10 +150,17 @@ impl PortalSession {
                         self.sequencer.reset();
                         return vec![self.encode(&WireMessage::Resync)];
                     };
-                    out.push(self.encode(&WireMessage::Frame {
-                        seq: Some(seq),
-                        frame: super::asset::data_frame(&id, offset, &bytes, eof),
-                    }));
+                    // Re-encode as it first went out. A portal that asked for
+                    // bytes is decoding bytes; handing it base64 now would be a
+                    // frame it cannot read, on a seq it is blocked waiting for.
+                    out.push(if binary {
+                        self.encode_media(seq, &id, offset, &bytes, eof)
+                    } else {
+                        self.encode(&WireMessage::Frame {
+                            seq: Some(seq),
+                            frame: super::asset::data_frame(&id, offset, &bytes, eof),
+                        })
+                    });
                 }
             }
         }
@@ -227,17 +235,64 @@ impl PortalSession {
         self.encode(&wire)
     }
 
+    /// Send one media range as bytes rather than as base64 inside JSON.
+    ///
+    /// Only for a portal that asked for it (`asset_pull.binary`) — see
+    /// [`super::media_frame`] for why that request is the whole of the
+    /// negotiation.
+    pub fn downlink_media(&mut self, id: &str, offset: u64, bytes: &[u8], eof: bool) -> Wire {
+        let seq = self.sequencer.tag_media(id, offset, bytes.len());
+        self.encode_media(seq, id, offset, bytes, eof)
+    }
+
+    fn encode_media(&self, seq: u64, id: &str, offset: u64, bytes: &[u8], eof: bool) -> Wire {
+        let frame = super::media_frame::MediaFrame {
+            seq,
+            id: id.to_string(),
+            offset,
+            eof,
+            data: bytes.to_vec(),
+        };
+        match super::media_frame::encode(&frame) {
+            Ok(raw) => self.seal(raw),
+            Err(e) => {
+                // Only an id over 255 bytes reaches here, and ids are minted as
+                // UUIDs — but answering with nothing would hang the range the
+                // portal is waiting on, so say so on the seq it expects.
+                tracing::warn!(target: "remote", %id, error = %e, "cannot frame media as bytes");
+                self.encode(&WireMessage::Frame {
+                    seq: Some(seq),
+                    frame: serde_json::json!({
+                        "kind": "asset_error", "id": id, "reason": e,
+                    }),
+                })
+            }
+        }
+    }
+
     fn encode(&self, wire: &WireMessage) -> Wire {
         let json = serde_json::to_vec(wire).expect("WireMessage serializes");
         match &self.key {
+            Some(_) => self.seal(json),
+            None => Wire::Text(String::from_utf8(json).expect("json is utf-8")),
+        }
+    }
+
+    /// Seal a payload for the channel, or pass it through as binary when this
+    /// session has no key.
+    ///
+    /// Media frames take this directly: they are bytes either way, and there is
+    /// no text form of them to fall back to in plaintext mode.
+    fn seal(&self, payload: Vec<u8>) -> Wire {
+        match &self.key {
             Some(k) => {
-                let sealed = crypto::seal_frame(k, &json).expect("seal_frame");
+                let sealed = crypto::seal_frame(k, &payload).expect("seal_frame");
                 let mut bytes = Vec::with_capacity(sealed.nonce.len() + sealed.ciphertext.len());
                 bytes.extend_from_slice(&sealed.nonce);
                 bytes.extend_from_slice(&sealed.ciphertext);
                 Wire::Binary(bytes)
             }
-            None => Wire::Text(String::from_utf8(json).expect("json is utf-8")),
+            None => Wire::Binary(payload),
         }
     }
 
@@ -376,6 +431,76 @@ mod tests {
             true,
             "eof is recomputed at resend time, not remembered"
         );
+    }
+
+    #[test]
+    fn a_binary_media_range_goes_out_as_bytes_and_costs_no_base64() {
+        let mut s = PortalSession::new(None, None, None);
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let wire = s.downlink_media("asset-1", 1024, &payload, false);
+
+        let Wire::Binary(raw) = wire else {
+            panic!("media must not travel as text even on a plaintext channel");
+        };
+        // The chunk plus a small header, not the chunk plus a third.
+        assert!(
+            raw.len() < payload.len() + 80,
+            "{} bytes on the wire for a {} byte range",
+            raw.len(),
+            payload.len()
+        );
+
+        let decoded = super::super::media_frame::decode(&raw).expect("decodes");
+        assert_eq!(decoded.data, payload);
+        assert_eq!(decoded.offset, 1024);
+        assert_eq!(decoded.seq, 0);
+    }
+
+    #[test]
+    fn a_binary_media_range_is_sealed_like_everything_else() {
+        // Bytes instead of base64 must not mean bytes instead of encrypted.
+        let key = [3u8; 32];
+        let mut s = PortalSession::new(Some(key), None, None);
+        let payload = vec![7u8; 512];
+        let Wire::Binary(sealed) = s.downlink_media("asset-1", 0, &payload, true) else {
+            panic!("expected binary");
+        };
+        assert!(
+            super::super::media_frame::decode(&sealed).is_err(),
+            "the payload must not be readable without the channel key"
+        );
+        let opened = super::super::crypto::open_frame(
+            &key,
+            &super::super::crypto::SealedFrame {
+                nonce: sealed[..12].try_into().expect("12 byte nonce"),
+                ciphertext: sealed[12..].to_vec(),
+            },
+        )
+        .expect("opens with the key");
+        assert_eq!(
+            super::super::media_frame::decode(&opened).unwrap().data,
+            payload
+        );
+    }
+
+    #[test]
+    fn a_resume_replays_a_binary_range_as_binary() {
+        let mut s = PortalSession::new(None, None, None);
+        s.on_chat(&chunk("a", false)); // seq 0, 1
+        s.downlink_media("asset-1", 2048, &[5u8; 300], false); // seq 2
+
+        let wires = s.on_resume(2, |id, offset, len| {
+            assert_eq!((id, offset, len), ("asset-1", 2048, 300));
+            Some((vec![5u8; 300], false))
+        });
+
+        assert_eq!(wires.len(), 1);
+        let Wire::Binary(raw) = &wires[0] else {
+            panic!("a binary range must come back binary");
+        };
+        let decoded = super::super::media_frame::decode(raw).expect("decodes");
+        assert_eq!(decoded.seq, 2, "the resend keeps the seq it was sent under");
+        assert_eq!(decoded.data, vec![5u8; 300]);
     }
 
     #[test]

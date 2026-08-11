@@ -245,10 +245,16 @@ impl PortalGateway {
             .get("length")
             .and_then(|v| v.as_u64())
             .unwrap_or(super::asset::CHUNK_BYTES as u64) as usize;
+        // The whole of the binary negotiation. Absent means a peer that predates
+        // it, and that peer gets base64 exactly as before.
+        let binary = frame
+            .get("binary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Scoped so the guard cannot outlive the block: held across the await
         // below it would make this future non-Send.
-        let out = {
+        let served = {
             let store = self.assets.lock().expect("asset store");
             match store.read(id, offset, length) {
                 Ok(bytes) => {
@@ -259,18 +265,32 @@ impl PortalGateway {
                     // build and a restart to find out which.
                     tracing::info!(
                         target: "remote",
-                        id, offset, asked = length, served = bytes.len(), eof,
+                        id, offset, asked = length, served = bytes.len(), eof, binary,
+                        saved = if binary { super::media_frame::overhead_saved(bytes.len()) } else { 0 },
                         "asset range served"
                     );
-                    super::asset::data_frame(id, offset, &bytes, eof)
+                    Ok((bytes, eof))
                 }
                 Err(e) => {
                     tracing::warn!(target: "remote", id, error = %e, "asset pull refused");
-                    serde_json::json!({ "kind": "asset_error", "id": id, "reason": e.to_string() })
+                    Err(e.to_string())
                 }
             }
         };
-        let wire = self.session.lock().await.downlink_frame(out);
+
+        let mut session = self.session.lock().await;
+        let wire = match served {
+            Ok((bytes, eof)) if binary => session.downlink_media(id, offset, &bytes, eof),
+            Ok((bytes, eof)) => {
+                session.downlink_frame(super::asset::data_frame(id, offset, &bytes, eof))
+            }
+            // An error is small and structured, so it stays JSON in both modes —
+            // the portal reads it off the same reducer either way.
+            Err(reason) => session.downlink_frame(
+                serde_json::json!({ "kind": "asset_error", "id": id, "reason": reason }),
+            ),
+        };
+        drop(session);
         self.sink.send(wire).await;
     }
 
