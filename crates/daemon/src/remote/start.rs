@@ -118,14 +118,22 @@ pub async fn open_channel_with_token(
 
     let key = super::crypto::derive_channel_key(&req.pairing_code, &req.channel_id).ok();
     let sink = Arc::new(super::ws::WsSink::new());
-    let gateway = Arc::new(PortalGateway::new(
-        key,
-        sink.clone(),
-        req.session_id.clone(),
-        req.mode.clone(),
-        req.execution_tier.clone(),
-        &req.channel_id,
-    ));
+    // A second socket for media only, so a 256 KB range stops sitting in front
+    // of every token behind it. Sealed with the same channel key and admitted
+    // by the same account JWT — it is a separate queue, not a separate trust
+    // boundary. Costs one more Durable Object per session.
+    let media_sink = Arc::new(super::ws::WsSink::new());
+    let gateway = Arc::new(
+        PortalGateway::new(
+            key,
+            sink.clone(),
+            req.session_id.clone(),
+            req.mode.clone(),
+            req.execution_tier.clone(),
+            &req.channel_id,
+        )
+        .with_media_sink(media_sink.clone()),
+    );
     registry.lock().await.register(gateway.clone());
     gateway.spawn_pump().await;
 
@@ -145,6 +153,21 @@ pub async fn open_channel_with_token(
     let (acct_base, acct_token) = (base, account_token);
     let reg = registry.clone();
     let gw = gateway.clone();
+    {
+        // Dialled independently of the chat socket. If it never comes up —
+        // a network that allows one socket and not two, a relay hiccup —
+        // ranges quietly take the chat socket instead, so the media path
+        // degrades to what it was rather than to nothing.
+        let (relay, ch, acct_base, acct_token) = (
+            relay.clone(),
+            ch.clone(),
+            acct_base.clone(),
+            acct_token.clone(),
+        );
+        tokio::spawn(async move {
+            super::ws::run_media_socket(&relay, &ch, acct_base, acct_token, media_sink).await;
+        });
+    }
     tokio::spawn(async move {
         super::ws::run_gateway(
             &relay, &ch, acct_base, acct_token, sid, injector, sink, gw, reg,

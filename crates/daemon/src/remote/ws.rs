@@ -75,6 +75,10 @@ impl Default for WsSink {
 
 #[async_trait]
 impl WireSink for WsSink {
+    async fn is_connected(&self) -> bool {
+        self.write.lock().await.is_some()
+    }
+
     async fn send(&self, wire: Wire) {
         let msg = wire_to_message(wire);
         let mut guard = self.write.lock().await;
@@ -315,6 +319,112 @@ async fn serve(
                     tracing::warn!(
                         target: "remote",
                         "relay silent for {SILENT_DEADLINE:?} - assuming a dead socket, reconnecting"
+                    );
+                    return;
+                }
+                Liveness::Ping => sink.ping().await,
+            },
+        }
+    }
+}
+
+/// The relay channel that carries this session's media.
+///
+/// A sibling of the chat channel rather than the same one. The relay routes by
+/// name, so a distinct name is a distinct Durable Object and a genuinely
+/// separate socket — which is the whole point: a 256 KB range on the chat
+/// socket sits in front of every token behind it, and a reply that takes a
+/// quarter of a second to clear is a quarter of a second the answer is not
+/// being typed.
+pub fn media_channel_of(channel_id: &str) -> String {
+    format!("{channel_id}-m")
+}
+
+/// Keep this session's media socket dialled.
+///
+/// Send-only from here. The portal asks for ranges on the chat socket, where
+/// the request is a few dozen bytes and blocks nothing; only the answers come
+/// back this way. So there is no read loop to run — inbound frames are drained
+/// and dropped, which is what keeps the keepalive's pongs from piling up.
+///
+/// Never gives up, for the same reason [`run_gateway`] does not: a media socket
+/// that retired itself over a lunch break would leave the session permanently
+/// unable to show a picture, with nothing in the logs to say why.
+pub async fn run_media_socket(
+    relay_base: &str,
+    channel_id: &str,
+    account_base: String,
+    account_token: String,
+    sink: Arc<WsSink>,
+) {
+    let channel = media_channel_of(channel_id);
+    let mut policy = ReconnectPolicy::new();
+
+    loop {
+        let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "remote", "mint media relay JWT failed: {e}");
+                tokio::time::sleep(policy.on_failure().wait).await;
+                continue;
+            }
+        };
+        let url = format!("{relay_base}/?c={channel}&t={token}");
+
+        match connect_async(url.as_str()).await {
+            Ok((ws, _resp)) => {
+                tracing::info!(target: "remote", "media relay connected (channel {channel})");
+                policy.on_connected();
+                let (write, read) = ws.split();
+                sink.set(write).await;
+                serve_media(read, &sink).await;
+                // Clearing the write half is what makes `is_connected` false, so
+                // the next range falls back to the chat socket rather than being
+                // written into a socket that leads nowhere.
+                sink.clear().await;
+                tokio::time::sleep(BASE_BACKOFF).await;
+            }
+            Err(e) => {
+                tracing::warn!(target: "remote", "media relay connect failed: {e}");
+                tokio::time::sleep(policy.on_failure().wait).await;
+            }
+        }
+    }
+}
+
+/// Pump one connected media socket until it stops leading anywhere.
+///
+/// Same silence deadline as the chat socket: a NAT that drops an idle flow
+/// sends no FIN, so only the absence of traffic gives it away. A media socket
+/// is idle far more often than a chat one, which makes the keepalive the only
+/// thing standing between it and a half-open socket nobody notices until the
+/// next picture fails to arrive.
+async fn serve_media(mut read: WsRead, sink: &WsSink) {
+    let mut last_inbound = Instant::now();
+    let mut ticker = tokio::time::interval(PING_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            item = read.next() => match item {
+                // Nothing is expected inbound, but anything arriving still
+                // proves the path is alive.
+                Some(Ok(_)) => last_inbound = Instant::now(),
+                Some(Err(e)) => {
+                    tracing::warn!(target: "remote", "media relay socket error: {e} - reconnecting");
+                    return;
+                }
+                None => {
+                    tracing::warn!(target: "remote", "media relay disconnected - reconnecting");
+                    return;
+                }
+            },
+            _ = ticker.tick() => match assess(last_inbound.elapsed()) {
+                Liveness::Dead => {
+                    tracing::warn!(
+                        target: "remote",
+                        "media relay silent for {SILENT_DEADLINE:?} - reconnecting"
                     );
                     return;
                 }

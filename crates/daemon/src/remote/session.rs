@@ -154,7 +154,7 @@ impl PortalSession {
                     // bytes is decoding bytes; handing it base64 now would be a
                     // frame it cannot read, on a seq it is blocked waiting for.
                     out.push(if binary {
-                        self.encode_media(seq, &id, offset, &bytes, eof)
+                        self.encode_media(Some(seq), &id, offset, &bytes, eof)
                     } else {
                         self.encode(&WireMessage::Frame {
                             seq: Some(seq),
@@ -242,10 +242,28 @@ impl PortalSession {
     /// negotiation.
     pub fn downlink_media(&mut self, id: &str, offset: u64, bytes: &[u8], eof: bool) -> Wire {
         let seq = self.sequencer.tag_media(id, offset, bytes.len());
-        self.encode_media(seq, id, offset, bytes, eof)
+        self.encode_media(Some(seq), id, offset, bytes, eof)
     }
 
-    fn encode_media(&self, seq: u64, id: &str, offset: u64, bytes: &[u8], eof: bool) -> Wire {
+    /// Encode one range for the dedicated media socket.
+    ///
+    /// Unsequenced and unretained, both for the same reason: this frame is not
+    /// going out the socket the sequencer describes. A seq the portal's chat
+    /// tracker could see but never receive there would stall everything behind
+    /// it, and there is nothing to resume — a range is idempotent, so a portal
+    /// that misses one asks again.
+    pub fn media_socket_frame(&self, id: &str, offset: u64, bytes: &[u8], eof: bool) -> Wire {
+        self.encode_media(None, id, offset, bytes, eof)
+    }
+
+    fn encode_media(
+        &self,
+        seq: Option<u64>,
+        id: &str,
+        offset: u64,
+        bytes: &[u8],
+        eof: bool,
+    ) -> Wire {
         let frame = super::media_frame::MediaFrame {
             seq,
             id: id.to_string(),
@@ -261,7 +279,10 @@ impl PortalSession {
                 // portal is waiting on, so say so on the seq it expects.
                 tracing::warn!(target: "remote", %id, error = %e, "cannot frame media as bytes");
                 self.encode(&WireMessage::Frame {
-                    seq: Some(seq),
+                    // Carries whatever seq the range would have had, so a
+                    // sequenced reply still lands where the tracker expects and
+                    // an unsequenced one still bypasses it.
+                    seq,
                     frame: serde_json::json!({
                         "kind": "asset_error", "id": id, "reason": e,
                     }),
@@ -453,7 +474,7 @@ mod tests {
         let decoded = super::super::media_frame::decode(&raw).expect("decodes");
         assert_eq!(decoded.data, payload);
         assert_eq!(decoded.offset, 1024);
-        assert_eq!(decoded.seq, 0);
+        assert_eq!(decoded.seq, Some(0));
     }
 
     #[test]
@@ -499,7 +520,11 @@ mod tests {
             panic!("a binary range must come back binary");
         };
         let decoded = super::super::media_frame::decode(raw).expect("decodes");
-        assert_eq!(decoded.seq, 2, "the resend keeps the seq it was sent under");
+        assert_eq!(
+            decoded.seq,
+            Some(2),
+            "the resend keeps the seq it was sent under"
+        );
         assert_eq!(decoded.data, vec![5u8; 300]);
     }
 

@@ -36,10 +36,20 @@ const FIXED_HEADER: usize = 4 + 8 + 1 + 8 + 1;
 /// `flags` bit 0: this range ends the asset.
 const FLAG_EOF: u8 = 1 << 0;
 
+/// `flags` bit 1: this frame carries no sequence number.
+///
+/// Set for ranges sent on the dedicated media socket. Those are ordered by
+/// nothing and need to be: the portal's chat sequencer delivers strictly in
+/// order, so a seq it can see but never receive on that socket would stall
+/// every frame behind it forever. A range is idempotent — the portal knows the
+/// offset and can simply ask again — so there is nothing for ordering to buy.
+const FLAG_NO_SEQ: u8 = 1 << 1;
+
 /// One media range, as it appears on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaFrame {
-    pub seq: u64,
+    /// `None` on the media socket; see [`FLAG_NO_SEQ`].
+    pub seq: Option<u64>,
     pub id: String,
     pub offset: u64,
     pub eof: bool,
@@ -63,13 +73,23 @@ pub fn encode(frame: &MediaFrame) -> Result<Vec<u8>, String> {
     let id_len = u8::try_from(id.len())
         .map_err(|_| format!("asset id is {} bytes, over the 255 byte limit", id.len()))?;
 
+    let mut flags = 0u8;
+    if frame.eof {
+        flags |= FLAG_EOF;
+    }
+    if frame.seq.is_none() {
+        flags |= FLAG_NO_SEQ;
+    }
+
     let mut out = Vec::with_capacity(FIXED_HEADER + id.len() + frame.data.len());
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&frame.seq.to_be_bytes());
+    // Zero when unsequenced, which the flag is what actually distinguishes —
+    // a real seq of 0 is the first frame of every session.
+    out.extend_from_slice(&frame.seq.unwrap_or(0).to_be_bytes());
     out.push(id_len);
     out.extend_from_slice(id);
     out.extend_from_slice(&frame.offset.to_be_bytes());
-    out.push(if frame.eof { FLAG_EOF } else { 0 });
+    out.push(flags);
     out.extend_from_slice(&frame.data);
     Ok(out)
 }
@@ -91,7 +111,7 @@ pub fn decode(bytes: &[u8]) -> Result<MediaFrame, String> {
         ));
     }
 
-    let seq = u64::from_be_bytes(bytes[4..12].try_into().expect("8 bytes"));
+    let raw_seq = u64::from_be_bytes(bytes[4..12].try_into().expect("8 bytes"));
     let id_len = bytes[12] as usize;
 
     let id_end = 13 + id_len;
@@ -107,7 +127,9 @@ pub fn decode(bytes: &[u8]) -> Result<MediaFrame, String> {
         .to_string();
 
     let offset = u64::from_be_bytes(bytes[id_end..id_end + 8].try_into().expect("8 bytes"));
-    let eof = bytes[id_end + 8] & FLAG_EOF != 0;
+    let flags = bytes[id_end + 8];
+    let eof = flags & FLAG_EOF != 0;
+    let seq = (flags & FLAG_NO_SEQ == 0).then_some(raw_seq);
     let data = bytes[id_end + 9..].to_vec();
 
     Ok(MediaFrame {
@@ -135,7 +157,7 @@ mod tests {
 
     fn sample(data: Vec<u8>) -> MediaFrame {
         MediaFrame {
-            seq: 42,
+            seq: Some(42),
             id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".into(),
             offset: 1_048_576,
             eof: true,
@@ -261,7 +283,7 @@ mod golden {
     #[test]
     fn the_wire_layout_matches_the_pinned_vector() {
         let frame = MediaFrame {
-            seq: 42,
+            seq: Some(42),
             id: "ab-1".into(),
             offset: 4_294_967_296,
             eof: true,
@@ -282,12 +304,57 @@ mod golden {
             .map(|i| u8::from_str_radix(&GOLDEN_HEX[i..i + 2], 16).unwrap())
             .collect();
         let f = decode(&bytes).unwrap();
-        assert_eq!(f.seq, 42);
+        assert_eq!(f.seq, Some(42));
         assert_eq!(f.id, "ab-1");
         assert_eq!(f.offset, 4_294_967_296);
         assert!(f.eof);
         // The payload deliberately contains a `{`, so a decoder that ever
         // sniffed content instead of the magic would be caught here.
         assert_eq!(f.data, vec![0x00, 0xff, 0x10, 0x7b]);
+    }
+}
+
+#[cfg(test)]
+mod unsequenced {
+    use super::*;
+
+    fn frame(seq: Option<u64>) -> MediaFrame {
+        MediaFrame {
+            seq,
+            id: "asset-1".into(),
+            offset: 4096,
+            eof: false,
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn an_unsequenced_frame_says_so_rather_than_picking_a_sentinel() {
+        // Zero is on the wire, but the flag is what carries the meaning: seq 0
+        // is the first frame of every session, so a sentinel value could not
+        // have told the two apart.
+        let wire = encode(&frame(None)).unwrap();
+        assert_eq!(&wire[4..12], &[0u8; 8]);
+        assert_eq!(decode(&wire).unwrap().seq, None);
+    }
+
+    #[test]
+    fn seq_zero_still_round_trips_as_a_real_sequence_number() {
+        assert_eq!(
+            decode(&encode(&frame(Some(0))).unwrap()).unwrap().seq,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn eof_and_unsequenced_are_independent_bits() {
+        for seq in [None, Some(7)] {
+            for eof in [true, false] {
+                let mut f = frame(seq);
+                f.eof = eof;
+                let got = decode(&encode(&f).unwrap()).unwrap();
+                assert_eq!((got.seq, got.eof), (seq, eof));
+            }
+        }
     }
 }

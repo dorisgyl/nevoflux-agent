@@ -20,6 +20,16 @@ use super::session::{Inbound, PortalSession, Wire};
 #[async_trait]
 pub trait WireSink: Send + Sync {
     async fn send(&self, wire: Wire);
+
+    /// Whether this sink currently leads anywhere.
+    ///
+    /// Asked before routing a range to the media socket: while that socket is
+    /// down, sending would log a drop and the portal would wait out a
+    /// thirty-second timeout for bytes nobody wrote. Defaults to true, because
+    /// a sink that cannot be disconnected has nothing to report.
+    async fn is_connected(&self) -> bool {
+        true
+    }
 }
 
 /// Portal remote gateway. Renders the chat stream into portal relay frames;
@@ -56,6 +66,13 @@ pub struct PortalGateway {
     announced: Mutex<std::collections::HashSet<String>>,
     /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
     push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
+    /// This session's second socket, carrying media only.
+    ///
+    /// `None` where none was opened (tests, and any caller that did not ask for
+    /// one). A range goes here when the portal says it is listening and this
+    /// side is connected; otherwise it takes the chat socket, which costs
+    /// head-of-line delay and delivers the picture.
+    media_sink: Option<Arc<dyn WireSink>>,
 }
 
 /// How much disk one remote session may occupy. With a 20 MB per-image cap
@@ -111,7 +128,18 @@ impl PortalGateway {
             ),
             announced: Mutex::new(std::collections::HashSet::new()),
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
+            media_sink: None,
         }
+    }
+
+    /// Give this gateway a dedicated media socket to answer ranges on.
+    ///
+    /// Separate from `new` because the socket is optional and its dialling loop
+    /// is spawned by the caller — a gateway is perfectly usable without one, it
+    /// just puts media in front of chat on the single socket it has.
+    pub fn with_media_sink(mut self, sink: Arc<dyn WireSink>) -> Self {
+        self.media_sink = Some(sink);
+        self
     }
 
     /// Start draining pushed frames onto the wire.
@@ -278,20 +306,51 @@ impl PortalGateway {
             }
         };
 
+        // Route to the dedicated socket only when both ends have one. The portal
+        // says it is listening there; this side has to actually be connected, or
+        // the range would be written into nothing and the player would wait out
+        // its timeout for bytes that were never sent.
+        let via_media = binary
+            && frame
+                .get("mediaChannel")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            && match &self.media_sink {
+                Some(s) => s.is_connected().await,
+                None => false,
+            };
+
         let mut session = self.session.lock().await;
-        let wire = match served {
-            Ok((bytes, eof)) if binary => session.downlink_media(id, offset, &bytes, eof),
-            Ok((bytes, eof)) => {
-                session.downlink_frame(super::asset::data_frame(id, offset, &bytes, eof))
+        // Destination is decided with the frame, not from the request. They
+        // differ exactly when the read failed: the range was headed for the
+        // media socket, the error that replaced it is not.
+        let (wire, on_media) = match served {
+            // On its own socket a range is unsequenced: the chat tracker must
+            // not be left waiting on a seq that will never arrive there.
+            Ok((bytes, eof)) if via_media => {
+                (session.media_socket_frame(id, offset, &bytes, eof), true)
             }
+            Ok((bytes, eof)) if binary => (session.downlink_media(id, offset, &bytes, eof), false),
+            Ok((bytes, eof)) => (
+                session.downlink_frame(super::asset::data_frame(id, offset, &bytes, eof)),
+                false,
+            ),
             // An error is small and structured, so it stays JSON in both modes —
-            // the portal reads it off the same reducer either way.
-            Err(reason) => session.downlink_frame(
-                serde_json::json!({ "kind": "asset_error", "id": id, "reason": reason }),
+            // the portal reads it off the same reducer either way. It also stays
+            // on the chat socket, which is the one guaranteed to be up.
+            Err(reason) => (
+                session.downlink_frame(
+                    serde_json::json!({ "kind": "asset_error", "id": id, "reason": reason }),
+                ),
+                false,
             ),
         };
         drop(session);
-        self.sink.send(wire).await;
+
+        match (on_media, &self.media_sink) {
+            (true, Some(media)) => media.send(wire).await,
+            _ => self.sink.send(wire).await,
+        }
     }
 
     /// Point the staging area at a temporary directory (tests only).
@@ -564,6 +623,23 @@ mod tests {
         }
     }
 
+    /// A sink standing in for a media socket that is not up.
+    ///
+    /// Sends here must never happen: writing a range into a socket that leads
+    /// nowhere is exactly the failure the routing check exists to prevent, and
+    /// it costs the player a thirty-second timeout to discover.
+    #[derive(Default)]
+    struct DownSink;
+    #[async_trait]
+    impl WireSink for DownSink {
+        async fn send(&self, _wire: Wire) {
+            panic!("nothing may be written to a disconnected media socket");
+        }
+        async fn is_connected(&self) -> bool {
+            false
+        }
+    }
+
     /// A chat envelope carrying the real daemon payload shape, including the
     /// `session_id` that `server.rs` now stamps for gateway scoping.
     fn chat_env_for(session: &str, content: &str, done: bool) -> DaemonEnvelope {
@@ -794,6 +870,120 @@ mod tests {
         sink.sent.lock().await.clear();
         gw.resume(1).await;
         assert_eq!(sink.sent.lock().await.len(), 1); // resends seq 1
+    }
+
+    /// A gateway holding one asset, plus the sinks to watch.
+    ///
+    /// Returns the temp dir so it outlives the store — dropping it early would
+    /// delete the file under the range being read.
+    async fn gateway_with_asset(
+        media: Option<Arc<dyn WireSink>>,
+    ) -> (PortalGateway, Arc<CollectSink>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = Arc::new(CollectSink::default());
+        let mut gw = PortalGateway::new(None, chat.clone(), "sess-media", None, None, "chan-media")
+            .with_asset_root(dir.path().to_path_buf());
+        if let Some(m) = media {
+            gw = gw.with_media_sink(m);
+        }
+        let id = {
+            let mut store = gw.assets.lock().expect("asset store");
+            store.put(&[7u8; 4096], "clip.mp4", "video/mp4").unwrap().id
+        };
+        (gw, chat, id, dir)
+    }
+
+    fn pull(id: &str, binary: bool, media_channel: bool) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "asset_pull",
+            "id": id,
+            "offset": 0,
+            "length": 4096,
+            "binary": binary,
+            "mediaChannel": media_channel,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_range_takes_the_media_socket_when_both_ends_have_one() {
+        let media = Arc::new(CollectSink::default());
+        let (gw, chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        assert!(
+            chat.sent.lock().await.is_empty(),
+            "the whole point is that the chat socket stays clear"
+        );
+        let sent = media.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Binary(raw) = &sent[0] else {
+            panic!("media must be binary");
+        };
+        let frame = super::super::media_frame::decode(raw).unwrap();
+        assert_eq!(frame.data, vec![7u8; 4096]);
+        assert_eq!(
+            frame.seq, None,
+            "a range on its own socket must not claim a seq the chat tracker \
+             would then wait for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_falls_back_to_chat_when_the_media_socket_is_down() {
+        // Degrading to head-of-line delay is right; degrading to a thirty
+        // second timeout and no picture is not.
+        let (gw, chat, id, _d) = gateway_with_asset(Some(Arc::new(DownSink))).await;
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        let sent = chat.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Binary(raw) = &sent[0] else {
+            panic!("binary was asked for");
+        };
+        assert_eq!(
+            super::super::media_frame::decode(raw).unwrap().seq,
+            Some(0),
+            "back on the chat socket it is sequenced again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_portal_that_did_not_open_a_media_socket_keeps_getting_chat() {
+        let media = Arc::new(CollectSink::default());
+        let (gw, chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+
+        gw.apply_asset_pull(&pull(&id, true, false)).await;
+
+        assert!(media.sent.lock().await.is_empty());
+        assert_eq!(chat.sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_head_with_no_media_socket_answers_on_chat() {
+        let (gw, chat, id, _d) = gateway_with_asset(None).await;
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+        assert_eq!(chat.sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_range_reports_on_the_chat_socket() {
+        // The error has to reach a socket that is definitely up, and it stays
+        // JSON so the reducer reads it the same way in both modes.
+        let media = Arc::new(CollectSink::default());
+        let (gw, chat, _id, _d) = gateway_with_asset(Some(media.clone())).await;
+
+        gw.apply_asset_pull(&pull("no-such-asset", true, true))
+            .await;
+
+        assert!(media.sent.lock().await.is_empty());
+        let sent = chat.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Text(t) = &sent[0] else {
+            panic!("an error stays JSON");
+        };
+        assert!(t.contains("asset_error"), "got {t}");
     }
 
     use super::super::relay_protocol::WireMessage;
