@@ -650,6 +650,32 @@ pub fn keyless_placeholder(id: &str) -> Option<&'static str> {
     }
 }
 
+/// Canonical builtin provider ids, in display order.
+///
+/// This is the config layer's list. `PROVIDER_METAS` in `server.rs` is the UI's
+/// card list and is deliberately shorter — `gemini-cli` is configurable but has
+/// no card. Do not conflate them.
+pub const BUILTIN_PROVIDER_IDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "openrouter",
+    "qwen",
+    "deepseek",
+    "claude-code",
+    "gemini-cli",
+    "antigravity",
+    "gemini",
+    "groq",
+    "ollama",
+    "mistral",
+    "xai",
+    "cohere",
+    "perplexity",
+    "together",
+    "kimi-agent",
+    "openclaw",
+];
+
 impl LlmConfig {
     /// Get the active provider name.
     pub fn active_provider(&self) -> Option<&str> {
@@ -747,6 +773,31 @@ impl LlmConfig {
         self.provider_config(id).map(|_| id.to_string())
     }
 
+    /// Whether `id` is usable as-is.
+    ///
+    /// A builtin provider needs an API key. A custom provider needs a
+    /// `base_url` — its key is optional, because a local OpenAI-compatible
+    /// server commonly has no auth at all.
+    pub fn is_provider_configured(&self, id: &str) -> bool {
+        let Some(pc) = self.provider_config(id) else {
+            return false;
+        };
+        if custom_id(id).is_some() {
+            return pc.base_url.as_deref().is_some_and(|u| !u.is_empty());
+        }
+        pc.api_key.as_deref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Every provider id this config knows: builtins in display order, then
+    /// custom providers in id order.
+    pub fn all_provider_ids(&self) -> Vec<String> {
+        BUILTIN_PROVIDER_IDS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(self.custom.keys().map(|k| format!("{CUSTOM_PREFIX}{k}")))
+            .collect()
+    }
+
     /// Returns `true` if at least one LLM provider is usable.
     ///
     /// A provider counts as usable when it has an explicit API key, or when a
@@ -761,31 +812,15 @@ impl LlmConfig {
     /// identical whether computed in the daemon or in the separately-launched
     /// proxy process reading the same `config.toml`.
     ///
-    /// Keep the provider list in sync with `get_provider_config` in server.rs.
+    /// The provider list comes from [`LlmConfig::all_provider_ids`] and each
+    /// entry is judged by [`LlmConfig::is_provider_configured`], so custom
+    /// providers count here without any extra wiring.
     pub fn has_any_configured_provider(&self) -> bool {
-        let any_key = [
-            &self.anthropic,
-            &self.openai,
-            &self.deepseek,
-            &self.qwen,
-            &self.gemini,
-            &self.groq,
-            &self.openrouter,
-            &self.mistral,
-            &self.xai,
-            &self.cohere,
-            &self.perplexity,
-            &self.together,
-            &self.ollama,
-            &self.claude_code,
-            &self.gemini_cli,
-            &self.antigravity,
-            &self.kimi_agent,
-            &self.openclaw,
-        ]
-        .iter()
-        .any(|pc| pc.api_key.is_some());
-        if any_key {
+        if self
+            .all_provider_ids()
+            .iter()
+            .any(|id| self.is_provider_configured(id))
+        {
             return true;
         }
 
@@ -870,41 +905,28 @@ impl LlmConfig {
     /// Get list of configured providers with their model names.
     /// Returns (provider_name, model_name) pairs for all providers with API keys.
     pub fn configured_providers(&self) -> Vec<(String, String)> {
-        let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 18] = [
-            ("anthropic", &self.anthropic),
-            ("openai", &self.openai),
-            ("openrouter", &self.openrouter),
-            ("qwen", &self.qwen),
-            ("deepseek", &self.deepseek),
-            ("claude-code", &self.claude_code),
-            ("gemini-cli", &self.gemini_cli),
-            ("antigravity", &self.antigravity),
-            ("gemini", &self.gemini),
-            ("groq", &self.groq),
-            ("ollama", &self.ollama),
-            ("mistral", &self.mistral),
-            ("xai", &self.xai),
-            ("cohere", &self.cohere),
-            ("perplexity", &self.perplexity),
-            ("together", &self.together),
-            ("kimi-agent", &self.kimi_agent),
-            ("openclaw", &self.openclaw),
-        ];
-
-        for (name, config) in &providers {
-            if config.api_key.is_some() {
-                let model = config.model.clone().unwrap_or_else(|| match name
-                    .parse::<nevoflux_llm::ProviderType>(
-                ) {
-                    Ok(pt) => nevoflux_llm::default_model_for(pt).to_string(),
-                    Err(_) => name.to_string(),
-                });
-                let is_active = active == Some(*name);
-                let suffix = if is_active { " (active)" } else { "" };
-                result.push((name.to_string(), format!("{}{}", model, suffix)));
+        let mut result = Vec::new();
+        for id in self.all_provider_ids() {
+            if !self.is_provider_configured(&id) {
+                continue;
             }
+            let Some(pc) = self.provider_config(&id) else {
+                continue;
+            };
+            let model = pc
+                .model
+                .clone()
+                .unwrap_or_else(|| match self.resolve_wire(&id) {
+                    Some(pt) => nevoflux_llm::default_model_for(pt).to_string(),
+                    None => id.clone(),
+                });
+            let suffix = if active == Some(id.as_str()) {
+                " (active)"
+            } else {
+                ""
+            };
+            result.push((id.clone(), format!("{}{}", model, suffix)));
         }
         result
     }
@@ -1791,6 +1813,87 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_custom_provider_counts_as_configured_without_key() {
+        let cfg = custom_cfg(
+            "local",
+            "Local",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.is_provider_configured("custom:local"));
+        assert!(cfg.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_custom_provider_without_base_url_is_not_configured() {
+        let cfg = custom_cfg(
+            "broken",
+            "Broken",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!cfg.is_provider_configured("custom:broken"));
+        assert!(!cfg.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_configured_providers_includes_custom() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:my-llm".to_string());
+        cfg.openai.api_key = Some("sk-oai".to_string());
+
+        let listed = cfg.configured_providers();
+        assert!(listed.iter().any(|(name, _)| name == "openai"));
+        let (_, model) = listed
+            .iter()
+            .find(|(name, _)| name == "custom:my-llm")
+            .expect("custom provider is listed");
+        assert_eq!(model, "gpt-4o (active)");
+    }
+
+    #[test]
+    fn test_configured_providers_custom_without_model_uses_wire_default() {
+        let cfg = custom_cfg(
+            "ant",
+            "Ant",
+            CustomWire::Anthropic,
+            ProviderConfig {
+                base_url: Some("https://y.test".to_string()),
+                ..Default::default()
+            },
+        );
+        let listed = cfg.configured_providers();
+        let (_, model) = listed
+            .iter()
+            .find(|(name, _)| name == "custom:ant")
+            .expect("custom provider is listed");
+        assert_eq!(model, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_all_provider_ids_order() {
+        let cfg = custom_cfg("zeta", "Z", CustomWire::Openai, ProviderConfig::default());
+        let ids = cfg.all_provider_ids();
+        assert_eq!(ids.first().map(String::as_str), Some("anthropic"));
+        assert_eq!(ids.last().map(String::as_str), Some("custom:zeta"));
+    }
 
     #[test]
     fn test_custom_provider_active_lookups() {
