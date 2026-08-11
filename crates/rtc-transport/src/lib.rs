@@ -34,8 +34,10 @@
 //! is load-bearing rather than incidental, so [`signal::SignalGuard`] refuses to
 //! negotiate at all without it.
 
+pub mod capture;
 pub mod connection;
 pub mod driver;
+pub mod ice;
 pub mod signal;
 
 /// Signalling is refused on a channel with no key. See [`signal::SignalGuard`].

@@ -25,6 +25,8 @@ declared-SSRC track, which silently kills all receive-side feedback.
 | `signal.rs` | The four signalling frames, and the rule that keeps them safe |
 | `connection.rs` | Offer / answer over those frames, with a data channel |
 | `driver.rs` | The pump, and a tokio loop that owns a socket (`tokio-driver`) |
+| `capture.rs` | ffmpeg capture+encode arguments for all three platforms, and the Annex-B reader |
+| `ice.rs` | STUN/TURN configuration, validated when it is read rather than when a call fails |
 
 The first two are sans-IO and unit-tested, including a negotiation between two
 endpoints passing nothing but serialized `SignalFrame`s. `driver.rs` is split
@@ -58,16 +60,8 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **The media track.** Screencast over RTP.
-- **Screen capture.** Three platform backends. `crates/computer` is
-  screenshot-only — `capture_screen()` takes one full frame and PNG-encodes it,
-  which at 30 fps would saturate a core. Real capture means DXGI Desktop
-  Duplication on Windows, ScreenCaptureKit on macOS, and X11/PipeWire on Linux;
-  the cheapest route is one ffmpeg process doing capture and encode together
-  (`ddagrab`/`avfoundation`/`x11grab` → `h264_nvenc`/`videotoolbox`/`vaapi`),
-  reading Annex-B off its stdout.
-- **TURN.** Roughly 10–20% of connections need it — symmetric NAT at both ends,
-  CGNAT, corporate firewalls. Not optional in practice.
+- **The media track.** `capture.rs` produces access units; nothing yet feeds
+  them to an RTP track or spawns the ffmpeg process that produces them.
 - **The fallback.** When no connection forms, the session has to stay on the
   relay path. That path exists and works; nothing routes between them yet.
 - **The portal side.** `RTCPeerConnection`, SDP exchange through the sealed
@@ -90,7 +84,33 @@ member so it compiles and tests in CI, and nothing depends on it.
 here, including the loopback connection. Without the feature the driver loop and
 its integration test are skipped.
 
-The capture path cannot be verified on the current development box: the Tesla T4
-is passthrough and headless (MCDM), so there is no desktop for DXGI Desktop
-Duplication to copy and the Windows-optimal path is untestable there. It needs a
-machine with a real display output.
+### Capture, and what is actually untested
+
+`crates/computer` takes *screenshots* — one frame, PNG-encoded — which at 30 fps
+saturates a core before anything reaches the network. Screencast needs the
+platform capture path wired to a hardware encoder, and writing that three times
+is three capture backends plus three encoder integrations. ffmpeg has all six
+and this repository already depends on it, so capture and encode are one child
+process and what lives here is the argument list and the parser for what comes
+back.
+
+Both of those are pure, and both are tested for **all three platforms from
+whichever one you are on** — the arguments are the part that fails silently, and
+leaving two of three untested because the machine is the third is how a
+screencast ends up permanently a second behind with nothing in the logs.
+
+What is genuinely untested is running it: no CI machine and not the current
+development box, where the Tesla T4 is passthrough and headless (MCDM) so there
+is no desktop for DXGI Desktop Duplication to copy. That needs a machine with a
+real display output, per platform.
+
+### TURN
+
+`ice.rs` validates configuration and reports whether a deployment can relay at
+all. It picks no provider — which service, at what cost, with credentials issued
+how, are deployment questions, and answering them in code answers them for every
+deployment. An empty list is legal and means host candidates only.
+
+Worth knowing before shipping: STUN alone works perfectly in testing and fails
+for roughly a fifth of real users, because a symmetric NAT makes a reflexive
+address useless to the far end. `can_relay` exists to make that checkable.
