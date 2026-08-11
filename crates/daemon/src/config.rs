@@ -619,6 +619,17 @@ pub fn is_acp_provider(provider: &str) -> bool {
     ACP_PROVIDERS.contains(&provider.to_lowercase().as_str())
 }
 
+/// Prefix marking a user-defined provider id.
+pub const CUSTOM_PREFIX: &str = "custom:";
+
+/// Strip the `custom:` prefix, returning the bare id.
+///
+/// Returns `None` for builtin ids and for a bare `custom:` with no id, so
+/// callers can treat "not custom" and "malformed custom" identically.
+pub fn custom_id(id: &str) -> Option<&str> {
+    id.strip_prefix(CUSTOM_PREFIX).filter(|s| !s.is_empty())
+}
+
 impl LlmConfig {
     /// Get the active provider name.
     pub fn active_provider(&self) -> Option<&str> {
@@ -631,6 +642,89 @@ impl LlmConfig {
     /// carry an image in its prompt.
     pub fn active_provider_is_acp(&self) -> bool {
         self.active_provider().is_some_and(is_acp_provider)
+    }
+
+    /// The one place that maps a provider id to its stored configuration.
+    ///
+    /// Accepts every builtin id and alias, plus `custom:<id>` for a
+    /// user-defined provider. Every other provider-dependent lookup in this
+    /// file — and `config.llm.get` / `config.llm.set` in `server.rs` —
+    /// delegates here, so a new provider becomes visible everywhere at once.
+    pub fn provider_config(&self, id: &str) -> Option<&ProviderConfig> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| &c.base);
+        }
+        match id {
+            "anthropic" => Some(&self.anthropic),
+            "openai" => Some(&self.openai),
+            "deepseek" => Some(&self.deepseek),
+            "qwen" => Some(&self.qwen),
+            "gemini" => Some(&self.gemini),
+            "groq" => Some(&self.groq),
+            "openrouter" => Some(&self.openrouter),
+            "mistral" => Some(&self.mistral),
+            "xai" | "grok" => Some(&self.xai),
+            "cohere" => Some(&self.cohere),
+            "perplexity" => Some(&self.perplexity),
+            "together" => Some(&self.together),
+            "ollama" => Some(&self.ollama),
+            "claude-code" | "claude_code" => Some(&self.claude_code),
+            "gemini-cli" | "gemini_cli" => Some(&self.gemini_cli),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&self.antigravity),
+            "kimi-agent" | "kimi_agent" | "kimi" => Some(&self.kimi_agent),
+            "openclaw" | "open_claw" | "open-claw" => Some(&self.openclaw),
+            _ => None,
+        }
+    }
+
+    /// Mutable twin of [`LlmConfig::provider_config`].
+    pub fn provider_config_mut(&mut self, id: &str) -> Option<&mut ProviderConfig> {
+        if let Some(key) = custom_id(id) {
+            let key = key.to_string();
+            return self.custom.get_mut(&key).map(|c| &mut c.base);
+        }
+        match id {
+            "anthropic" => Some(&mut self.anthropic),
+            "openai" => Some(&mut self.openai),
+            "deepseek" => Some(&mut self.deepseek),
+            "qwen" => Some(&mut self.qwen),
+            "gemini" => Some(&mut self.gemini),
+            "groq" => Some(&mut self.groq),
+            "openrouter" => Some(&mut self.openrouter),
+            "mistral" => Some(&mut self.mistral),
+            "xai" | "grok" => Some(&mut self.xai),
+            "cohere" => Some(&mut self.cohere),
+            "perplexity" => Some(&mut self.perplexity),
+            "together" => Some(&mut self.together),
+            "ollama" => Some(&mut self.ollama),
+            "claude-code" | "claude_code" => Some(&mut self.claude_code),
+            "gemini-cli" | "gemini_cli" => Some(&mut self.gemini_cli),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut self.antigravity),
+            "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut self.kimi_agent),
+            "openclaw" | "open_claw" | "open-claw" => Some(&mut self.openclaw),
+            _ => None,
+        }
+    }
+
+    /// The wire protocol to speak for `id`.
+    ///
+    /// Builtin ids parse to their own `ProviderType`; `custom:<id>` resolves to
+    /// `OpenAi` or `Anthropic` according to its `wire` field. Prefer this over
+    /// a bare `id.parse::<ProviderType>()` anywhere the id may come from
+    /// [`LlmConfig::active_provider`], which can name a custom provider.
+    pub fn resolve_wire(&self, id: &str) -> Option<nevoflux_llm::ProviderType> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| c.wire.provider_type());
+        }
+        id.parse::<nevoflux_llm::ProviderType>().ok()
+    }
+
+    /// Human-readable name for UI and logs. Builtin ids return the id itself.
+    pub fn display_name(&self, id: &str) -> Option<String> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| c.display_name.clone());
+        }
+        self.provider_config(id).map(|_| id.to_string())
     }
 
     /// Returns `true` if at least one LLM provider is usable.
@@ -1836,6 +1930,159 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_provider_config_parity_with_named_fields() {
+        let cfg = LlmConfig::default();
+        // Every builtin id and alias must resolve to the very same struct the
+        // named field holds. Mirrors the arms of the old get_provider_config.
+        let cases: &[(&str, *const ProviderConfig)] = &[
+            ("anthropic", &cfg.anthropic),
+            ("openai", &cfg.openai),
+            ("deepseek", &cfg.deepseek),
+            ("qwen", &cfg.qwen),
+            ("gemini", &cfg.gemini),
+            ("groq", &cfg.groq),
+            ("openrouter", &cfg.openrouter),
+            ("mistral", &cfg.mistral),
+            ("xai", &cfg.xai),
+            ("grok", &cfg.xai),
+            ("cohere", &cfg.cohere),
+            ("perplexity", &cfg.perplexity),
+            ("together", &cfg.together),
+            ("ollama", &cfg.ollama),
+            ("claude-code", &cfg.claude_code),
+            ("claude_code", &cfg.claude_code),
+            ("gemini-cli", &cfg.gemini_cli),
+            ("gemini_cli", &cfg.gemini_cli),
+            ("antigravity", &cfg.antigravity),
+            ("antigravity-cli", &cfg.antigravity),
+            ("antigravity_cli", &cfg.antigravity),
+            ("kimi-agent", &cfg.kimi_agent),
+            ("kimi_agent", &cfg.kimi_agent),
+            ("kimi", &cfg.kimi_agent),
+            ("openclaw", &cfg.openclaw),
+            ("open_claw", &cfg.openclaw),
+            ("open-claw", &cfg.openclaw),
+        ];
+        for (id, expected) in cases {
+            let got = cfg
+                .provider_config(id)
+                .unwrap_or_else(|| panic!("provider_config({id}) returned None"));
+            assert!(
+                std::ptr::eq(got, *expected),
+                "provider_config({id}) resolved to the wrong field"
+            );
+        }
+        assert!(cfg.provider_config("nope").is_none());
+    }
+
+    /// Build a one-entry custom map for the lookup tests.
+    fn custom_cfg(id: &str, name: &str, wire: CustomWire, base: ProviderConfig) -> LlmConfig {
+        let mut cfg = LlmConfig::default();
+        cfg.custom.insert(
+            id.to_string(),
+            CustomProviderConfig {
+                display_name: name.to_string(),
+                wire,
+                accent: None,
+                base,
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn test_provider_config_resolves_custom() {
+        let cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let pc = cfg
+            .provider_config("custom:my-llm")
+            .expect("custom resolves");
+        assert_eq!(pc.api_key.as_deref(), Some("sk-1"));
+        assert!(cfg.provider_config("custom:missing").is_none());
+        assert!(cfg.provider_config("custom:").is_none());
+        assert!(
+            cfg.provider_config("my-llm").is_none(),
+            "bare id must not resolve"
+        );
+    }
+
+    #[test]
+    fn test_provider_config_mut_resolves_custom() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        cfg.provider_config_mut("custom:my-llm").unwrap().model = Some("gpt-4o".to_string());
+        assert_eq!(
+            cfg.custom.get("my-llm").unwrap().base.model.as_deref(),
+            Some("gpt-4o")
+        );
+        cfg.provider_config_mut("openai").unwrap().model = Some("gpt-5".to_string());
+        assert_eq!(cfg.openai.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn test_resolve_wire() {
+        use nevoflux_llm::ProviderType;
+        let mut cfg = custom_cfg(
+            "oai",
+            "OAI-ish",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        cfg.custom.insert(
+            "ant".to_string(),
+            CustomProviderConfig {
+                display_name: "Ant-ish".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig::default(),
+            },
+        );
+
+        assert_eq!(cfg.resolve_wire("anthropic"), Some(ProviderType::Anthropic));
+        assert_eq!(
+            cfg.resolve_wire("claude_code"),
+            Some(ProviderType::ClaudeCode)
+        );
+        assert_eq!(cfg.resolve_wire("grok"), Some(ProviderType::XAi));
+        assert_eq!(cfg.resolve_wire("custom:oai"), Some(ProviderType::OpenAi));
+        assert_eq!(
+            cfg.resolve_wire("custom:ant"),
+            Some(ProviderType::Anthropic)
+        );
+        assert_eq!(cfg.resolve_wire("custom:missing"), None);
+        assert_eq!(cfg.resolve_wire("nope"), None);
+    }
+
+    #[test]
+    fn test_display_name() {
+        let cfg = custom_cfg(
+            "my-llm",
+            "\u{516c}\u{53f8}\u{7f51}\u{5173}",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        assert_eq!(
+            cfg.display_name("custom:my-llm").as_deref(),
+            Some("\u{516c}\u{53f8}\u{7f51}\u{5173}")
+        );
+        assert_eq!(cfg.display_name("openai").as_deref(), Some("openai"));
+        assert_eq!(cfg.display_name("custom:missing"), None);
+    }
 
     #[test]
     fn test_custom_provider_toml_round_trip() {
