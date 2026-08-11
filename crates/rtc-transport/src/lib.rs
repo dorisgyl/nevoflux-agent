@@ -35,6 +35,7 @@
 //! negotiate at all without it.
 
 pub mod connection;
+pub mod driver;
 pub mod signal;
 
 /// Signalling is refused on a channel with no key. See [`signal::SignalGuard`].

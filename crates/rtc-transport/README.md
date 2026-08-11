@@ -24,9 +24,17 @@ declared-SSRC track, which silently kills all receive-side feedback.
 |---|---|
 | `signal.rs` | The four signalling frames, and the rule that keeps them safe |
 | `connection.rs` | Offer / answer over those frames, with a data channel |
+| `driver.rs` | The pump, and a tokio loop that owns a socket (`tokio-driver`) |
 
-Both are sans-IO and fully unit-tested, including a negotiation between two
-endpoints that passes nothing but serialized `SignalFrame`s.
+The first two are sans-IO and unit-tested, including a negotiation between two
+endpoints passing nothing but serialized `SignalFrame`s. `driver.rs` is split
+the same way: `pump` is pure and testable by hand, `run` owns the socket.
+
+`tests/loopback.rs` is the one test that cannot be sans-IO — ICE has to probe,
+DTLS has to handshake and SCTP has to open, and SDP that looks plausible and
+never connects would pass everything else here. Two peers on real UDP sockets
+connect, the channel opens on both, and 3001 bytes of non-ASCII cross it intact
+in both directions.
 
 ### The property everything else rests on
 
@@ -42,12 +50,14 @@ inside.
 
 ## What is not here
 
-Not started, and each is substantial:
+Each is substantial:
 
-- **The driver.** UDP sockets, `poll_output`/`handle_input`, timeouts, ICE
-  candidate trickling against a real network.
-- **The data channel payloads.** Asset ranges and input events over SCTP,
-  replacing the relay pull path when a connection forms.
+- **ICE against a real network.** The loopback test proves the driver; it does
+  not prove hole-punching. Trickled candidates are plumbed
+  (`add_remote_candidate`) but nothing generates srflx or relay ones yet.
+- **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
+  preferring the channel over the relay once it is up, and falling back when it
+  drops. Nothing routes between the two paths yet.
 - **The media track.** Screencast over RTP.
 - **Screen capture.** Three platform backends. `crates/computer` is
   screenshot-only — `capture_screen()` takes one full frame and PNG-encodes it,
@@ -63,6 +73,11 @@ Not started, and each is substantial:
 - **The portal side.** `RTCPeerConnection`, SDP exchange through the sealed
   wire, a `ChatTransport` over the data channel, `<video srcObject>`.
 
+The channel payloads, at least, need no new protocol.
+`crates/daemon/src/remote/media_frame.rs` already frames a range as bytes and
+the portal already decodes it; the data channel moves opaque blobs, so the same
+framing crosses either path and neither end has to learn a second one.
+
 ## Not in the daemon's build
 
 Deliberately. `str0m` pulls ~100 crates, and this is not usable yet — wiring it
@@ -71,7 +86,9 @@ member so it compiles and tests in CI, and nothing depends on it.
 
 ## Testing notes
 
-`cargo test -p nevoflux-rtc-transport` covers everything here.
+`cargo test -p nevoflux-rtc-transport --features tokio-driver` covers everything
+here, including the loopback connection. Without the feature the driver loop and
+its integration test are skipped.
 
 The capture path cannot be verified on the current development box: the Tesla T4
 is passthrough and headless (MCDM), so there is no desktop for DXGI Desktop

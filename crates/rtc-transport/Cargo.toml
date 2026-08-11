@@ -15,6 +15,16 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# The socket-owning event loop. Off by default so the protocol logic can be
+# depended on without pulling a runtime in with it.
+tokio-driver = ["dep:tokio"]
+
+[dependencies.tokio]
+workspace = true
+features = ["net", "time", "sync", "rt", "macros"]
+optional = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 
