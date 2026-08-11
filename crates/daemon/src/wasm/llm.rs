@@ -602,6 +602,13 @@ fn is_mimo_anthropic_compat_base_url(url: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+/// Test-only accessor for [`is_mimo_anthropic_compat_base_url`], so the config
+/// tests can assert a user-supplied custom base URL never matches it.
+#[cfg(test)]
+pub fn is_mimo_anthropic_compat_base_url_for_test(url: Option<&str>) -> bool {
+    is_mimo_anthropic_compat_base_url(url)
+}
+
 /// Recursively rewrite a JSON Schema so it satisfies OpenAI Responses API
 /// strict-mode validation (`strict: true` is hard-coded by rig 0.29 at
 /// `responses_api/mod.rs:451`, with no public escape hatch on

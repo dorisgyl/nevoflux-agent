@@ -630,6 +630,26 @@ pub fn custom_id(id: &str) -> Option<&str> {
     id.strip_prefix(CUSTOM_PREFIX).filter(|s| !s.is_empty())
 }
 
+/// The stand-in key for providers that authenticate by other means.
+///
+/// The client builders require a non-empty key even when the endpoint ignores
+/// it — CLI providers carry their own auth, and a local OpenAI-compatible
+/// server usually needs none at all.
+pub fn keyless_placeholder(id: &str) -> Option<&'static str> {
+    if custom_id(id).is_some() {
+        return Some("custom-local");
+    }
+    match id {
+        "claude-code" | "claude_code" => Some("claude-code-cli"),
+        "gemini-cli" | "gemini_cli" => Some("gemini-cli"),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some("antigravity"),
+        "ollama" => Some("ollama-local"),
+        "kimi-agent" | "kimi_agent" | "kimi" => Some("kimi-agent-cli"),
+        "openclaw" | "open_claw" | "open-claw" => Some("openclaw-acp"),
+        _ => None,
+    }
+}
+
 impl LlmConfig {
     /// Get the active provider name.
     pub fn active_provider(&self) -> Option<&str> {
@@ -789,150 +809,42 @@ impl LlmConfig {
     }
 
     /// Get the API key for the active provider.
+    ///
+    /// An empty stored key counts as absent, so a keyless endpoint falls
+    /// through to [`keyless_placeholder`] rather than handing the client
+    /// builder an empty string.
     pub fn active_api_key(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.api_key.as_deref(),
-            "openai" => self.openai.api_key.as_deref(),
-            "qwen" => self.qwen.api_key.as_deref(),
-            "deepseek" => self.deepseek.api_key.as_deref(),
-            "openrouter" => self.openrouter.api_key.as_deref(),
-            "claude-code" | "claude_code" => self
-                .claude_code
-                .api_key
-                .as_deref()
-                .or(Some("claude-code-cli")),
-            "gemini-cli" | "gemini_cli" => {
-                self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
-            }
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.api_key.as_deref().or(Some("antigravity"))
-            }
-            "gemini" => self.gemini.api_key.as_deref(),
-            "groq" => self.groq.api_key.as_deref(),
-            "ollama" => self.ollama.api_key.as_deref().or(Some("ollama-local")),
-            "mistral" => self.mistral.api_key.as_deref(),
-            "xai" | "grok" => self.xai.api_key.as_deref(),
-            "cohere" => self.cohere.api_key.as_deref(),
-            "perplexity" => self.perplexity.api_key.as_deref(),
-            "together" => self.together.api_key.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self
-                .kimi_agent
-                .api_key
-                .as_deref()
-                .or(Some("kimi-agent-cli")),
-            "openclaw" | "open_claw" | "open-claw" => {
-                self.openclaw.api_key.as_deref().or(Some("openclaw-acp"))
-            }
-            _ => None,
-        }
+        let id = self.active_provider()?;
+        let pc = self.provider_config(id)?;
+        pc.api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .or_else(|| keyless_placeholder(id))
     }
 
     /// Get the model for the active provider.
     pub fn active_model(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.model.as_deref(),
-            "openai" => self.openai.model.as_deref(),
-            "qwen" => self.qwen.model.as_deref(),
-            "deepseek" => self.deepseek.model.as_deref(),
-            "openrouter" => self.openrouter.model.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.model.as_deref()
-            }
-            "gemini" => self.gemini.model.as_deref(),
-            "groq" => self.groq.model.as_deref(),
-            "ollama" => self.ollama.model.as_deref(),
-            "mistral" => self.mistral.model.as_deref(),
-            "xai" | "grok" => self.xai.model.as_deref(),
-            "cohere" => self.cohere.model.as_deref(),
-            "perplexity" => self.perplexity.model.as_deref(),
-            "together" => self.together.model.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
-            _ => self.default_model.as_deref(),
+        let id = self.active_provider()?;
+        match self.provider_config(id) {
+            Some(pc) => pc.model.as_deref(),
+            None => self.default_model.as_deref(),
         }
     }
 
     /// Get the configured model for a specific provider name.
     pub fn model_for_provider(&self, provider: &str) -> Option<&str> {
-        match provider {
-            "anthropic" => self.anthropic.model.as_deref(),
-            "openai" => self.openai.model.as_deref(),
-            "qwen" => self.qwen.model.as_deref(),
-            "deepseek" => self.deepseek.model.as_deref(),
-            "openrouter" => self.openrouter.model.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.model.as_deref()
-            }
-            "gemini" => self.gemini.model.as_deref(),
-            "groq" => self.groq.model.as_deref(),
-            "ollama" => self.ollama.model.as_deref(),
-            "mistral" => self.mistral.model.as_deref(),
-            "xai" | "grok" => self.xai.model.as_deref(),
-            "cohere" => self.cohere.model.as_deref(),
-            "perplexity" => self.perplexity.model.as_deref(),
-            "together" => self.together.model.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
-            _ => None,
-        }
+        self.provider_config(provider)?.model.as_deref()
     }
 
     /// Get the base URL for the active provider.
     pub fn active_base_url(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.base_url.as_deref(),
-            "openai" => self.openai.base_url.as_deref(),
-            "qwen" => self.qwen.base_url.as_deref(),
-            "deepseek" => self.deepseek.base_url.as_deref(),
-            "openrouter" => self.openrouter.base_url.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.base_url.as_deref()
-            }
-            "gemini" => self.gemini.base_url.as_deref(),
-            "groq" => self.groq.base_url.as_deref(),
-            "ollama" => self.ollama.base_url.as_deref(),
-            "mistral" => self.mistral.base_url.as_deref(),
-            "xai" | "grok" => self.xai.base_url.as_deref(),
-            "cohere" => self.cohere.base_url.as_deref(),
-            "perplexity" => self.perplexity.base_url.as_deref(),
-            "together" => self.together.base_url.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
-            _ => None,
-        }
+        let id = self.active_provider()?;
+        self.provider_config(id)?.base_url.as_deref()
     }
 
     /// Get the base URL for a specific provider by name.
     pub fn base_url_for_provider(&self, provider: &str) -> Option<&str> {
-        match provider {
-            "anthropic" => self.anthropic.base_url.as_deref(),
-            "openai" => self.openai.base_url.as_deref(),
-            "qwen" => self.qwen.base_url.as_deref(),
-            "deepseek" => self.deepseek.base_url.as_deref(),
-            "openrouter" => self.openrouter.base_url.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.base_url.as_deref()
-            }
-            "gemini" => self.gemini.base_url.as_deref(),
-            "groq" => self.groq.base_url.as_deref(),
-            "ollama" => self.ollama.base_url.as_deref(),
-            "mistral" => self.mistral.base_url.as_deref(),
-            "xai" | "grok" => self.xai.base_url.as_deref(),
-            "cohere" => self.cohere.base_url.as_deref(),
-            "perplexity" => self.perplexity.base_url.as_deref(),
-            "together" => self.together.base_url.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
-            _ => None,
-        }
+        self.provider_config(provider)?.base_url.as_deref()
     }
 
     /// Get use_streaming for the active provider. Defaults to true.
@@ -944,30 +856,12 @@ impl LlmConfig {
     }
 
     /// Get use_streaming for a specific provider.
-    /// Defaults to `false` for providers that don't support streaming (Qwen, Ollama),
+    /// Defaults to `false` for providers that don't support streaming (Ollama),
     /// `true` for all others.
     pub fn use_streaming_for_provider(&self, provider: &str) -> bool {
-        let value = match provider {
-            "anthropic" => self.anthropic.use_streaming,
-            "openai" => self.openai.use_streaming,
-            "qwen" => self.qwen.use_streaming,
-            "deepseek" => self.deepseek.use_streaming,
-            "openrouter" => self.openrouter.use_streaming,
-            "claude-code" | "claude_code" => self.claude_code.use_streaming,
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.use_streaming,
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => self.antigravity.use_streaming,
-            "gemini" => self.gemini.use_streaming,
-            "groq" => self.groq.use_streaming,
-            "ollama" => self.ollama.use_streaming,
-            "mistral" => self.mistral.use_streaming,
-            "xai" | "grok" => self.xai.use_streaming,
-            "cohere" => self.cohere.use_streaming,
-            "perplexity" => self.perplexity.use_streaming,
-            "together" => self.together.use_streaming,
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.use_streaming,
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.use_streaming,
-            _ => None,
-        };
+        let value = self
+            .provider_config(provider)
+            .and_then(|pc| pc.use_streaming);
         // Providers that don't support streaming default to false
         let default = !matches!(provider, "ollama");
         value.unwrap_or(default)
@@ -1019,51 +913,18 @@ impl LlmConfig {
     ///
     /// Resolution order:
     /// 1. Provider-specific `context_window` from config
-    /// 2. Known default for the provider type
+    /// 2. Known default for the provider's wire protocol
     /// 3. Fallback: 128,000 tokens
     pub fn context_window(&self) -> u32 {
-        use nevoflux_llm::ProviderType;
-
-        // Check provider-specific config override
-        let provider_config_window = match self.active_provider() {
-            Some("anthropic") => self.anthropic.context_window,
-            Some("openai") => self.openai.context_window,
-            Some("qwen") => self.qwen.context_window,
-            Some("deepseek") => self.deepseek.context_window,
-            Some("claude-code") | Some("claude_code") => self.claude_code.context_window,
-            Some("gemini-cli") | Some("gemini_cli") => self.gemini_cli.context_window,
-            Some("antigravity") | Some("antigravity-cli") | Some("antigravity_cli") => {
-                self.antigravity.context_window
-            }
-            Some("gemini") => self.gemini.context_window,
-            Some("groq") => self.groq.context_window,
-            Some("ollama") => self.ollama.context_window,
-            Some("mistral") => self.mistral.context_window,
-            Some("xai") | Some("grok") => self.xai.context_window,
-            Some("cohere") => self.cohere.context_window,
-            Some("perplexity") => self.perplexity.context_window,
-            Some("together") => self.together.context_window,
-            Some("kimi-agent") | Some("kimi_agent") | Some("kimi") => {
-                self.kimi_agent.context_window
-            }
-            Some("openclaw") | Some("open_claw") | Some("open-claw") => {
-                self.openclaw.context_window
-            }
-            _ => None,
+        let Some(id) = self.active_provider() else {
+            return 128_000;
         };
-
-        if let Some(window) = provider_config_window {
+        if let Some(window) = self.provider_config(id).and_then(|pc| pc.context_window) {
             return window;
         }
-
-        // Fall back to known provider default
-        if let Some(provider_name) = self.active_provider() {
-            if let Ok(provider_type) = provider_name.parse::<ProviderType>() {
-                return nevoflux_llm::default_context_window_for(provider_type);
-            }
+        if let Some(wire) = self.resolve_wire(id) {
+            return nevoflux_llm::default_context_window_for(wire);
         }
-
-        // Ultimate fallback
         128_000
     }
 }
@@ -1930,6 +1791,96 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_custom_provider_active_lookups() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                model: Some("gpt-4o".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                context_window: Some(32_768),
+                use_streaming: Some(false),
+                add_dirs: None,
+            },
+        );
+        cfg.provider = Some("custom:my-llm".to_string());
+
+        assert_eq!(cfg.active_api_key(), Some("sk-1"));
+        assert_eq!(cfg.active_model(), Some("gpt-4o"));
+        assert_eq!(cfg.model_for_provider("custom:my-llm"), Some("gpt-4o"));
+        assert_eq!(cfg.active_base_url(), Some("https://x.test/v1"));
+        assert!(!cfg.active_use_streaming());
+        assert_eq!(cfg.context_window(), 32_768);
+    }
+
+    #[test]
+    fn test_custom_provider_keyless_uses_placeholder() {
+        let mut cfg = custom_cfg(
+            "local",
+            "Local",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:local".to_string());
+        // A local OpenAI-compatible server needs no key; the placeholder keeps
+        // the client builder happy the way ollama-local does.
+        assert_eq!(cfg.active_api_key(), Some("custom-local"));
+        // Streaming defaults on.
+        assert!(cfg.active_use_streaming());
+    }
+
+    #[test]
+    fn test_custom_provider_context_window_falls_back_to_wire_default() {
+        let mut cfg = custom_cfg(
+            "oai",
+            "OAI",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:oai".to_string());
+        assert_eq!(cfg.context_window(), 128_000);
+
+        cfg.custom.insert(
+            "ant".to_string(),
+            CustomProviderConfig {
+                display_name: "Ant".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig {
+                    base_url: Some("https://y.test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.provider = Some("custom:ant".to_string());
+        assert_eq!(cfg.context_window(), 200_000);
+    }
+
+    #[test]
+    fn test_generic_custom_base_url_is_not_mimo() {
+        // Guards spec risk 3: the MiMo Anthropic-compat heuristic must not fire
+        // for a user-supplied endpoint.
+        assert!(
+            !crate::wasm::llm::is_mimo_anthropic_compat_base_url_for_test(Some(
+                "https://gateway.mycorp.internal/anthropic"
+            ))
+        );
+        assert!(
+            crate::wasm::llm::is_mimo_anthropic_compat_base_url_for_test(Some(
+                "https://api.xiaomimimo.com/anthropic"
+            ))
+        );
+    }
 
     #[test]
     fn test_provider_config_parity_with_named_fields() {
