@@ -25,6 +25,7 @@ members = [
     "crates/computer",
     "crates/builtin-wasm",
     "crates/tts",
+    "crates/rtc-transport",
 ]
 # Evaluation harnesses (see experiments/README.md). Excluded rather than left
 # unlisted so the intent is on the record: they pull dependency trees that must

@@ -1,0 +1,20 @@
+[package]
+name = "nevoflux-rtc-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebRTC transport for NevoFlux remote sessions: signalling, peer connection, data channel"
+
+[dependencies]
+# Sans-IO WebRTC. Chosen over webrtc-rs because it ships a working, test-covered
+# GCC bandwidth estimator and a pacer; see experiments/str0m-bwe/README.md.
+str0m = { version = "0.22", default-features = false, features = ["aws-lc-rs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
