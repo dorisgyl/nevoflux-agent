@@ -262,14 +262,7 @@ impl PortalGateway {
                         id, offset, asked = length, served = bytes.len(), eof,
                         "asset range served"
                     );
-                    use base64::Engine;
-                    serde_json::json!({
-                        "kind": "asset_data",
-                        "id": id,
-                        "offset": offset,
-                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        "eof": eof,
-                    })
+                    super::asset::data_frame(id, offset, &bytes, eof)
                 }
                 Err(e) => {
                     tracing::warn!(target: "remote", id, error = %e, "asset pull refused");
@@ -369,8 +362,23 @@ impl PortalGateway {
     }
 
     /// Honor a portal `resume{from}` (called by the WS read loop).
+    ///
+    /// The session kept media frames as ranges rather than as bytes, so the
+    /// store is handed in to read them back. Cloned out of `self` first: the
+    /// closure runs while the session lock is held, and reaching through
+    /// `&self` there would nest an async lock inside a sync one.
     pub async fn resume(&self, from: u64) {
-        let wires = self.session.lock().await.on_resume(from);
+        let assets = std::sync::Arc::clone(&self.assets);
+        let wires = self
+            .session
+            .lock()
+            .await
+            .on_resume(from, |id, offset, len| {
+                let store = assets.lock().ok()?;
+                let bytes = store.read(id, offset, len).ok()?;
+                let eof = store.is_eof(id, offset, bytes.len());
+                Some((bytes, eof))
+            });
         for w in wires {
             self.sink.send(w).await;
         }

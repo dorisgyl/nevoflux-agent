@@ -17,7 +17,7 @@ use nevoflux_protocol::chat::SidebarMessage;
 use serde_json::Value;
 
 use super::crypto::{self, SealedFrame};
-use super::relay_protocol::{SendSequencer, WireMessage};
+use super::relay_protocol::{Resend, SendSequencer, WireMessage};
 use super::translate::{self, Translator};
 
 /// A WS message payload: text (plaintext mode) or binary (E2E-sealed).
@@ -110,14 +110,53 @@ impl PortalSession {
 
     /// Honor a `resume{from}`: resend the buffered tail, or (when the gap is
     /// older than the buffer) reset and emit a single `resync`.
-    pub fn on_resume(&mut self, from: u64) -> Vec<Wire> {
-        match self.sequencer.resend_from(from) {
-            Some(msgs) => msgs.iter().map(|w| self.encode(w)).collect(),
-            None => {
-                self.sequencer.reset();
-                vec![self.encode(&WireMessage::Resync)]
+    ///
+    /// Media frames are retained as a range rather than as their bytes, so
+    /// `read_media` supplies what the buffer deliberately did not keep: given
+    /// `(id, offset, len)` it returns the bytes and whether they end the asset.
+    /// Reading is IO and belongs to the caller, which owns the store — this
+    /// layer stays sans-IO.
+    ///
+    /// A range that cannot be read back forces a `resync`. Skipping it instead
+    /// would leave a hole the portal's in-order tracker waits on forever, which
+    /// is a worse failure than reloading the transcript.
+    pub fn on_resume(
+        &mut self,
+        from: u64,
+        read_media: impl Fn(&str, u64, usize) -> Option<(Vec<u8>, bool)>,
+    ) -> Vec<Wire> {
+        let Some(plan) = self.sequencer.resend_from(from) else {
+            self.sequencer.reset();
+            return vec![self.encode(&WireMessage::Resync)];
+        };
+
+        let mut out = Vec::with_capacity(plan.len());
+        for item in plan {
+            match item {
+                Resend::Ready(w) => out.push(self.encode(&w)),
+                Resend::Media {
+                    seq,
+                    id,
+                    offset,
+                    len,
+                } => {
+                    let Some((bytes, eof)) = read_media(&id, offset, len) else {
+                        tracing::warn!(
+                            target: "remote",
+                            %id, offset, len,
+                            "cannot re-read a media range for resume; resyncing"
+                        );
+                        self.sequencer.reset();
+                        return vec![self.encode(&WireMessage::Resync)];
+                    };
+                    out.push(self.encode(&WireMessage::Frame {
+                        seq: Some(seq),
+                        frame: super::asset::data_frame(&id, offset, &bytes, eof),
+                    }));
+                }
             }
         }
+        out
     }
 
     /// Open one inbound WS message.
@@ -272,23 +311,90 @@ mod tests {
         );
     }
 
+    /// A media reader that refuses everything — for resumes with no media in
+    /// them, where being asked at all would be the bug.
+    fn no_media(_: &str, _: u64, _: usize) -> Option<(Vec<u8>, bool)> {
+        panic!("this resume should not have needed any media bytes")
+    }
+
+    /// The decoded wire messages of a plaintext resume.
+    fn decoded(wires: &[Wire]) -> Vec<WireMessage> {
+        wires
+            .iter()
+            .map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<WireMessage>(t).unwrap(),
+                _ => panic!("plaintext expected"),
+            })
+            .collect()
+    }
+
+    fn seqs_of(wires: &[Wire]) -> Vec<u64> {
+        decoded(wires)
+            .into_iter()
+            .map(|m| match m {
+                WireMessage::Frame { seq: Some(n), .. } => n,
+                other => panic!("expected Frame, got {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn on_resume_resends_buffered_tail() {
         let mut s = PortalSession::new(None, None, None);
         s.on_chat(&chunk("a", false)); // seq 0 (start) + 1 (delta)
         s.on_chat(&chunk("", true)); // seq 2 (end)
-        let resent = s.on_resume(1);
-        let seqs: Vec<u64> = resent
-            .iter()
-            .map(|w| match w {
-                Wire::Text(t) => match serde_json::from_str::<WireMessage>(t).unwrap() {
-                    WireMessage::Frame { seq: Some(n), .. } => n,
-                    other => panic!("expected Frame, got {other:?}"),
-                },
-                _ => panic!("plaintext"),
-            })
-            .collect();
-        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(seqs_of(&s.on_resume(1, no_media)), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_resume_across_media_rebuilds_it_from_the_store() {
+        let mut s = PortalSession::new(None, None, None);
+        s.on_chat(&chunk("a", false)); // seq 0, 1
+        s.downlink_frame(super::super::asset::data_frame(
+            "asset-1",
+            4096,
+            &[9u8; 700],
+            false,
+        )); // seq 2
+
+        let wires = s.on_resume(1, |id, offset, len| {
+            assert_eq!((id, offset, len), ("asset-1", 4096, 700));
+            Some((vec![9u8; 700], true))
+        });
+
+        assert_eq!(seqs_of(&wires), vec![1, 2]);
+        let WireMessage::Frame { frame, .. } = &decoded(&wires)[1] else {
+            panic!("expected a frame");
+        };
+        // Rebuilt from the store, so it must arrive as a usable answer to the
+        // range the portal is still waiting on — same shape, same offset.
+        assert_eq!(frame.get("kind").unwrap(), "asset_data");
+        assert_eq!(frame.get("id").unwrap(), "asset-1");
+        assert_eq!(frame.get("offset").unwrap(), 4096);
+        assert_eq!(
+            frame.get("eof").unwrap(),
+            true,
+            "eof is recomputed at resend time, not remembered"
+        );
+    }
+
+    #[test]
+    fn media_bytes_that_are_gone_force_a_resync() {
+        // An adopted file can be deleted mid-session. Skipping the frame would
+        // leave a hole the portal's in-order tracker waits on forever.
+        let mut s = PortalSession::new(None, None, None);
+        s.on_chat(&chunk("a", false));
+        s.downlink_frame(super::super::asset::data_frame(
+            "gone", 0, &[1u8; 10], false,
+        ));
+
+        let wires = s.on_resume(0, |_, _, _| None);
+        assert_eq!(decoded(&wires), vec![WireMessage::Resync]);
+        assert_eq!(
+            s.sequencer.next_seq(),
+            0,
+            "a resync has to reset the counter, or the portal's reset to 0 desyncs us"
+        );
     }
 
     /// Wrap a business frame the way the portal sends one upstream.

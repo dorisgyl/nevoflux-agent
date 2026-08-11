@@ -41,6 +41,22 @@ pub const MAX_ADOPTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// with room for the envelope. Matches the phone's upload chunking.
 pub const CHUNK_BYTES: usize = 256 * 1024;
 
+/// The downlink frame carrying one range of an asset.
+///
+/// Shared by the pull path and the resume path rather than written out at each,
+/// so the two cannot drift. The portal matches a reply by id and offset; a
+/// resent frame differing in shape would be an answer it could not use.
+pub fn data_frame(id: &str, offset: u64, bytes: &[u8], eof: bool) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "kind": "asset_data",
+        "id": id,
+        "offset": offset,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "eof": eof,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
     #[error("no asset {0}")]
