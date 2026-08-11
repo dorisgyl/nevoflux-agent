@@ -490,6 +490,11 @@ pub struct LlmConfig {
     #[serde(default)]
     pub openclaw: ProviderConfig,
 
+    /// User-defined providers, keyed by the stable id that follows `custom:`
+    /// in [`LlmConfig::provider`]. See [`CustomProviderConfig`].
+    #[serde(default)]
+    pub custom: std::collections::BTreeMap<String, CustomProviderConfig>,
+
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -535,6 +540,54 @@ pub struct ProviderConfig {
     /// Defaults to `true` when not specified.
     #[serde(default)]
     pub use_streaming: Option<bool>,
+}
+
+/// Wire protocol a custom provider speaks.
+///
+/// Selects which existing client path in [`crate::wasm::llm`] builds the
+/// request. A custom provider never introduces a new transport — it reuses the
+/// Anthropic or OpenAI path with its own `base_url`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomWire {
+    /// OpenAI-compatible `/chat/completions`.
+    Openai,
+    /// Anthropic `/v1/messages`.
+    Anthropic,
+}
+
+impl CustomWire {
+    /// The `ProviderType` whose client path serves this wire.
+    pub fn provider_type(self) -> nevoflux_llm::ProviderType {
+        match self {
+            CustomWire::Openai => nevoflux_llm::ProviderType::OpenAi,
+            CustomWire::Anthropic => nevoflux_llm::ProviderType::Anthropic,
+        }
+    }
+}
+
+/// A user-defined provider.
+///
+/// `base` carries everything a builtin provider has, flattened into the same
+/// TOML table so `[llm.custom.my-llm]` stays hand-editable. Holding a real
+/// [`ProviderConfig`] (rather than duplicating its fields) is what lets
+/// [`LlmConfig::provider_config`] return a borrow for builtin and custom
+/// providers alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    /// Name shown in the UI. Freely editable; never used as an identity.
+    pub display_name: String,
+
+    /// Which wire protocol this endpoint speaks.
+    pub wire: CustomWire,
+
+    /// Card accent colour as `#rrggbb`. `None` renders the default surface.
+    #[serde(default)]
+    pub accent: Option<String>,
+
+    /// Key, model, base URL, context window and streaming flag.
+    #[serde(flatten)]
+    pub base: ProviderConfig,
 }
 
 /// Providers that delegate the turn to an external agent over ACP, so their
@@ -945,6 +998,7 @@ impl Default for LlmConfig {
             together: ProviderConfig::default(),
             kimi_agent: ProviderConfig::default(),
             openclaw: ProviderConfig::default(),
+            custom: std::collections::BTreeMap::new(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),
@@ -1782,6 +1836,98 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_custom_provider_toml_round_trip() {
+        let mut config = LlmConfig::default();
+        config.provider = Some("custom:my-llm".to_string());
+        config.custom.insert(
+            "my-llm".to_string(),
+            CustomProviderConfig {
+                display_name: "My LLM".to_string(),
+                wire: CustomWire::Openai,
+                accent: Some("#7c5cff".to_string()),
+                base: ProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    model: Some("gpt-4o".to_string()),
+                    context_window: Some(32_768),
+                    add_dirs: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    use_streaming: Some(true),
+                },
+            },
+        );
+        config.custom.insert(
+            "local".to_string(),
+            CustomProviderConfig {
+                display_name: "\u{672c}\u{5730}\u{7ad9}".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig {
+                    api_key: None,
+                    model: None,
+                    context_window: None,
+                    add_dirs: None,
+                    base_url: Some("http://127.0.0.1:8080".to_string()),
+                    use_streaming: None,
+                },
+            },
+        );
+
+        let serialized =
+            toml::to_string(&config).expect("serialize LlmConfig with custom providers");
+        let parsed: LlmConfig = toml::from_str(&serialized).expect("reparse LlmConfig");
+
+        assert_eq!(parsed.custom.len(), 2);
+        let mine = parsed
+            .custom
+            .get("my-llm")
+            .expect("my-llm survives round trip");
+        assert_eq!(mine.display_name, "My LLM");
+        assert_eq!(mine.wire, CustomWire::Openai);
+        assert_eq!(mine.accent.as_deref(), Some("#7c5cff"));
+        assert_eq!(mine.base.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(mine.base.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(mine.base.context_window, Some(32_768));
+        assert_eq!(
+            mine.base.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(mine.base.use_streaming, Some(true));
+
+        let local = parsed
+            .custom
+            .get("local")
+            .expect("local survives round trip");
+        assert_eq!(local.display_name, "\u{672c}\u{5730}\u{7ad9}");
+        assert_eq!(local.wire, CustomWire::Anthropic);
+        assert_eq!(local.accent, None);
+        assert_eq!(local.base.api_key, None);
+        assert_eq!(
+            local.base.base_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+
+        // The flattened fields must sit directly under the provider table, not
+        // in a nested [custom.my-llm.base] table.
+        assert!(
+            serialized.contains("[custom.my-llm]"),
+            "actual:\n{serialized}"
+        );
+        assert!(
+            !serialized.contains("base]"),
+            "flatten regressed:\n{serialized}"
+        );
+    }
+
+    #[test]
+    fn test_custom_provider_absent_by_default() {
+        let config = LlmConfig::default();
+        assert!(config.custom.is_empty());
+        let serialized = toml::to_string(&config).expect("serialize default LlmConfig");
+        let parsed: LlmConfig = toml::from_str(&serialized).expect("reparse default");
+        assert!(parsed.custom.is_empty());
+    }
 
     #[test]
     fn test_daemon_config_default() {
