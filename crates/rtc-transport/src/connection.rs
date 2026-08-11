@@ -14,6 +14,7 @@
 
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::channel::ChannelId;
+use str0m::media::{Direction, MediaKind, Mid};
 use str0m::{Rtc, RtcError};
 
 use crate::signal::{SignalFrame, SignalGuard, SignalRefused};
@@ -56,6 +57,8 @@ pub struct RtcEndpoint {
     guard: SignalGuard,
     pending: Option<SdpPendingOffer>,
     channel: Option<ChannelId>,
+    want_video: bool,
+    video: Option<Mid>,
 }
 
 impl RtcEndpoint {
@@ -72,13 +75,44 @@ impl RtcEndpoint {
     pub fn new(sealed: bool, now: std::time::Instant) -> Self {
         let rtc = Rtc::builder()
             .enable_bwe(Some(str0m::bwe::Bitrate::bps(INITIAL_BITRATE_BPS)))
+            // H.264 only. It is the one codec every phone this targets can
+            // decode in hardware, and the capture path encodes nothing else —
+            // offering VP8 as well would invite a negotiation this end cannot
+            // then satisfy.
+            .enable_h264(true)
+            .enable_vp8(false)
+            .enable_opus(false)
             .build(now);
         Self {
             rtc,
             guard: SignalGuard::new(sealed),
             pending: None,
             channel: None,
+            want_video: false,
+            video: None,
         }
+    }
+
+    /// Ask for a send-only video track on the next offer.
+    ///
+    /// Records the intent rather than acting on it. A `str0m` change set only
+    /// exists until it is applied, and applying one here would mean a second
+    /// offer/answer to add the track — a full exchange over the relay before
+    /// the first frame could move. Both go out together instead.
+    ///
+    /// Opt-in because a session that only moves files should not negotiate a
+    /// track it will never write to: an unused m-line still costs an SSRC,
+    /// RTCP traffic and a keepalive on both ends.
+    pub fn want_video(&mut self) {
+        self.want_video = true;
+    }
+
+    /// The video track, once the offer has been made.
+    ///
+    /// `None` before then, because the mid does not exist until the change set
+    /// is applied.
+    pub fn video_mid(&self) -> Option<Mid> {
+        self.video
     }
 
     /// Open the data channel and produce the offer to send.
@@ -90,6 +124,16 @@ impl RtcEndpoint {
 
         let mut api = self.rtc.sdp_api();
         let channel = api.add_channel(DATA_CHANNEL_LABEL.to_string());
+        // Same change set as the channel, so one exchange covers both.
+        let video = self.want_video.then(|| {
+            api.add_media(
+                MediaKind::Video,
+                Direction::SendOnly,
+                Some("nevoflux".into()),
+                Some("screen".into()),
+                None,
+            )
+        });
         let (offer, pending) = api.apply().ok_or_else(|| {
             // `apply` returns None when the change set is empty, which cannot
             // happen directly after adding a channel — but a silent `?` here
@@ -98,6 +142,7 @@ impl RtcEndpoint {
         })?;
 
         self.channel = Some(channel);
+        self.video = video;
         self.pending = Some(pending);
         Ok(SignalFrame::RtcOffer {
             sdp: offer.to_sdp_string(),

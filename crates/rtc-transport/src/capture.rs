@@ -606,3 +606,158 @@ mod tests {
         assert!(!is_keyframe(b"no start code here"));
     }
 }
+
+/// The 90 kHz clock every H.264 RTP stream is timed against.
+pub const VIDEO_CLOCK_HZ: u64 = 90_000;
+
+/// The RTP timestamp for a frame this far into the capture.
+///
+/// Derived from elapsed time rather than counted in frames: a capture that
+/// drops one — and every screen capture drops some, because nothing changed or
+/// the encoder was behind — would otherwise slew permanently ahead of the clock
+/// and the far end would play the whole session progressively out of time.
+pub fn rtp_time(elapsed: Duration) -> u64 {
+    (elapsed.as_nanos() * VIDEO_CLOCK_HZ as u128 / 1_000_000_000u128) as u64
+}
+
+#[cfg(feature = "tokio-driver")]
+pub use spawn::{run_capture, CaptureHandle};
+
+#[cfg(feature = "tokio-driver")]
+mod spawn {
+    use super::*;
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+
+    /// One encoded frame, ready for the track.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Frame {
+        pub data: Vec<u8>,
+        /// Since capture began, for [`rtp_time`].
+        pub elapsed: Duration,
+        pub keyframe: bool,
+    }
+
+    /// A running capture. Dropping it stops ffmpeg.
+    pub struct CaptureHandle {
+        child: tokio::process::Child,
+    }
+
+    impl CaptureHandle {
+        /// Stop capturing.
+        ///
+        /// Killed rather than asked politely: ffmpeg reading a capture device
+        /// does not always notice a closed stdout, and a screencast that keeps
+        /// running after the session ended is both a privacy problem and a core
+        /// burning for nobody.
+        pub async fn stop(mut self) {
+            let _ = self.child.kill().await;
+        }
+    }
+
+    /// Start capturing the desktop, delivering access units as they are encoded.
+    ///
+    /// `ffmpeg` is the binary to run — passed in rather than found here, so a
+    /// build that bundles it and one that relies on PATH share this.
+    pub async fn run_capture(
+        ffmpeg: &std::path::Path,
+        cfg: CaptureConfig,
+        frames: mpsc::Sender<Frame>,
+    ) -> std::io::Result<CaptureHandle> {
+        let args = ffmpeg_args(Platform::host(), &cfg);
+        tracing::info!(target: "rtc", "starting capture: {} {}", ffmpeg.display(), args.join(" "));
+
+        let mut child = tokio::process::Command::new(ffmpeg)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()?;
+
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        // Drained on its own task. ffmpeg writes progress and warnings here, and
+        // a full stderr pipe blocks the encoder — which looks exactly like a
+        // capture that mysteriously stops after a few seconds.
+        if let Some(mut stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf).await;
+                if !buf.trim().is_empty() {
+                    tracing::warn!(target: "rtc", "ffmpeg: {}", buf.trim());
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut reader = AnnexBReader::new();
+            let mut buf = vec![0u8; 64 * 1024];
+
+            loop {
+                let n = match stdout.read(&mut buf).await {
+                    Ok(0) => break, // ffmpeg exited
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(target: "rtc", "capture read failed: {e}");
+                        break;
+                    }
+                };
+                for unit in reader.push(&buf[..n]) {
+                    let frame = Frame {
+                        keyframe: is_keyframe(&unit),
+                        data: unit,
+                        elapsed: started.elapsed(),
+                    };
+                    if frames.send(frame).await.is_err() {
+                        return; // nobody is watching any more
+                    }
+                }
+            }
+            if let Some(unit) = reader.flush() {
+                let _ = frames
+                    .send(Frame {
+                        keyframe: is_keyframe(&unit),
+                        data: unit,
+                        elapsed: started.elapsed(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(CaptureHandle { child })
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn rtp_time_runs_at_ninety_kilohertz() {
+        assert_eq!(rtp_time(Duration::ZERO), 0);
+        assert_eq!(rtp_time(Duration::from_secs(1)), 90_000);
+        assert_eq!(rtp_time(Duration::from_millis(33)), 2_970);
+    }
+
+    #[test]
+    fn a_dropped_frame_does_not_slew_the_clock() {
+        // The reason this is derived from elapsed time and not a frame counter.
+        // Every screen capture drops frames — nothing changed, or the encoder
+        // was behind — and counting them would put the whole session
+        // progressively out of time with no single moment where it broke.
+        let at_one_second = rtp_time(Duration::from_secs(1));
+        // Ten frames of a 30 fps capture never arrived; the eleventh is still
+        // stamped for where it actually is.
+        assert_eq!(at_one_second, 90_000);
+        assert_eq!(rtp_time(Duration::from_secs(2)) - at_one_second, 90_000);
+    }
+
+    #[test]
+    fn the_clock_survives_a_long_session() {
+        // u64 at 90 kHz overflows after six million years; u32 would wrap in
+        // thirteen hours, which a screencast can reach.
+        let day = rtp_time(Duration::from_secs(60 * 60 * 24));
+        assert_eq!(day, 90_000 * 60 * 60 * 24);
+    }
+}

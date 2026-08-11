@@ -119,6 +119,12 @@ pub enum DriverEvent {
     ChannelOpen(ChannelId),
     /// Bytes arrived on the data channel.
     Data { binary: bool, data: Vec<u8> },
+    /// An encoded video frame arrived. Only the receiving end sees these.
+    Video { keyframe: bool, data: Vec<u8> },
+    /// The far end cannot draw anything until it gets a keyframe — it just
+    /// joined, or it lost one. Answered by asking the encoder for an IDR rather
+    /// than waiting out the GOP, which is up to two seconds of nothing.
+    KeyframeWanted,
     /// The connection is over. The session falls back to the relay path.
     Closed,
 }
@@ -137,6 +143,11 @@ pub fn classify(event: Event) -> Option<DriverEvent> {
             data: d.data,
         }),
         Event::ChannelClose(_) => Some(DriverEvent::Closed),
+        Event::MediaData(d) => Some(DriverEvent::Video {
+            keyframe: crate::capture::is_keyframe(&d.data),
+            data: d.data.to_vec(),
+        }),
+        Event::KeyframeRequest(_) => Some(DriverEvent::KeyframeWanted),
         _ => None,
     }
 }
@@ -334,5 +345,104 @@ mod tests {
             )),
             None
         );
+    }
+}
+
+/// Put one encoded access unit on the video track.
+///
+/// `false` when the track is not writable yet — before the answer, or after the
+/// connection went. Ordinary rather than exceptional: capture starts as soon as
+/// the user asks and the connection takes a moment, and dropping those first
+/// frames is correct. They are stale by the time anyone could see them.
+pub fn send_video(
+    rtc: &mut Rtc,
+    mid: str0m::media::Mid,
+    elapsed: std::time::Duration,
+    data: &[u8],
+) -> bool {
+    let Some(writer) = rtc.writer(mid) else {
+        return false;
+    };
+    // The payload type is whatever the two ends settled on for H.264. Asking
+    // the writer rather than assuming means a renegotiation that moves it does
+    // not silently produce a stream the far end discards.
+    let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
+        return false;
+    };
+    let time = str0m::media::MediaTime::new(
+        crate::capture::rtp_time(elapsed),
+        str0m::media::Frequency::new(crate::capture::VIDEO_CLOCK_HZ as u32)
+            .expect("90kHz is a valid frequency"),
+    );
+    writer
+        .write(pt, std::time::Instant::now(), time, data.to_vec())
+        .is_ok()
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+    use crate::connection::RtcEndpoint;
+    use crate::signal::SignalFrame;
+
+    #[test]
+    fn a_video_track_is_negotiated_alongside_the_data_channel() {
+        // One offer/answer for both. A second round trip to add the track would
+        // delay the first frame by the time of a full exchange over the relay.
+        let now = Instant::now();
+        let mut head = RtcEndpoint::new(true, now);
+        head.want_video();
+        let SignalFrame::RtcOffer { sdp } = head.offer().unwrap() else {
+            panic!("expected an offer");
+        };
+
+        assert!(sdp.contains("m=video"), "no video track in:\n{sdp}");
+        assert!(sdp.contains("webrtc-datachannel"), "no data channel");
+        assert!(
+            sdp.contains("H264") || sdp.contains("h264"),
+            "no H.264:\n{sdp}"
+        );
+        assert!(head.video_mid().is_some());
+    }
+
+    #[test]
+    fn only_h264_is_offered_for_video() {
+        // The capture path encodes nothing else, so offering VP8 too would
+        // invite a negotiation this end could not then satisfy — the far end
+        // would wait for frames that never come.
+        let mut head = RtcEndpoint::new(true, Instant::now());
+        head.want_video();
+        let SignalFrame::RtcOffer { sdp } = head.offer().unwrap() else {
+            panic!("expected an offer");
+        };
+        assert!(!sdp.to_uppercase().contains("VP8"), "VP8 offered:\n{sdp}");
+    }
+
+    #[test]
+    fn a_session_that_wants_no_video_negotiates_none() {
+        // An unused m-line still costs an SSRC, RTCP and a keepalive on both
+        // ends, so a file-only session must not carry one.
+        let mut head = RtcEndpoint::new(true, Instant::now());
+        let SignalFrame::RtcOffer { sdp } = head.offer().unwrap() else {
+            panic!("expected an offer");
+        };
+        assert!(!sdp.contains("m=video"), "video offered unasked:\n{sdp}");
+        assert_eq!(head.video_mid(), None);
+    }
+
+    #[test]
+    fn writing_video_before_the_track_is_live_is_a_no_and_not_a_panic() {
+        // Capture starts when the user asks; the connection takes a moment.
+        // Those first frames are stale by the time anyone could see them.
+        let mut head = RtcEndpoint::new(true, Instant::now());
+        head.want_video();
+        head.offer().unwrap();
+        let mid = head.video_mid().expect("the offer created the track");
+        assert!(!send_video(
+            head.rtc_mut(),
+            mid,
+            std::time::Duration::ZERO,
+            &[0, 0, 0, 1, 5, 9, 9]
+        ));
     }
 }

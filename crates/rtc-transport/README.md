@@ -36,7 +36,9 @@ the same way: `pump` is pure and testable by hand, `run` owns the socket.
 DTLS has to handshake and SCTP has to open, and SDP that looks plausible and
 never connects would pass everything else here. Two peers on real UDP sockets
 connect, the channel opens on both, and 3001 bytes of non-ASCII cross it intact
-in both directions.
+in both directions. An encoded H.264 access unit crosses the video track the
+same way and arrives marked as a keyframe — a track that negotiates and never
+delivers would pass every unit test in the crate.
 
 ### The property everything else rests on
 
@@ -60,8 +62,6 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **The media track.** `capture.rs` produces access units; nothing yet feeds
-  them to an RTP track or spawns the ffmpeg process that produces them.
 - **The fallback.** When no connection forms, the session has to stay on the
   relay path. That path exists and works; nothing routes between them yet.
 - **The portal side.** `RTCPeerConnection`, SDP exchange through the sealed
