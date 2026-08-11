@@ -1,0 +1,4 @@
+# Third-party source vendored by setup.sh. Not ours to commit; regenerate it.
+vendor/
+# A spike pins nothing for anyone else.
+Cargo.lock

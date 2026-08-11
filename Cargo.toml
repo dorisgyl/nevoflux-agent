@@ -26,6 +26,10 @@ members = [
     "crates/builtin-wasm",
     "crates/tts",
 ]
+# Evaluation harnesses (see experiments/README.md). Excluded rather than left
+# unlisted so the intent is on the record: they pull dependency trees that must
+# not reach the daemon's build graph.
+exclude = ["experiments"]
 
 [workspace.package]
 version = "0.3.14"
