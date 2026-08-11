@@ -1861,7 +1861,7 @@ pub async fn start_server(
             config.llm.active_api_key(),
             config.llm.active_model(),
         ) {
-            if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
+            if let Some(provider) = config.llm.resolve_wire(provider_str) {
                 let mut llm_config =
                     crate::wasm::services::LlmConfig::new(provider, api_key, model);
                 if let Some(base_url) = config.llm.active_base_url() {
@@ -10970,65 +10970,9 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
     },
 ];
 
-/// Get the ProviderConfig for a given provider id from the LlmConfig.
-fn get_provider_config<'a>(
-    llm: &'a crate::config::LlmConfig,
-    provider_id: &str,
-) -> Option<&'a crate::config::ProviderConfig> {
-    match provider_id {
-        "anthropic" => Some(&llm.anthropic),
-        "openai" => Some(&llm.openai),
-        "deepseek" => Some(&llm.deepseek),
-        "qwen" => Some(&llm.qwen),
-        "gemini" => Some(&llm.gemini),
-        "groq" => Some(&llm.groq),
-        "openrouter" => Some(&llm.openrouter),
-        "mistral" => Some(&llm.mistral),
-        "xai" => Some(&llm.xai),
-        "cohere" => Some(&llm.cohere),
-        "perplexity" => Some(&llm.perplexity),
-        "together" => Some(&llm.together),
-        "ollama" => Some(&llm.ollama),
-        "claude-code" | "claude_code" => Some(&llm.claude_code),
-        "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
-        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&llm.antigravity),
-        "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
-        "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
-        _ => None,
-    }
-}
-
 // Note: the "is any provider usable?" check lives on `LlmConfig` as
 // `has_any_configured_provider()` (see config.rs) so the daemon's `status`
 // handler and the proxy's early setup hint share one implementation.
-
-/// Get a mutable reference to the ProviderConfig for a given provider id.
-fn get_provider_config_mut<'a>(
-    llm: &'a mut crate::config::LlmConfig,
-    provider_id: &str,
-) -> Option<&'a mut crate::config::ProviderConfig> {
-    match provider_id {
-        "anthropic" => Some(&mut llm.anthropic),
-        "openai" => Some(&mut llm.openai),
-        "deepseek" => Some(&mut llm.deepseek),
-        "qwen" => Some(&mut llm.qwen),
-        "gemini" => Some(&mut llm.gemini),
-        "groq" => Some(&mut llm.groq),
-        "openrouter" => Some(&mut llm.openrouter),
-        "mistral" => Some(&mut llm.mistral),
-        "xai" => Some(&mut llm.xai),
-        "cohere" => Some(&mut llm.cohere),
-        "perplexity" => Some(&mut llm.perplexity),
-        "together" => Some(&mut llm.together),
-        "ollama" => Some(&mut llm.ollama),
-        "claude-code" | "claude_code" => Some(&mut llm.claude_code),
-        "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
-        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut llm.antigravity),
-        "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut llm.kimi_agent),
-        "openclaw" | "open_claw" | "open-claw" => Some(&mut llm.openclaw),
-        _ => None,
-    }
-}
 
 /// Handle config.llm.list command.
 ///
@@ -11046,10 +10990,8 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
     let providers: Vec<serde_json::Value> = PROVIDER_METAS
         .iter()
         .map(|meta| {
-            let provider_config = get_provider_config(&config.llm, meta.id);
-            let configured = provider_config
-                .map(|pc| pc.api_key.is_some())
-                .unwrap_or(false);
+            let provider_config = config.llm.provider_config(meta.id);
+            let configured = config.llm.is_provider_configured(meta.id);
             let is_active = active.as_deref() == Some(meta.id)
                 || (meta.id == "claude-code" && active.as_deref() == Some("claude_code"))
                 || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"))
@@ -11061,10 +11003,9 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
                         || active.as_deref() == Some("kimi")));
             let model = provider_config.and_then(|pc| pc.model.clone());
 
-            let default_model = meta
-                .id
-                .parse::<nevoflux_llm::ProviderType>()
-                .ok()
+            let default_model = config
+                .llm
+                .resolve_wire(meta.id)
                 .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
 
             serde_json::json!({
@@ -11125,7 +11066,7 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
     }
 
     let config = AgentConfig::load().unwrap_or_default();
-    let provider_config = match get_provider_config(&config.llm, provider_id) {
+    let provider_config = match config.llm.provider_config(provider_id) {
         Some(pc) => pc,
         None => {
             return serde_json::json!({
@@ -11152,14 +11093,14 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
         }
     });
 
-    let default_model = provider_id
-        .parse::<nevoflux_llm::ProviderType>()
-        .ok()
+    let default_model = config
+        .llm
+        .resolve_wire(provider_id)
         .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
 
-    let default_context_window = provider_id
-        .parse::<nevoflux_llm::ProviderType>()
-        .ok()
+    let default_context_window = config
+        .llm
+        .resolve_wire(provider_id)
         .map(|pt| nevoflux_llm::default_context_window_for(pt));
 
     let is_active = config.llm.active_provider() == Some(provider_id)
@@ -11245,7 +11186,7 @@ async fn handle_config_llm_set(
     };
 
     // Get mutable reference to the provider config
-    let provider_config = match get_provider_config_mut(&mut config.llm, provider_id) {
+    let provider_config = match config.llm.provider_config_mut(provider_id) {
         Some(pc) => pc,
         None => {
             return serde_json::json!({
@@ -11309,7 +11250,14 @@ async fn handle_config_llm_set(
             // subprocess at spawn. Drop the cached instance so the next chat
             // respawns with the just-saved settings — generic on purpose:
             // fixes the same staleness for gemini-cli/claude-code too.
-            if let Ok(pt) = provider_id.parse::<nevoflux_llm::ProviderType>() {
+            // Custom providers are direct-API only and never own an ACP cache
+            // entry, so they are skipped — otherwise a custom provider would
+            // evict the builtin entry its wire resolves to.
+            if let Some(pt) = crate::config::custom_id(provider_id)
+                .is_none()
+                .then(|| provider_id.parse::<nevoflux_llm::ProviderType>().ok())
+                .flatten()
+            {
                 let key = format!("{:?}", pt);
                 let acp = crate::wasm::llm::acp_providers().clone();
                 tokio::spawn(async move {

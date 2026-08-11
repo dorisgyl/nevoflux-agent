@@ -8,7 +8,6 @@ use crate::context::ContextMessage;
 use crate::error::{DaemonError, Result};
 use crate::wasm::llm::{execute_llm_chat, LlmChatRequest, LlmMessage};
 use nevoflux_llm::ProviderType;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -175,7 +174,7 @@ async fn generate_summary(config: &AgentConfig, messages: &[ContextMessage]) -> 
             let active_provider = config
                 .llm
                 .active_provider()
-                .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
+                .and_then(|p| config.llm.resolve_wire(p));
             if active_provider == Some(provider) {
                 active_model
             } else {
@@ -313,7 +312,7 @@ pub fn get_summarization_provider(
     let provider = config
         .llm
         .active_provider()
-        .and_then(|p| ProviderType::from_str(p).ok())
+        .and_then(|p| config.llm.resolve_wire(p))
         .unwrap_or_else(|| {
             // Fallback: infer from model name (only when no active provider)
             if model.starts_with("gpt-") || model.starts_with("o1") {

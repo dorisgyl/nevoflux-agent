@@ -108,28 +108,18 @@ struct LlmProviderSnapshot {
 /// the default protocol (Anthropic), which then falls through to the
 /// built-in defaults inside [`resolve_upstream_config`].
 fn read_llm_provider_section(llm: &LlmConfig, provider: &str) -> LlmProviderSnapshot {
-    let protocol = UpstreamProtocol::from_provider_name(provider);
-    let sub = match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => Some(&llm.anthropic),
-        "openai" => Some(&llm.openai),
-        "qwen" => Some(&llm.qwen),
-        "deepseek" => Some(&llm.deepseek),
-        "openrouter" => Some(&llm.openrouter),
-        "claude-code" | "claude_code" => Some(&llm.claude_code),
-        "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
-        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&llm.antigravity),
-        "gemini" => Some(&llm.gemini),
-        "groq" => Some(&llm.groq),
-        "ollama" => Some(&llm.ollama),
-        "mistral" => Some(&llm.mistral),
-        "xai" | "grok" => Some(&llm.xai),
-        "cohere" => Some(&llm.cohere),
-        "perplexity" => Some(&llm.perplexity),
-        "together" => Some(&llm.together),
-        "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
-        "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
-        _ => None,
+    // A custom provider's protocol comes from its declared wire; builtin names
+    // map by convention. Without this a custom Anthropic-wire endpoint would be
+    // driven with the OpenAI-compatible handler.
+    let protocol = match crate::config::custom_id(provider) {
+        Some(_) => match llm.resolve_wire(provider) {
+            Some(nevoflux_llm::ProviderType::Anthropic) => UpstreamProtocol::Anthropic,
+            _ => UpstreamProtocol::OpenAi,
+        },
+        None => UpstreamProtocol::from_provider_name(provider),
     };
+    let lower = provider.to_ascii_lowercase();
+    let sub = llm.provider_config(&lower);
     let snapshot_base_url = match sub {
         Some(p) => p.base_url.clone().unwrap_or_default(),
         None => String::new(),
