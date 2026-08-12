@@ -798,6 +798,17 @@ impl LlmConfig {
             .collect()
     }
 
+    /// The provider to activate once `removed` is gone.
+    ///
+    /// Builtins are preferred in display order, then custom providers by id, so
+    /// deleting the active provider lands somewhere predictable rather than
+    /// dropping the user back into onboarding when an alternative exists.
+    pub fn fallback_provider_after_removing(&self, removed: &str) -> Option<String> {
+        self.all_provider_ids()
+            .into_iter()
+            .find(|id| id != removed && self.is_provider_configured(id))
+    }
+
     /// Returns `true` if at least one LLM provider is usable.
     ///
     /// A provider counts as usable when it has an explicit API key, or when a
@@ -1813,6 +1824,64 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_fallback_provider_after_removing() {
+        let mut cfg = custom_cfg(
+            "mine",
+            "Mine",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.anthropic.api_key = Some("sk-ant".to_string());
+        // Builtins are preferred, in display order.
+        assert_eq!(
+            cfg.fallback_provider_after_removing("custom:mine")
+                .as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn test_fallback_provider_none_left() {
+        let cfg = custom_cfg(
+            "only",
+            "Only",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.fallback_provider_after_removing("custom:only"), None);
+    }
+
+    #[test]
+    fn test_fallback_prefers_another_custom_when_no_builtin() {
+        let mut cfg = LlmConfig::default();
+        for id in ["aaa", "bbb"] {
+            cfg.custom.insert(
+                id.to_string(),
+                CustomProviderConfig {
+                    display_name: id.to_string(),
+                    wire: CustomWire::Openai,
+                    accent: None,
+                    base: ProviderConfig {
+                        base_url: Some("https://x.test/v1".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            cfg.fallback_provider_after_removing("custom:aaa")
+                .as_deref(),
+            Some("custom:bbb")
+        );
+    }
 
     #[test]
     fn test_custom_provider_counts_as_configured_without_key() {
