@@ -21,6 +21,15 @@ test:
 test-unit:
     cargo test --all --lib
 
+# Tests that only exist behind a non-default feature.
+#
+# `cargo test --all` uses default features, so these targets are never even
+# compiled by it — a signature change can break them and every other check stays
+# green. That happened once; this recipe is why it should not again.
+test-features:
+    cargo test -p nevoflux-rtc-transport --features tokio-driver
+    cargo test -p nevoflux-daemon --features webrtc --lib remote::
+
 # Run integration tests only
 test-integration:
     cargo test --all --test '*'
@@ -86,7 +95,7 @@ stop:
     cargo run -- --stop
 
 # Run all quality checks (fmt, lint, test)
-ci: fmt-check lint test
+ci: fmt-check lint test test-features
 
 # Watch for changes and run tests
 watch:

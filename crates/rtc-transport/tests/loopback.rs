@@ -97,6 +97,8 @@ async fn connect() -> (Peer, Peer) {
         head_sig_rx,
         // No relay: loopback has nothing to traverse.
         None,
+        // No screencast: these exercise the data channel.
+        None,
     ));
 
     // The answerer learns its channel id from the ChannelOpen event, so the id
@@ -112,6 +114,7 @@ async fn connect() -> (Peer, Peer) {
         portal_rx,
         portal_ev_tx,
         portal_sig_rx,
+        None,
         None,
     ));
 
@@ -301,6 +304,7 @@ async fn connect_with_video() -> (VideoPeer, Peer) {
         portal_rx,
         portal_ev_tx,
         sig_rx,
+        None,
         None,
     ));
 
