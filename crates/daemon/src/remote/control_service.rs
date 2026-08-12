@@ -142,6 +142,7 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         mode: Some(resolved.mode.clone()),
         execution_tier: Some(resolved.execution_tier.clone()),
         injector_proxy_id: INJECTOR_PROXY_ID.to_string(),
+        ice_servers: cfg.remote_control.ice_servers.clone(),
     };
     let gateway = super::start::open_channel(req, &deps.registry, &deps.msg_tx)
         .await

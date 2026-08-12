@@ -27,6 +27,8 @@ declared-SSRC track, which silently kills all receive-side feedback.
 | `driver.rs` | The pump, and a tokio loop that owns a socket (`tokio-driver`) |
 | `capture.rs` | ffmpeg capture+encode arguments for all three platforms, and the Annex-B reader |
 | `ice.rs` | STUN/TURN configuration, validated when it is read rather than when a call fails |
+| `gather.rs` | Asking a STUN server for the reflexive address, and a TURN server for a relay |
+| `stun_wire.rs` | Reading server replies — see below for why `is::stun::parse` cannot |
 
 The first two are sans-IO and unit-tested, including a negotiation between two
 endpoints passing nothing but serialized `SignalFrame`s. `driver.rs` is split
@@ -62,13 +64,15 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **Proof on a real network.** Everything here is exercised on loopback, where
-  there is no NAT to traverse. Hole-punching, and how often it fails, can only
-  be measured between two machines on different networks.
-- **STUN/TURN gathering.** `ice.rs` validates the configuration and the driver
-  accepts trickled candidates, but nothing yet asks a STUN server for a
-  reflexive address or allocates a TURN relay — so today only host candidates
-  are offered, which works on a LAN and not across the internet.
+- **Relaying through TURN.** `gather::allocate` performs the allocation, but
+  nothing yet routes traffic through the relay — a relayed candidate has to be
+  wrapped in ChannelData or Send indications on the way out and unwrapped on the
+  way in, and until that exists advertising one would be offering a path that
+  cannot carry anything. So today: host and reflexive candidates.
+- **Proof between two networks.** Loopback proves the driver; the live STUN test
+  proves this machine can learn its public address. Whether hole-punching
+  actually succeeds, and how often, can only be measured phone-to-machine across
+  real NATs.
 
 The channel payloads, at least, need no new protocol.
 `crates/daemon/src/remote/media_frame.rs` already frames a range as bytes and
@@ -119,13 +123,26 @@ development box, where the Tesla T4 is passthrough and headless (MCDM) so there
 is no desktop for DXGI Desktop Duplication to copy. That needs a machine with a
 real display output, per platform.
 
-### TURN
+### Reading server replies
 
-`ice.rs` validates configuration and reports whether a deployment can relay at
-all. It picks no provider — which service, at what cost, with credentials issued
-how, are deployment questions, and answering them in code answers them for every
-deployment. An empty list is legal and means host candidates only.
+`is` is an ICE implementation, and inside ICE every binding message carries
+MESSAGE-INTEGRITY — so its parser *rejects* a binding response without one. A
+public STUN server answering an unauthenticated query sends exactly that, which
+makes the one reply this code exists to read the one `is` will not accept.
+Requests are still built with `is`; replies are read by `stun_wire`, where the
+strictness matches what servers actually send.
 
-Worth knowing before shipping: STUN alone works perfectly in testing and fails
-for roughly a fifth of real users, because a symmetric NAT makes a reflexive
-address useless to the far end. `can_relay` exists to make that checkable.
+### STUN and TURN
+
+Configured under `[remote_control] ice_servers` and validated when read, not
+when a call fails — a typo'd URL discovered at connect time is a session that
+silently fails for the one user whose network needed it.
+
+Empty means host candidates only, which reaches a phone on the same network and
+nothing else. A deployment meant to work over the internet needs at least a STUN
+server; TURN covers the rest, and `can_relay` reports whether a configuration
+has one, because STUN alone works perfectly in testing and fails for roughly a
+fifth of real users.
+
+No provider is chosen here. Which service, at what cost, with credentials issued
+how, are deployment questions.

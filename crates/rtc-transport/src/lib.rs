@@ -37,8 +37,10 @@
 pub mod capture;
 pub mod connection;
 pub mod driver;
+pub mod gather;
 pub mod ice;
 pub mod signal;
+pub mod stun_wire;
 
 /// Signalling is refused on a channel with no key. See [`signal::SignalGuard`].
 ///

@@ -28,6 +28,13 @@ pub struct ChannelRequest {
     pub execution_tier: Option<String>,
     /// Proxy id injected messages are stamped with.
     pub injector_proxy_id: String,
+    /// STUN/TURN servers for the peer-to-peer media path.
+    ///
+    /// Empty means host candidates only, which reaches a phone on the same
+    /// network and nothing else — so a deployment meant to work across the
+    /// internet has to configure at least a STUN server.
+    #[allow(dead_code)] // read only under the `webrtc` feature
+    pub ice_servers: Vec<crate::config::IceServerConfig>,
 }
 
 /// Why a channel could not be opened.
@@ -132,7 +139,8 @@ pub async fn open_channel_with_token(
             req.execution_tier.clone(),
             &req.channel_id,
         )
-        .with_media_sink(media_sink.clone()),
+        .with_media_sink(media_sink.clone())
+        .with_ice_servers(req.ice_servers.clone()),
     );
     registry.lock().await.register(gateway.clone());
     gateway.spawn_pump().await;
@@ -190,6 +198,7 @@ mod tests {
             mode: Some("agent".into()),
             execution_tier: Some("full-auto".into()),
             injector_proxy_id: "remote-control".into(),
+            ice_servers: Vec::new(),
         }
     }
 

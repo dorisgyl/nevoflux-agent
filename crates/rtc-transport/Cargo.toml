@@ -14,6 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+hmac = "0.12"
+sha1 = "0.10"
+md5 = "0.7"
 
 [features]
 # The socket-owning event loop. Off by default so the protocol logic can be

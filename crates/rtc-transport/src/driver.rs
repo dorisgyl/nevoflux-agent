@@ -468,3 +468,18 @@ mod video_tests {
         ));
     }
 }
+
+/// Announce an address the outside world can reach this socket on.
+///
+/// `base` is the local address the mapping belongs to. ICE needs both: the
+/// reflexive address to give the far end, and the base to know which local
+/// socket a check on it should come from.
+pub fn add_reflexive_candidate(
+    rtc: &mut Rtc,
+    public: SocketAddr,
+    base: SocketAddr,
+) -> Result<(), RtcError> {
+    let c = Candidate::server_reflexive(public, base, Protocol::Udp).map_err(RtcError::from)?;
+    rtc.add_local_candidate(c);
+    Ok(())
+}

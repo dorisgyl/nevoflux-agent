@@ -420,3 +420,52 @@ async fn an_encoded_frame_reaches_the_far_end_as_video() {
     );
     assert!(!data.is_empty());
 }
+
+/// Ask a real STUN server on the internet what it sees.
+///
+/// Ignored by default — it needs the network and a public server, and a
+/// suite that fails on a train is a suite people stop trusting. Run it with
+/// `cargo test --features tokio-driver -- --ignored --nocapture` when
+/// verifying that a build can actually reach across a NAT.
+///
+/// This is the one thing loopback cannot establish: whether the reflexive
+/// address this machine advertises is real.
+#[tokio::test]
+#[ignore = "needs the internet"]
+async fn a_real_stun_server_reports_this_machine_s_public_address() {
+    use nevoflux_rtc_transport::gather;
+
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    let local = socket.local_addr().unwrap();
+
+    // Two, because one being down should not read as "no NAT traversal".
+    let servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+    let mut found = None;
+    for name in servers {
+        let Some(addr) = tokio::net::lookup_host(name)
+            .await
+            .ok()
+            .and_then(|mut a| a.next())
+        else {
+            eprintln!("{name}: does not resolve");
+            continue;
+        };
+        match gather::reflexive(&socket, addr).await {
+            Some(public) => {
+                eprintln!("{name} ({addr}) sees us as {public}");
+                found = Some(public);
+                break;
+            }
+            None => eprintln!("{name} ({addr}): no reply"),
+        }
+    }
+
+    let public = found.expect("no STUN server answered; check the network");
+    assert_ne!(
+        public.ip(),
+        local.ip(),
+        "the reflexive address equals the local one, so this machine is not \
+         behind a NAT and the test proves nothing about traversal"
+    );
+    assert!(!public.ip().is_loopback());
+}

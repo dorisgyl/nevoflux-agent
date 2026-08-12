@@ -80,6 +80,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: Some("browser".into()),
             execution_tier: Some("browser-auto".into()),
+            ..Default::default()
         };
         let r = resolve(&cfg, &no_env);
         assert_eq!(r.mode, "browser");
@@ -91,6 +92,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: Some("browser".into()),
             execution_tier: Some("browser-auto".into()),
+            ..Default::default()
         };
         let env = |k: &str| match k {
             "NEVOFLUX_REMOTE_MODE" => Some("chat".to_string()),
@@ -108,6 +110,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: Some("browser".into()),
             execution_tier: Some("browser-auto".into()),
+            ..Default::default()
         };
         let env = |k: &str| (k == "NEVOFLUX_REMOTE_MODE").then(|| "agent".to_string());
         let r = resolve(&cfg, &env);
@@ -120,6 +123,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: Some("supervisor".into()),
             execution_tier: None,
+            ..Default::default()
         };
         assert_eq!(resolve(&cfg, &no_env).mode, "chat");
     }
@@ -129,6 +133,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: None,
             execution_tier: Some("yolo".into()),
+            ..Default::default()
         };
         assert_eq!(resolve(&cfg, &no_env).execution_tier, "read-only");
     }
@@ -141,6 +146,7 @@ mod tests {
         let cfg = RemoteControlConfig {
             mode: Some("browser".into()),
             execution_tier: None,
+            ..Default::default()
         };
         let env = |k: &str| (k == "NEVOFLUX_REMOTE_MODE").then(String::new);
         assert_eq!(resolve(&cfg, &env).mode, "browser");

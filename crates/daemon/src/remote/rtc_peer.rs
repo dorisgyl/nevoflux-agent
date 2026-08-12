@@ -92,7 +92,11 @@ async fn outbound_ip() -> Option<std::net::IpAddr> {
 /// `None` when the channel is unsealed (the transport refuses — the relay could
 /// substitute both DTLS fingerprints) or when a socket cannot be bound. Both
 /// leave the session on the relay.
-pub async fn begin(sealed: bool, slot: &mut PeerSlot) -> Option<SignalFrame> {
+pub async fn begin(
+    sealed: bool,
+    ice_servers: &[crate::config::IceServerConfig],
+    slot: &mut PeerSlot,
+) -> Option<SignalFrame> {
     if matches!(slot, PeerSlot::Offered { .. } | PeerSlot::Running { .. }) {
         return None; // already negotiating
     }
@@ -119,6 +123,24 @@ pub async fn begin(sealed: bool, slot: &mut PeerSlot) -> Option<SignalFrame> {
         return None;
     }
 
+    // Then whatever the outside world sees. Gathered from *this* socket,
+    // because a NAT maps per source port and an address learned on another
+    // socket describes a pinhole nobody is listening behind. Done before the
+    // offer so the far end has somewhere to try immediately; a server that does
+    // not answer inside the timeout is simply left out.
+    let reflexive = gather_reflexive(&socket, ice_servers).await;
+    for public in reflexive {
+        if public == addr {
+            // A machine with a public address sees itself; offering the same
+            // address twice only gives the far end a duplicate to check.
+            continue;
+        }
+        match driver::add_reflexive_candidate(endpoint.rtc_mut(), public, addr) {
+            Ok(()) => tracing::info!(target: "rtc", %public, "advertising a reflexive address"),
+            Err(e) => tracing::debug!(target: "rtc", %public, "cannot advertise: {e}"),
+        }
+    }
+
     let offer = match endpoint.offer() {
         Ok(o) => o,
         Err(e) => {
@@ -134,6 +156,48 @@ pub async fn begin(sealed: bool, slot: &mut PeerSlot) -> Option<SignalFrame> {
         early: Vec::new(),
     };
     Some(offer)
+}
+
+/// Ask every configured STUN server what it sees.
+///
+/// Sequential rather than concurrent: they share one socket, and two
+/// outstanding queries would race for each other's replies. Two servers at two
+/// seconds each is the worst case, and one is the normal configuration.
+///
+/// A TURN server is also a STUN server, so `turn:` URLs are queried too — it
+/// costs one round trip and often means no relay is needed at all.
+async fn gather_reflexive(
+    socket: &UdpSocket,
+    servers: &[crate::config::IceServerConfig],
+) -> Vec<std::net::SocketAddr> {
+    let mut out = Vec::new();
+    for s in servers {
+        let Some(addr) = resolve(&s.url).await else {
+            continue;
+        };
+        if let Some(public) = nevoflux_rtc_transport::gather::reflexive(socket, addr).await {
+            if !out.contains(&public) {
+                out.push(public);
+            }
+        }
+    }
+    out
+}
+
+/// Turn a `stun:`/`turn:` URL into an address to send to.
+///
+/// DNS, because these are configured as hostnames and a STUN service commonly
+/// resolves to several addresses behind one name.
+async fn resolve(url: &str) -> Option<std::net::SocketAddr> {
+    let rest = url.split_once(':').map(|(_, r)| r)?;
+    let host_port = rest.split(['?', '/']).next()?;
+    // A bare host means the default STUN port.
+    let with_port = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:3478")
+    };
+    tokio::net::lookup_host(with_port).await.ok()?.next()
 }
 
 /// Take one signalling frame from the portal.
@@ -244,26 +308,26 @@ mod tests {
         // The relay could substitute both DTLS fingerprints, so the transport
         // refuses and the session stays where it is.
         let mut slot = PeerSlot::Idle;
-        assert!(begin(false, &mut slot).await.is_none());
+        assert!(begin(false, &[], &mut slot).await.is_none());
         assert!(matches!(slot, PeerSlot::Idle));
     }
 
     #[tokio::test]
     async fn a_sealed_channel_offers_once() {
         let mut slot = PeerSlot::Idle;
-        let offer = begin(true, &mut slot).await.expect("should offer");
+        let offer = begin(true, &[], &mut slot).await.expect("should offer");
         assert!(matches!(offer, SignalFrame::RtcOffer { .. }));
         assert!(matches!(slot, PeerSlot::Offered { .. }));
 
         // A second attempt while one is outstanding would strand the first
         // connection's socket and confuse the portal with two offers.
-        assert!(begin(true, &mut slot).await.is_none());
+        assert!(begin(true, &[], &mut slot).await.is_none());
     }
 
     #[tokio::test]
     async fn the_offer_carries_a_reachable_address() {
         let mut slot = PeerSlot::Idle;
-        let SignalFrame::RtcOffer { sdp } = begin(true, &mut slot).await.unwrap() else {
+        let SignalFrame::RtcOffer { sdp } = begin(true, &[], &mut slot).await.unwrap() else {
             panic!("expected an offer");
         };
         assert!(sdp.contains("a=candidate:"), "no way in:\n{sdp}");
@@ -276,7 +340,7 @@ mod tests {
         // is routinely before its own answer arrives, and dropping them costs a
         // connection that would have formed on the first path tried.
         let mut slot = PeerSlot::Idle;
-        begin(true, &mut slot).await.unwrap();
+        begin(true, &[], &mut slot).await.unwrap();
         on_signal(
             SignalFrame::RtcCandidate {
                 candidate: "candidate:1 1 UDP 1 192.0.2.1 5000 typ host".into(),
@@ -311,7 +375,7 @@ mod tests {
     async fn a_junk_answer_leaves_the_session_on_the_relay() {
         let mut slot = PeerSlot::Idle;
         let s = state();
-        begin(true, &mut slot).await.unwrap();
+        begin(true, &[], &mut slot).await.unwrap();
         on_signal(
             SignalFrame::RtcAnswer {
                 sdp: "not sdp".into(),
@@ -321,14 +385,14 @@ mod tests {
         );
         assert_eq!(s.path(), Path::Relay);
         // And the slot is free, so a later attempt can still succeed.
-        assert!(begin(true, &mut slot).await.is_some());
+        assert!(begin(true, &[], &mut slot).await.is_some());
     }
 
     #[tokio::test]
     async fn a_close_puts_the_session_back_on_the_relay() {
         let mut slot = PeerSlot::Idle;
         let s = state();
-        begin(true, &mut slot).await.unwrap();
+        begin(true, &[], &mut slot).await.unwrap();
         s.set_path(Path::Forming);
         on_signal(
             SignalFrame::RtcClose { reason: None },
@@ -358,7 +422,7 @@ mod tests {
     async fn nothing_is_written_before_a_channel_exists() {
         let mut slot = PeerSlot::Idle;
         assert!(!slot.try_send(vec![1, 2, 3]));
-        begin(true, &mut slot).await.unwrap();
+        begin(true, &[], &mut slot).await.unwrap();
         assert!(!slot.try_send(vec![1, 2, 3]));
     }
 }

@@ -69,6 +69,9 @@ pub struct PortalGateway {
     /// Which path this session's media takes, and whether a peer connection is
     /// forming. Always `Relay` in a build without the `webrtc` feature.
     rtc: Arc<super::rtc::RtcState>,
+    /// STUN/TURN servers for the peer path. Empty means host candidates only,
+    /// which reaches a phone on the same network and nothing else.
+    ice_servers: Vec<crate::config::IceServerConfig>,
     /// This session's peer connection, when the feature is compiled in.
     #[cfg(feature = "webrtc")]
     peer: Mutex<super::rtc_peer::PeerSlot>,
@@ -135,6 +138,7 @@ impl PortalGateway {
             announced: Mutex::new(std::collections::HashSet::new()),
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
             rtc: Arc::new(super::rtc::RtcState::new()),
+            ice_servers: Vec::new(),
             #[cfg(feature = "webrtc")]
             peer: Mutex::new(super::rtc_peer::PeerSlot::default()),
             media_sink: None,
@@ -148,6 +152,17 @@ impl PortalGateway {
     /// just puts media in front of chat on the single socket it has.
     pub fn with_media_sink(mut self, sink: Arc<dyn WireSink>) -> Self {
         self.media_sink = Some(sink);
+        self
+    }
+
+    /// STUN/TURN servers for the peer path.
+    ///
+    /// Without at least a STUN server the only candidate offered is this
+    /// machine's LAN address, which reaches a phone on the same network and
+    /// nothing else — so a deployment meant to work over the internet has to
+    /// set this.
+    pub fn with_ice_servers(mut self, servers: Vec<crate::config::IceServerConfig>) -> Self {
+        self.ice_servers = servers;
         self
     }
 
@@ -504,7 +519,7 @@ impl PortalGateway {
         let sealed = self.session.lock().await.is_sealed();
         let offer = {
             let mut slot = self.peer.lock().await;
-            super::rtc_peer::begin(sealed, &mut slot).await
+            super::rtc_peer::begin(sealed, &self.ice_servers, &mut slot).await
         };
         let Some(offer) = offer else { return };
         let Ok(value) = serde_json::to_value(&offer) else {
