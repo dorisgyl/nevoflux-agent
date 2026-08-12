@@ -1861,7 +1861,7 @@ pub async fn start_server(
             config.llm.active_api_key(),
             config.llm.active_model(),
         ) {
-            if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
+            if let Some(provider) = config.llm.resolve_wire(provider_str) {
                 let mut llm_config =
                     crate::wasm::services::LlmConfig::new(provider, api_key, model);
                 if let Some(base_url) = config.llm.active_base_url() {
@@ -7890,6 +7890,15 @@ async fn handle_chat_message(
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
                 "config.llm.set" => handle_config_llm_set(&params, shared_config).await,
+                "config.llm.custom.create" => {
+                    handle_config_llm_custom_create(&params, shared_config).await
+                }
+                "config.llm.custom.update" => {
+                    handle_config_llm_custom_update(&params, shared_config).await
+                }
+                "config.llm.custom.delete" => {
+                    handle_config_llm_custom_delete(&params, shared_config).await
+                }
                 // OpenClaw model configuration commands
                 // Wrap in system_response envelope (handlers return raw data)
                 cmd @ ("config.openclaw.model.list"
@@ -10970,65 +10979,9 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
     },
 ];
 
-/// Get the ProviderConfig for a given provider id from the LlmConfig.
-fn get_provider_config<'a>(
-    llm: &'a crate::config::LlmConfig,
-    provider_id: &str,
-) -> Option<&'a crate::config::ProviderConfig> {
-    match provider_id {
-        "anthropic" => Some(&llm.anthropic),
-        "openai" => Some(&llm.openai),
-        "deepseek" => Some(&llm.deepseek),
-        "qwen" => Some(&llm.qwen),
-        "gemini" => Some(&llm.gemini),
-        "groq" => Some(&llm.groq),
-        "openrouter" => Some(&llm.openrouter),
-        "mistral" => Some(&llm.mistral),
-        "xai" => Some(&llm.xai),
-        "cohere" => Some(&llm.cohere),
-        "perplexity" => Some(&llm.perplexity),
-        "together" => Some(&llm.together),
-        "ollama" => Some(&llm.ollama),
-        "claude-code" | "claude_code" => Some(&llm.claude_code),
-        "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
-        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&llm.antigravity),
-        "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
-        "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
-        _ => None,
-    }
-}
-
 // Note: the "is any provider usable?" check lives on `LlmConfig` as
 // `has_any_configured_provider()` (see config.rs) so the daemon's `status`
 // handler and the proxy's early setup hint share one implementation.
-
-/// Get a mutable reference to the ProviderConfig for a given provider id.
-fn get_provider_config_mut<'a>(
-    llm: &'a mut crate::config::LlmConfig,
-    provider_id: &str,
-) -> Option<&'a mut crate::config::ProviderConfig> {
-    match provider_id {
-        "anthropic" => Some(&mut llm.anthropic),
-        "openai" => Some(&mut llm.openai),
-        "deepseek" => Some(&mut llm.deepseek),
-        "qwen" => Some(&mut llm.qwen),
-        "gemini" => Some(&mut llm.gemini),
-        "groq" => Some(&mut llm.groq),
-        "openrouter" => Some(&mut llm.openrouter),
-        "mistral" => Some(&mut llm.mistral),
-        "xai" => Some(&mut llm.xai),
-        "cohere" => Some(&mut llm.cohere),
-        "perplexity" => Some(&mut llm.perplexity),
-        "together" => Some(&mut llm.together),
-        "ollama" => Some(&mut llm.ollama),
-        "claude-code" | "claude_code" => Some(&mut llm.claude_code),
-        "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
-        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut llm.antigravity),
-        "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut llm.kimi_agent),
-        "openclaw" | "open_claw" | "open-claw" => Some(&mut llm.openclaw),
-        _ => None,
-    }
-}
 
 /// Handle config.llm.list command.
 ///
@@ -11043,13 +10996,11 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
     let config = AgentConfig::load().unwrap_or_default();
     let active = config.llm.active_provider().map(|s| s.to_string());
 
-    let providers: Vec<serde_json::Value> = PROVIDER_METAS
+    let mut providers: Vec<serde_json::Value> = PROVIDER_METAS
         .iter()
         .map(|meta| {
-            let provider_config = get_provider_config(&config.llm, meta.id);
-            let configured = provider_config
-                .map(|pc| pc.api_key.is_some())
-                .unwrap_or(false);
+            let provider_config = config.llm.provider_config(meta.id);
+            let configured = config.llm.is_provider_configured(meta.id);
             let is_active = active.as_deref() == Some(meta.id)
                 || (meta.id == "claude-code" && active.as_deref() == Some("claude_code"))
                 || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"))
@@ -11061,10 +11012,9 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
                         || active.as_deref() == Some("kimi")));
             let model = provider_config.and_then(|pc| pc.model.clone());
 
-            let default_model = meta
-                .id
-                .parse::<nevoflux_llm::ProviderType>()
-                .ok()
+            let default_model = config
+                .llm
+                .resolve_wire(meta.id)
                 .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
 
             serde_json::json!({
@@ -11079,6 +11029,36 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
             })
         })
         .collect();
+
+    // User-defined providers render in their own grid. `icon` is null — the UI
+    // draws an initial on `accent` instead.
+    for (key, custom) in &config.llm.custom {
+        let wire_id = format!("custom:{key}");
+        let is_active = active.as_deref() == Some(wire_id.as_str());
+        let default_model = config
+            .llm
+            .resolve_wire(&wire_id)
+            .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
+        providers.push(serde_json::json!({
+            "id": wire_id,
+            "display_name": custom.display_name,
+            "type": "custom",
+            "icon": serde_json::Value::Null,
+            "configured": config.llm.is_provider_configured(&wire_id),
+            "active": is_active,
+            "model": custom.base.model,
+            "default_model": default_model,
+            "is_custom": true,
+            "wire": match custom.wire {
+                crate::config::CustomWire::Openai => "openai",
+                crate::config::CustomWire::Anthropic => "anthropic",
+            },
+            "accent": custom.accent,
+            "base_url": custom.base.base_url,
+            "context_window": custom.base.context_window,
+            "use_streaming": custom.base.use_streaming,
+        }));
+    }
 
     serde_json::json!({
         "type": "system_response",
@@ -11125,7 +11105,7 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
     }
 
     let config = AgentConfig::load().unwrap_or_default();
-    let provider_config = match get_provider_config(&config.llm, provider_id) {
+    let provider_config = match config.llm.provider_config(provider_id) {
         Some(pc) => pc,
         None => {
             return serde_json::json!({
@@ -11152,14 +11132,14 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
         }
     });
 
-    let default_model = provider_id
-        .parse::<nevoflux_llm::ProviderType>()
-        .ok()
+    let default_model = config
+        .llm
+        .resolve_wire(provider_id)
         .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
 
-    let default_context_window = provider_id
-        .parse::<nevoflux_llm::ProviderType>()
-        .ok()
+    let default_context_window = config
+        .llm
+        .resolve_wire(provider_id)
         .map(|pt| nevoflux_llm::default_context_window_for(pt));
 
     let is_active = config.llm.active_provider() == Some(provider_id)
@@ -11245,7 +11225,7 @@ async fn handle_config_llm_set(
     };
 
     // Get mutable reference to the provider config
-    let provider_config = match get_provider_config_mut(&mut config.llm, provider_id) {
+    let provider_config = match config.llm.provider_config_mut(provider_id) {
         Some(pc) => pc,
         None => {
             return serde_json::json!({
@@ -11309,7 +11289,14 @@ async fn handle_config_llm_set(
             // subprocess at spawn. Drop the cached instance so the next chat
             // respawns with the just-saved settings — generic on purpose:
             // fixes the same staleness for gemini-cli/claude-code too.
-            if let Ok(pt) = provider_id.parse::<nevoflux_llm::ProviderType>() {
+            // Custom providers are direct-API only and never own an ACP cache
+            // entry, so they are skipped — otherwise a custom provider would
+            // evict the builtin entry its wire resolves to.
+            if let Some(pt) = crate::config::custom_id(provider_id)
+                .is_none()
+                .then(|| provider_id.parse::<nevoflux_llm::ProviderType>().ok())
+                .flatten()
+            {
                 let key = format!("{:?}", pt);
                 let acp = crate::wasm::llm::acp_providers().clone();
                 tokio::spawn(async move {
@@ -11354,6 +11341,373 @@ async fn handle_config_llm_set(
                     }
                 }
             })
+        }
+    }
+}
+
+/// Shared field parsing for `config.llm.custom.create` / `.update`.
+///
+/// `api_key` follows the modal's "leave blank to keep current" contract: an
+/// absent field or an empty string leaves the stored key alone; an explicit
+/// JSON `null` clears it.
+fn apply_custom_fields(
+    entry: &mut crate::config::CustomProviderConfig,
+    params: &serde_json::Value,
+) {
+    if let Some(name) = params.get("display_name").and_then(|v| v.as_str()) {
+        if !name.trim().is_empty() {
+            entry.display_name = name.trim().to_string();
+        }
+    }
+    if let Some(wire) = params.get("wire").and_then(|v| v.as_str()) {
+        entry.wire = match wire {
+            "anthropic" => crate::config::CustomWire::Anthropic,
+            _ => crate::config::CustomWire::Openai,
+        };
+    }
+    if let Some(accent) = params.get("accent") {
+        entry.accent = accent
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+    match params.get("api_key") {
+        Some(serde_json::Value::Null) => entry.base.api_key = None,
+        Some(v) => {
+            if let Some(k) = v.as_str().filter(|k| !k.is_empty()) {
+                entry.base.api_key = Some(k.to_string());
+            }
+        }
+        None => {}
+    }
+    if let Some(model) = params.get("model").and_then(|v| v.as_str()) {
+        entry.base.model = if model.is_empty() {
+            None
+        } else {
+            Some(model.to_string())
+        };
+    }
+    if let Some(url) = params.get("base_url").and_then(|v| v.as_str()) {
+        let trimmed = url.trim();
+        entry.base.base_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(cw) = params.get("context_window") {
+        entry.base.context_window = cw
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0);
+    }
+    if let Some(streaming) = params.get("use_streaming").and_then(|v| v.as_bool()) {
+        entry.base.use_streaming = Some(streaming);
+    }
+}
+
+/// Build a `system_response` envelope for a custom-provider command.
+fn custom_response(
+    request_id: &str,
+    command: &str,
+    // `Result` is aliased to DaemonError's result in this module, so the
+    // two-parameter form must be spelled out.
+    result: std::result::Result<serde_json::Value, (&str, String)>,
+) -> serde_json::Value {
+    match result {
+        Ok(data) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": true,
+                "data": data
+            }
+        }),
+        Err((code, message)) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": false,
+                "error": { "code": code, "message": message }
+            }
+        }),
+    }
+}
+
+/// Handle `config.llm.custom.create`.
+///
+/// Mints a stable id from `display_name`, stores the provider, and optionally
+/// activates it. `base_url` is required — it is what makes a custom provider
+/// usable, since its API key is optional.
+async fn handle_config_llm_custom_create(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let command = "config.llm.custom.create";
+
+    let display_name = params
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if display_name.is_empty() {
+        return custom_response(
+            request_id,
+            command,
+            Err(("MISSING_PARAM", "display_name is required".into())),
+        );
+    }
+    let base_url = params
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if base_url.is_empty() {
+        return custom_response(
+            request_id,
+            command,
+            Err(("MISSING_PARAM", "base_url is required".into())),
+        );
+    }
+
+    let mut config = match AgentConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return custom_response(
+                request_id,
+                command,
+                Err(("CONFIG_ERROR", format!("Failed to load config: {e}"))),
+            )
+        }
+    };
+
+    let id = crate::config_custom_id::allocate_custom_id(&display_name, |candidate| {
+        config.llm.custom.contains_key(candidate)
+    });
+
+    let mut entry = crate::config::CustomProviderConfig {
+        display_name: display_name.clone(),
+        wire: crate::config::CustomWire::Openai,
+        accent: None,
+        base: crate::config::ProviderConfig::default(),
+    };
+    apply_custom_fields(&mut entry, params);
+    config.llm.custom.insert(id.clone(), entry);
+
+    let wire_id = format!("custom:{id}");
+    if params
+        .get("set_active")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false)
+    {
+        config.llm.provider = Some(wire_id.clone());
+    }
+
+    match config.save() {
+        Ok(()) => {
+            let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
+            *shared_config.write().unwrap() = Arc::new(config);
+            info!("config.llm.custom.create: created {wire_id} (active={active})");
+            custom_response(
+                request_id,
+                command,
+                Ok(serde_json::json!({ "id": wire_id, "active": active })),
+            )
+        }
+        Err(e) => {
+            error!("Failed to save config: {e}");
+            custom_response(
+                request_id,
+                command,
+                Err(("SAVE_ERROR", format!("Failed to save config: {e}"))),
+            )
+        }
+    }
+}
+
+/// Handle `config.llm.custom.update`.
+async fn handle_config_llm_custom_update(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let command = "config.llm.custom.update";
+
+    let wire_id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(key) = crate::config::custom_id(&wire_id).map(|s| s.to_string()) else {
+        return custom_response(
+            request_id,
+            command,
+            Err(("MISSING_PARAM", "id must be of the form custom:<id>".into())),
+        );
+    };
+
+    let mut config = match AgentConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return custom_response(
+                request_id,
+                command,
+                Err(("CONFIG_ERROR", format!("Failed to load config: {e}"))),
+            )
+        }
+    };
+
+    let Some(entry) = config.llm.custom.get_mut(&key) else {
+        return custom_response(
+            request_id,
+            command,
+            Err((
+                "UNKNOWN_PROVIDER",
+                format!("Unknown custom provider: {wire_id}"),
+            )),
+        );
+    };
+    apply_custom_fields(entry, params);
+
+    if entry.base.base_url.as_deref().unwrap_or("").is_empty() {
+        return custom_response(
+            request_id,
+            command,
+            Err(("MISSING_PARAM", "base_url is required".into())),
+        );
+    }
+
+    match params.get("set_active").and_then(|s| s.as_bool()) {
+        Some(true) => config.llm.provider = Some(wire_id.clone()),
+        // Unchecking "set as active" on the active provider hands the pointer
+        // to whatever else is configured, rather than silently keeping it.
+        Some(false) if config.llm.provider.as_deref() == Some(wire_id.as_str()) => {
+            config.llm.provider = config.llm.fallback_provider_after_removing(&wire_id);
+        }
+        _ => {}
+    }
+
+    match config.save() {
+        Ok(()) => {
+            let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
+            *shared_config.write().unwrap() = Arc::new(config);
+            info!("config.llm.custom.update: updated {wire_id} (active={active})");
+            custom_response(
+                request_id,
+                command,
+                Ok(serde_json::json!({ "id": wire_id, "active": active })),
+            )
+        }
+        Err(e) => {
+            error!("Failed to save config: {e}");
+            custom_response(
+                request_id,
+                command,
+                Err(("SAVE_ERROR", format!("Failed to save config: {e}"))),
+            )
+        }
+    }
+}
+
+/// Handle `config.llm.custom.delete`.
+///
+/// If the target is the active provider, the pointer falls back to the first
+/// other configured provider; the chosen id is reported so the UI can name it.
+async fn handle_config_llm_custom_delete(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let command = "config.llm.custom.delete";
+
+    let wire_id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(key) = crate::config::custom_id(&wire_id).map(|s| s.to_string()) else {
+        return custom_response(
+            request_id,
+            command,
+            Err(("MISSING_PARAM", "id must be of the form custom:<id>".into())),
+        );
+    };
+
+    let mut config = match AgentConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return custom_response(
+                request_id,
+                command,
+                Err(("CONFIG_ERROR", format!("Failed to load config: {e}"))),
+            )
+        }
+    };
+
+    if !config.llm.custom.contains_key(&key) {
+        return custom_response(
+            request_id,
+            command,
+            Err((
+                "UNKNOWN_PROVIDER",
+                format!("Unknown custom provider: {wire_id}"),
+            )),
+        );
+    }
+
+    let was_active = config.llm.active_provider() == Some(wire_id.as_str());
+    let fell_back_to = if was_active {
+        config.llm.fallback_provider_after_removing(&wire_id)
+    } else {
+        None
+    };
+    config.llm.custom.remove(&key);
+    if was_active {
+        config.llm.provider = fell_back_to.clone();
+        // `default_provider` is the legacy fallback active_provider() consults;
+        // leaving it pointing at the deleted id would resurrect it.
+        if config.llm.default_provider.as_deref() == Some(wire_id.as_str()) {
+            config.llm.default_provider = None;
+        }
+    }
+
+    match config.save() {
+        Ok(()) => {
+            *shared_config.write().unwrap() = Arc::new(config);
+            info!(
+                "config.llm.custom.delete: removed {wire_id} (was_active={was_active}, fell_back_to={fell_back_to:?})"
+            );
+            custom_response(
+                request_id,
+                command,
+                Ok(serde_json::json!({
+                    "id": wire_id,
+                    "was_active": was_active,
+                    "fell_back_to": fell_back_to
+                })),
+            )
+        }
+        Err(e) => {
+            error!("Failed to save config: {e}");
+            custom_response(
+                request_id,
+                command,
+                Err(("SAVE_ERROR", format!("Failed to save config: {e}"))),
+            )
         }
     }
 }

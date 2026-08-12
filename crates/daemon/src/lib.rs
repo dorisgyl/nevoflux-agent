@@ -36,6 +36,7 @@ pub mod canvas_persist;
 pub mod canvas_tools;
 pub mod canvas_video;
 pub mod config;
+pub mod config_custom_id;
 pub mod config_watcher;
 pub mod context;
 pub mod error;

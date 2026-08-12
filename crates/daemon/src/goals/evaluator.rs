@@ -61,6 +61,12 @@ pub const TRANSCRIPT_MAX_BYTES: usize = 24 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatorChoice {
     pub provider: String,
+    /// The wire protocol resolved from `provider` at resolution time.
+    ///
+    /// Carried rather than re-parsed because `provider` may name a custom
+    /// endpoint (`custom:<id>`), which only [`LlmConfig::resolve_wire`] can
+    /// map — and [`evaluate`] has no config to consult.
+    pub wire: ProviderType,
     pub model: String,
     pub api_key: String,
     pub base_url: Option<String>,
@@ -82,26 +88,12 @@ pub struct Verdict {
 /// Map a (lowercased) direct-API provider name to its `ProviderConfig`.
 /// Returns `None` for unknown or ACP providers (ACP is rejected earlier).
 fn direct_provider_cfg<'a>(llm: &'a LlmConfig, provider: &str) -> Option<&'a ProviderConfig> {
-    Some(match provider {
-        "anthropic" => &llm.anthropic,
-        "openai" => &llm.openai,
-        "qwen" => &llm.qwen,
-        "deepseek" => &llm.deepseek,
-        "openrouter" => &llm.openrouter,
-        "gemini" => &llm.gemini,
-        "groq" => &llm.groq,
-        "ollama" => &llm.ollama,
-        "mistral" => &llm.mistral,
-        "xai" | "grok" => &llm.xai,
-        "cohere" => &llm.cohere,
-        "perplexity" => &llm.perplexity,
-        "together" => &llm.together,
-        // kimi-agent is an ACP *worker* but supports non-streaming chat via
-        // execute_kimi_agent_chat, so it acts as a direct-API evaluator (unlike
-        // claude-code/gemini-cli/openclaw, which only stream).
-        "kimi-agent" | "kimi_agent" | "kimi" => &llm.kimi_agent,
-        _ => return None,
-    })
+    // Callers reject ACP providers via `is_acp_provider` before reaching here,
+    // which covers claude-code / gemini-cli / openclaw / antigravity. kimi-agent
+    // is deliberately not in that list: it is an ACP worker but also supports
+    // non-streaming chat via execute_kimi_agent_chat, so it qualifies as a
+    // direct-API evaluator. Custom providers are direct-API by construction.
+    llm.provider_config(provider)
 }
 
 /// Resolve evaluator settings: the explicit `(provider, model)` from the goal
@@ -131,9 +123,11 @@ pub fn resolve_evaluator(
         ));
     }
 
-    // Validate it names a known provider type at all.
-    ProviderType::from_str(&provider_norm)
-        .map_err(|e| format!("invalid evaluator provider '{provider_str}': {e}"))?;
+    // Validate it names a known provider — builtin id or custom:<id>.
+    let wire = config
+        .llm
+        .resolve_wire(&provider_norm)
+        .ok_or_else(|| format!("invalid evaluator provider '{provider_str}': Unknown provider"))?;
 
     let pc = direct_provider_cfg(&config.llm, &provider_norm).ok_or_else(|| {
         format!(
@@ -145,11 +139,13 @@ pub fn resolve_evaluator(
     // Key: config only. ollama is keyless (local); everything else needs one.
     let api_key = match pc.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
-        None if provider_norm == "ollama" => "ollama-local".to_string(),
-        // kimi-agent can run keyless in CLI mode; the wire client treats the
-        // "kimi-agent-cli" sentinel as "spawn the CLI without an API key".
-        None if matches!(provider_norm.as_str(), "kimi-agent" | "kimi_agent" | "kimi") => {
-            "kimi-agent-cli".to_string()
+        // ollama is keyless (local), kimi-agent can run keyless in CLI mode, and
+        // a custom endpoint may have no auth at all. `keyless_placeholder` is the
+        // single table the wire clients agree on for those sentinels.
+        None if crate::config::keyless_placeholder(&provider_norm).is_some() => {
+            crate::config::keyless_placeholder(&provider_norm)
+                .expect("checked above")
+                .to_string()
         }
         None => {
             return Err(format!(
@@ -175,6 +171,7 @@ pub fn resolve_evaluator(
         })?;
 
     Ok(EvaluatorChoice {
+        wire,
         provider: provider_norm,
         model,
         api_key,
@@ -200,6 +197,10 @@ pub fn resolve_evaluator_for_goal(
     if let Some(p) = &provider_str {
         if crate::config::is_acp_provider(p) {
             return Ok(EvaluatorChoice {
+                wire: config
+                    .llm
+                    .resolve_wire(&p.to_lowercase())
+                    .unwrap_or(ProviderType::Anthropic),
                 provider: p.to_lowercase(),
                 model: model.unwrap_or_default().to_string(),
                 api_key: String::new(),
@@ -308,8 +309,7 @@ pub async fn evaluate(
     condition: &str,
     transcript: &[(String, String)],
 ) -> Result<Verdict, String> {
-    let provider = ProviderType::from_str(&choice.provider)
-        .map_err(|e| format!("invalid evaluator provider '{}': {e}", choice.provider))?;
+    let provider = choice.wire;
 
     let system_base = format!("{EVALUATOR_SYSTEM_PROMPT}\n\nCONDITION:\n{condition}");
     let user_content = render_transcript(transcript);
@@ -371,8 +371,7 @@ pub async fn evaluate_via_acp(
     condition: &str,
     transcript: &[(String, String)],
 ) -> Result<Verdict, String> {
-    let provider = ProviderType::from_str(&choice.provider)
-        .map_err(|e| format!("invalid evaluator provider '{}': {e}", choice.provider))?;
+    let provider = choice.wire;
     let system_base = format!("{EVALUATOR_SYSTEM_PROMPT}\n\nCONDITION:\n{condition}");
     let user_content = render_transcript(transcript);
 
