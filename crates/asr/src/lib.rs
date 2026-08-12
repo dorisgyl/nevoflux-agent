@@ -10,6 +10,7 @@
 
 pub mod error;
 pub mod route;
+pub mod stitch;
 
 pub use error::AsrError;
 pub use route::route;
