@@ -62,6 +62,8 @@ mod tests {
             composition_id: None,
             file_path: None,
             model_size: None,
+            engine: None,
+            language: None,
         }
     }
     fn req_artifact(comp: &str, path: &str) -> TranscribeRequest {
@@ -70,6 +72,8 @@ mod tests {
             composition_id: Some(comp.into()),
             file_path: Some(path.into()),
             model_size: None,
+            engine: None,
+            language: None,
         }
     }
 
@@ -81,6 +85,8 @@ mod tests {
             composition_id: None,
             file_path: None,
             model_size: None,
+            engine: None,
+            language: None,
         };
         let err = transcribe(&cfg, &r).await.unwrap_err();
         assert!(matches!(err, TtsError::InvalidRequest(_)));
@@ -94,6 +100,8 @@ mod tests {
             composition_id: Some("comp-x".into()),
             file_path: Some("narration.mp3".into()),
             model_size: None,
+            engine: None,
+            language: None,
         };
         let err = transcribe(&cfg, &r).await.unwrap_err();
         assert!(matches!(err, TtsError::InvalidRequest(_)));
