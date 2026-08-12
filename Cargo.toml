@@ -25,6 +25,7 @@ members = [
     "crates/computer",
     "crates/builtin-wasm",
     "crates/tts",
+    "crates/asr",
 ]
 
 [workspace.package]
