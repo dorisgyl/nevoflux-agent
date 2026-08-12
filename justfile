@@ -161,6 +161,62 @@ download-model:
     print(f'Model downloaded to {cache_dir}')
     "
 
+# Fetch SenseVoice + VAD models for local transcription
+fetch-asr-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The local filenames below are this project's convention, not the upstream
+    # ones -- the various exports disagree with each other, and daemon-side path
+    # resolution (crates/daemon/src/tts/asr.rs, following the kokoro.rs
+    # precedent) depends on them staying put. Rename here, rename there.
+    #
+    # The daemon never fetches anything itself. Adding network behaviour to a
+    # native-messaging host expected to start in under a second is a bad trade,
+    # and pulling gigabytes at a moment nobody chose is a worse one.
+    DEST="${HOME}/.cache/nevoflux/models"
+    mkdir -p "$DEST"
+    pip install -q huggingface_hub
+    python3 - "$DEST" <<'PY'
+    import os, shutil, sys
+    from huggingface_hub import hf_hub_download
+
+    dest = sys.argv[1]
+    # (repo_id, filename in repo, local name this project uses)
+    wanted = [
+        ("FunAudioLLM/SenseVoiceSmall", "model_quant.onnx", "sensevoice-small.int8.onnx"),
+        ("FunAudioLLM/SenseVoiceSmall", "tokens.json",      "sensevoice-tokens.json"),
+        ("funasr/fsmn-vad",             "model.onnx",       "fsmn-vad.onnx"),
+    ]
+    for repo, remote, local in wanted:
+        src = hf_hub_download(repo_id=repo, filename=remote)
+        target = os.path.join(dest, local)
+        shutil.copyfile(src, target)
+        print(f"  {repo}/{remote} -> {target}")
+    PY
+    echo "ASR models are in $DEST"
+    echo "Whisper is optional and only needed for --features asr-whisper: just fetch-whisper-model"
+
+# Fetch Whisper weights (only needed for --features asr-whisper)
+fetch-whisper-model SIZE="large-v3-turbo":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Separate from fetch-asr-models on purpose: the default build has no
+    # Whisper engine, so most people never need this and should not be made to
+    # download a gigabyte to find that out.
+    DEST="${HOME}/.cache/nevoflux/models"
+    mkdir -p "$DEST"
+    pip install -q huggingface_hub
+    python3 - "$DEST" "{{SIZE}}" <<'PY'
+    import os, shutil, sys
+    from huggingface_hub import hf_hub_download
+
+    dest, size = sys.argv[1], sys.argv[2]
+    src = hf_hub_download(repo_id="ggerganov/whisper.cpp", filename=f"ggml-{size}.bin")
+    target = os.path.join(dest, f"whisper-{size}.q8.gguf")
+    shutil.copyfile(src, target)
+    print(f"  {target}")
+    PY
+
 # ONNX Runtime version for load-dynamic builds. Keep in lockstep with
 # EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 5 -> ORT 1.24.x).
 ort_version := "1.24.2"
