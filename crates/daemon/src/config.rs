@@ -1826,6 +1826,61 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn test_hand_written_custom_provider_toml_parses() {
+        // The shape a user types into ~/.config/nevoflux/config.toml by hand.
+        let src = r##"
+provider = "custom:my-llm"
+
+[custom.my-llm]
+display_name = "My LLM"
+wire = "openai"
+accent = "#7c5cff"
+api_key = "sk-abc"
+model = "gpt-4o"
+base_url = "https://api.example.com/v1"
+context_window = 32768
+
+[custom.local]
+display_name = "Local llama.cpp"
+wire = "anthropic"
+base_url = "http://127.0.0.1:8080"
+"##;
+        let cfg: LlmConfig = toml::from_str(src).expect("hand-written custom section parses");
+
+        assert_eq!(cfg.active_provider(), Some("custom:my-llm"));
+        assert_eq!(cfg.active_api_key(), Some("sk-abc"));
+        assert_eq!(cfg.active_model(), Some("gpt-4o"));
+        assert_eq!(cfg.active_base_url(), Some("https://api.example.com/v1"));
+        assert_eq!(cfg.context_window(), 32_768);
+        assert!(cfg.is_provider_configured("custom:my-llm"));
+
+        // The keyless one is usable purely on its base_url.
+        assert!(cfg.is_provider_configured("custom:local"));
+        assert_eq!(
+            cfg.resolve_wire("custom:local"),
+            Some(nevoflux_llm::ProviderType::Anthropic)
+        );
+
+        // Both show up for the sidebar model picker, custom ids last.
+        let listed = cfg.configured_providers();
+        assert!(listed.iter().any(|(id, _)| id == "custom:my-llm"));
+        assert!(listed.iter().any(|(id, _)| id == "custom:local"));
+    }
+
+    #[test]
+    fn test_unknown_wire_value_is_rejected() {
+        // A typo in `wire` must fail loudly at parse time rather than silently
+        // defaulting to one of the two protocols.
+        let src = r#"
+[custom.oops]
+display_name = "Oops"
+wire = "grpc"
+base_url = "https://x.test"
+"#;
+        assert!(toml::from_str::<LlmConfig>(src).is_err());
+    }
+
+    #[test]
     fn test_fallback_provider_after_removing() {
         let mut cfg = custom_cfg(
             "mine",

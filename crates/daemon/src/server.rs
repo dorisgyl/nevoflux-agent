@@ -10996,7 +10996,7 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
     let config = AgentConfig::load().unwrap_or_default();
     let active = config.llm.active_provider().map(|s| s.to_string());
 
-    let providers: Vec<serde_json::Value> = PROVIDER_METAS
+    let mut providers: Vec<serde_json::Value> = PROVIDER_METAS
         .iter()
         .map(|meta| {
             let provider_config = config.llm.provider_config(meta.id);
@@ -11029,6 +11029,36 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
             })
         })
         .collect();
+
+    // User-defined providers render in their own grid. `icon` is null — the UI
+    // draws an initial on `accent` instead.
+    for (key, custom) in &config.llm.custom {
+        let wire_id = format!("custom:{key}");
+        let is_active = active.as_deref() == Some(wire_id.as_str());
+        let default_model = config
+            .llm
+            .resolve_wire(&wire_id)
+            .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
+        providers.push(serde_json::json!({
+            "id": wire_id,
+            "display_name": custom.display_name,
+            "type": "custom",
+            "icon": serde_json::Value::Null,
+            "configured": config.llm.is_provider_configured(&wire_id),
+            "active": is_active,
+            "model": custom.base.model,
+            "default_model": default_model,
+            "is_custom": true,
+            "wire": match custom.wire {
+                crate::config::CustomWire::Openai => "openai",
+                crate::config::CustomWire::Anthropic => "anthropic",
+            },
+            "accent": custom.accent,
+            "base_url": custom.base.base_url,
+            "context_window": custom.base.context_window,
+            "use_streaming": custom.base.use_streaming,
+        }));
+    }
 
     serde_json::json!({
         "type": "system_response",
