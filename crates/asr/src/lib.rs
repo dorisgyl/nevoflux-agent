@@ -8,6 +8,7 @@
 //! MCP stop at the daemon, exactly as they do for `nevoflux-tts`; that is what
 //! keeps the inference here testable without any of it.
 
+pub mod audio;
 pub mod error;
 pub mod route;
 pub mod stitch;
