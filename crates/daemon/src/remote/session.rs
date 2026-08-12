@@ -238,6 +238,15 @@ impl PortalSession {
         self.translator.current_stream_id()
     }
 
+    /// Whether this channel is sealed with a key derived from the pairing code.
+    ///
+    /// WebRTC signalling depends on it: without a key the relay could
+    /// substitute both DTLS fingerprints and sit inside the session it helped
+    /// set up, so the transport refuses to negotiate at all.
+    pub fn is_sealed(&self) -> bool {
+        self.key.is_some()
+    }
+
     pub fn open_stream_id(&self) -> Option<String> {
         self.translator.open_stream_id()
     }

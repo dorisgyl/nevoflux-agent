@@ -20,6 +20,8 @@ pub mod portal_gateway;
 pub mod push;
 pub mod relay_protocol;
 pub mod rtc;
+#[cfg(feature = "webrtc")]
+pub mod rtc_peer;
 pub mod session;
 pub mod start;
 pub mod translate;

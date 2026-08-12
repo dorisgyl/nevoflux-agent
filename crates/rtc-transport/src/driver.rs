@@ -184,6 +184,7 @@ mod tokio_driver {
         channel: ChannelId,
         mut outbound: mpsc::Receiver<Vec<u8>>,
         events: mpsc::Sender<DriverEvent>,
+        mut signals: mpsc::Receiver<crate::signal::SignalFrame>,
     ) {
         let local = match socket.local_addr() {
             Ok(a) => a,
@@ -258,6 +259,27 @@ mod tokio_driver {
                         }
                     }
                     // The caller hung up.
+                    None => break,
+                },
+                // Candidates keep arriving after the answer — the far end
+                // trickles srflx and relay ones as its own gathering finishes.
+                // Without this they would have nowhere to go, and a connection
+                // that needed a relayed path would simply never form.
+                sig = signals.recv() => match sig {
+                    Some(crate::signal::SignalFrame::RtcCandidate { candidate, .. }) => {
+                        let rtc = endpoint.rtc_mut();
+                        if let Err(e) = add_remote_candidate(rtc, &candidate) {
+                            // One unusable candidate out of several; the others
+                            // are still being tried.
+                            tracing::debug!(target: "rtc", "ignoring candidate: {e}");
+                        }
+                    }
+                    Some(crate::signal::SignalFrame::RtcClose { reason }) => {
+                        tracing::info!(target: "rtc", ?reason, "far end closed the connection");
+                        break;
+                    }
+                    // An offer or answer here is out of order; nothing to do.
+                    Some(_) => {}
                     None => break,
                 }
             }

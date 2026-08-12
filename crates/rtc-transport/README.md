@@ -62,21 +62,30 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **The last mile of wiring.** `remote::rtc` classifies signalling and holds
-  the session's path; `PortalGateway::apply_rtc_signal` is where the driver gets
-  attached, and that call is still a stub under the `webrtc` feature. Until it
-  is filled in, a head never offers and the portal's peer support stays inert.
+- **Proof on a real network.** Everything here is exercised on loopback, where
+  there is no NAT to traverse. Hole-punching, and how often it fails, can only
+  be measured between two machines on different networks.
+- **STUN/TURN gathering.** `ice.rs` validates the configuration and the driver
+  accepts trickled candidates, but nothing yet asks a STUN server for a
+  reflexive address or allocates a TURN relay — so today only host candidates
+  are offered, which works on a LAN and not across the internet.
 
 The channel payloads, at least, need no new protocol.
 `crates/daemon/src/remote/media_frame.rs` already frames a range as bytes and
 the portal already decodes it; the data channel moves opaque blobs, so the same
 framing crosses either path and neither end has to learn a second one.
 
-## Not in the daemon's build
+## Wired, behind a feature
 
-Deliberately. `str0m` pulls ~100 crates, and this is not usable yet — wiring it
-in would cost every build for something no session can reach. It is a workspace
-member so it compiles and tests in CI, and nothing depends on it.
+`nevoflux-daemon` depends on this only under its `webrtc` feature, off by
+default: `str0m` pulls ~100 crates and the path is not proven on real networks
+yet. With the feature on, a head offers a connection as soon as a portal
+attaches (`PortalGateway::offer_peer_connection`), answers and candidates route
+through `remote::rtc_peer`, and the session's path moves to `Peer` only while
+the channel is genuinely open — back to `Relay` the moment it is not.
+
+Both configurations are built and tested. Without the feature every range takes
+the relay, exactly as it does today.
 
 ## Testing notes
 

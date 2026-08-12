@@ -257,6 +257,11 @@ pub async fn run_gateway(
                 sink.set(write).await;
                 // Tell the portal what this head is set to, before any chat.
                 gateway.announce().await;
+                // Then offer a direct path. Sent after the announce so a portal
+                // that only wants to talk is never left waiting on a
+                // negotiation it does not need, and a no-op in a build without
+                // the feature or on a channel with no key.
+                gateway.offer_peer_connection().await;
                 serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
                 sink.clear().await;
                 // A dropped socket is not a failed attempt; reconnect promptly.

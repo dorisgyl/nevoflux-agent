@@ -26,6 +26,10 @@ const DEADLINE: Duration = Duration::from_secs(20);
 struct Peer {
     outbound: mpsc::Sender<Vec<u8>>,
     events: mpsc::Receiver<DriverEvent>,
+    /// Held, not used here. The driver treats a closed signalling channel as
+    /// the session ending — which is right in production, where the gateway
+    /// owns this and drops it on teardown.
+    _signals: mpsc::Sender<nevoflux_rtc_transport::signal::SignalFrame>,
 }
 
 /// Wait for one event, failing the test rather than blocking forever.
@@ -83,12 +87,14 @@ async fn connect() -> (Peer, Peer) {
 
     let (head_tx, head_rx) = mpsc::channel(8);
     let (head_ev_tx, head_ev_rx) = mpsc::channel(64);
+    let (head_sig, head_sig_rx) = mpsc::channel(8);
     tokio::spawn(driver::run(
         head,
         head_sock,
         head_channel,
         head_rx,
         head_ev_tx,
+        head_sig_rx,
     ));
 
     // The answerer learns its channel id from the ChannelOpen event, so the id
@@ -96,22 +102,26 @@ async fn connect() -> (Peer, Peer) {
     // this peer's writes come after it has seen the channel open.
     let (portal_tx, portal_rx) = mpsc::channel(8);
     let (portal_ev_tx, portal_ev_rx) = mpsc::channel(64);
+    let (portal_sig, portal_sig_rx) = mpsc::channel(8);
     tokio::spawn(driver::run(
         portal,
         portal_sock,
         head_channel,
         portal_rx,
         portal_ev_tx,
+        portal_sig_rx,
     ));
 
     (
         Peer {
             outbound: head_tx,
             events: head_ev_rx,
+            _signals: head_sig,
         },
         Peer {
             outbound: portal_tx,
             events: portal_ev_rx,
+            _signals: portal_sig,
         },
     )
 }
@@ -280,12 +290,14 @@ async fn connect_with_video() -> (VideoPeer, Peer) {
 
     let (portal_tx, portal_rx) = mpsc::channel(8);
     let (portal_ev_tx, portal_ev_rx) = mpsc::channel(64);
+    let (sig, sig_rx) = mpsc::channel(8);
     tokio::spawn(driver::run(
         portal,
         portal_sock,
         channel,
         portal_rx,
         portal_ev_tx,
+        sig_rx,
     ));
 
     (
@@ -297,6 +309,7 @@ async fn connect_with_video() -> (VideoPeer, Peer) {
         Peer {
             outbound: portal_tx,
             events: portal_ev_rx,
+            _signals: sig,
         },
     )
 }

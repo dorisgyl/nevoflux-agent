@@ -68,7 +68,10 @@ pub struct PortalGateway {
     push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
     /// Which path this session's media takes, and whether a peer connection is
     /// forming. Always `Relay` in a build without the `webrtc` feature.
-    rtc: super::rtc::RtcState,
+    rtc: Arc<super::rtc::RtcState>,
+    /// This session's peer connection, when the feature is compiled in.
+    #[cfg(feature = "webrtc")]
+    peer: Mutex<super::rtc_peer::PeerSlot>,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -131,7 +134,9 @@ impl PortalGateway {
             ),
             announced: Mutex::new(std::collections::HashSet::new()),
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
-            rtc: super::rtc::RtcState::new(),
+            rtc: Arc::new(super::rtc::RtcState::new()),
+            #[cfg(feature = "webrtc")]
+            peer: Mutex::new(super::rtc_peer::PeerSlot::default()),
             media_sink: None,
         }
     }
@@ -463,23 +468,58 @@ impl PortalGateway {
         );
         #[cfg(not(feature = "webrtc"))]
         {
-            // Said once per session rather than per frame: a portal that keeps
-            // retrying should not fill the log with the same line.
-            if kind == "rtc_offer" {
+            if kind == "rtc_answer" {
                 tracing::info!(
                     target: "remote",
-                    "portal offered a peer connection; this build has no webrtc \
-                     support, staying on the relay"
+                    "this build has no webrtc support; staying on the relay"
                 );
             }
         }
         #[cfg(feature = "webrtc")]
         {
-            // The connection itself is driven by `nevoflux-rtc-transport`; this
-            // is the seam, and wiring the driver in is the remaining work.
             let _ = kind;
+            // Parsed here rather than at the session layer, so that layer stays
+            // free of str0m types and a build without the feature carries none.
+            match serde_json::from_value::<nevoflux_rtc_transport::signal::SignalFrame>(
+                frame.clone(),
+            ) {
+                Ok(f) => {
+                    let mut slot = self.peer.lock().await;
+                    super::rtc_peer::on_signal(f, &mut slot, Arc::clone(&self.rtc));
+                }
+                Err(e) => {
+                    tracing::debug!(target: "remote", "unreadable signalling frame: {e}");
+                }
+            }
         }
     }
+
+    /// Offer a peer connection to the portal, if this build and channel allow.
+    ///
+    /// Called once the portal is attached. Failing is the ordinary case — an
+    /// unsealed channel, a build without the feature, a machine with no route
+    /// out — and it costs nothing: the session stays on the relay, which works.
+    #[cfg(feature = "webrtc")]
+    pub async fn offer_peer_connection(&self) {
+        let sealed = self.session.lock().await.is_sealed();
+        let offer = {
+            let mut slot = self.peer.lock().await;
+            super::rtc_peer::begin(sealed, &mut slot).await
+        };
+        let Some(offer) = offer else { return };
+        let Ok(value) = serde_json::to_value(&offer) else {
+            return;
+        };
+
+        self.rtc.set_path(super::rtc::Path::Forming);
+        let wire = self.session.lock().await.downlink_frame(value);
+        self.sink.send(wire).await;
+        tracing::info!(target: "remote", "offered a peer connection to the portal");
+    }
+
+    /// No-op without the feature, so the call site needs no `cfg`.
+    #[cfg(not(feature = "webrtc"))]
+    pub async fn offer_peer_connection(&self) {}
 
     /// Honor a portal `resume{from}` (called by the WS read loop).
     ///
