@@ -15,6 +15,11 @@ embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
 tts-local = ["dep:nevoflux-tts"]
+# NOTE: `asr-sensevoice` / `asr-whisper` are added by the tasks that implement
+# those engines. A feature flag with no implementation behind it is a build
+# that fails for whoever turns it on, so the flag follows the engine rather
+# than announcing it. Routing, stitching and length checks are feature-free
+# and always compiled.
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:
 #   * ort-load-dynamic (default): load `libonnxruntime` at startup via
 #     ORT_DYLIB_PATH or bundled next to the exe. Runs on glibc >= 2.27; ship a
@@ -44,6 +49,7 @@ nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-tts = { path = "../tts", optional = true }
+nevoflux-asr = { path = "../asr" }
 nevoflux-brain = { path = "../brain" }
 nevoflux-pack = { path = "../pack" }
 

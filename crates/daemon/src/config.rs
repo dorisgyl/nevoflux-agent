@@ -111,11 +111,14 @@ pub struct TtsConfig {
     /// then `tts_synthesize_local` returns ConfigMissing.
     #[serde(default)]
     pub kokoro: KokoroConfig,
-    /// Whisper local ONNX path config (P5b-3). Same gating contract as
-    /// Kokoro — `tts_transcribe` returns ConfigMissing until
-    /// `model_path` resolves.
+    /// Whisper local config. Only reachable in a build with `asr-whisper`;
+    /// otherwise `tts_transcribe` reports EngineUnavailable rather than
+    /// anything about this section.
     #[serde(default)]
     pub whisper: WhisperConfig,
+    /// SenseVoice local ONNX config — the default transcription engine.
+    #[serde(default)]
+    pub sensevoice: SenseVoiceConfig,
 }
 
 /// Kokoro local TTS config.
@@ -179,6 +182,33 @@ pub struct WhisperConfig {
     /// Default model size (`tiny` / `base` / `small` / `medium`).
     #[serde(default)]
     pub default_size: Option<String>,
+}
+
+/// SenseVoice local ASR config — the default transcription engine.
+///
+/// `[tts.sensevoice]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.sensevoice]
+/// model_path = "~/.cache/nevoflux/models/sensevoice-small.int8.onnx"
+/// vad_path   = "~/.cache/nevoflux/models/fsmn-vad.onnx"
+/// threads    = 4
+/// ```
+///
+/// Both paths are optional: unset means look in `~/.cache/nevoflux/models/`
+/// for the names `just fetch-asr-models` writes. Those names are a local
+/// convention rather than the upstream ones, which disagree with each other.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SenseVoiceConfig {
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// fsmn-vad weights. Only consulted for audio longer than 30 s, which is
+    /// the most SenseVoice can take in one pass.
+    #[serde(default)]
+    pub vad_path: Option<String>,
+    /// ONNX intra-op thread count. None → logical cores capped at four,
+    /// matching the Kokoro default.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 /// ElevenLabs HTTP API config.

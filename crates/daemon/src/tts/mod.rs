@@ -1,26 +1,29 @@
 //! TTS subsystem (umbrella spec §7).
 //!
-//! P5b-1 ships the ElevenLabs HTTP API path; P5b-2 / P5b-3 add Kokoro
-//! local + Whisper local stubs that surface ConfigMissing until the
-//! `nevoflux-tts` workspace crate (ort + phonemizer + model fetch)
-//! lands. Splitting that out keeps ort linker complexity isolated
-//! from the daemon binary.
+//! P5b-1 ships the ElevenLabs HTTP API path and P5b-2 local Kokoro, both
+//! through the `nevoflux-tts` workspace crate. Transcription lives in
+//! [`asr`] and goes through `nevoflux-asr`; despite the module path it is
+//! not text-to-speech, but the tool has always been named `tts_transcribe`
+//! and that name is a wire contract.
+//!
+//! Splitting inference into workspace crates keeps ort/Candle linker
+//! complexity out of the daemon binary.
 //!
 //! Module layout:
 //! - [`error`]      shared error type with mapping to `HostError` codes.
 //! - [`elevenlabs`] HTTP client.
 //! - [`kokoro`]     local TTS scaffold (P5b-2).
-//! - [`whisper`]    local transcription scaffold (P5b-3).
+//! - [`asr`]        transcription: engine routing + audio decode.
 //!
 //! Dispatch entries (called by all three tool surfaces):
 //! - [`synthesize_api`]
 //! - [`synthesize_local`]
 //! - [`transcribe`]
 
+pub mod asr;
 pub mod elevenlabs;
 pub mod error;
 pub mod kokoro;
-pub mod whisper;
 
 use crate::config::ElevenLabsConfig;
 use error::TtsError;
@@ -29,7 +32,7 @@ use nevoflux_protocol::tts::{SynthesizeRequest, SynthesizeResponse};
 /// Re-export so dispatch arms can call `tts::synthesize_local` /
 /// `tts::transcribe` symmetric to `tts::synthesize_api`.
 pub use kokoro::{list_voices, synthesize_local};
-pub use whisper::transcribe;
+pub use asr::transcribe;
 
 /// ElevenLabs' ceiling per umbrella §7.8 — roughly 60 s of speech.
 pub const MAX_TEXT_LEN_API: usize = 600;

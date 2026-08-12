@@ -5469,10 +5469,11 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 4,
                 message: format!("invalid tts_transcribe args: {e}"),
             })?;
-        let cfg = self.config.tts.whisper.clone();
+        let cfg = self.config.tts.clone();
+        let database = self.services.as_ref().map(|s| s.database.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                crate::tts::transcribe(&cfg, &req)
+                crate::tts::transcribe(&cfg, &req, database.as_deref())
                     .await
                     .map_err(|e| HostError {
                         code: e.code() as i32,
