@@ -3527,6 +3527,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nevoflux-asr"
+version = "0.3.14"
+dependencies = [
+ "dirs 5.0.1",
+ "ndarray",
+ "ort",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nevoflux-brain"
 version = "0.3.14"
 dependencies = [
@@ -3619,6 +3630,7 @@ dependencies = [
  "image",
  "monty",
  "monty-types",
+ "nevoflux-asr",
  "nevoflux-brain",
  "nevoflux-builtin-wasm",
  "nevoflux-computer",
