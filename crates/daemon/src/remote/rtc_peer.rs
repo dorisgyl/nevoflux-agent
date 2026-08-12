@@ -53,6 +53,15 @@ pub enum PeerSlot {
         /// The TURN allocation, when one was granted. Handed to the driver with
         /// the endpoint, since it is the driver that has to route through it.
         relay: Option<nevoflux_rtc_transport::turn::Relay>,
+        /// The offer as sent, kept so it can be sent again.
+        ///
+        /// The relay does not hold frames for a channel nobody is attached to,
+        /// so an offer made before the portal arrived was delivered to no one.
+        /// Sending this one again is right rather than building a fresh offer:
+        /// the socket is still bound, its NAT pinhole is still the one the
+        /// candidates describe, and the fingerprint still matches the endpoint
+        /// waiting for an answer.
+        offer: SignalFrame,
     },
     /// Connected or connecting; a task owns the endpoint.
     Running {
@@ -67,6 +76,32 @@ impl PeerSlot {
         match self {
             PeerSlot::Running { data, .. } => data.try_send(bytes).is_ok(),
             _ => false,
+        }
+    }
+
+    /// Whether this slot still describes a negotiation or connection worth
+    /// keeping.
+    ///
+    /// A `Running` slot outlives its driver: the task that watches for the
+    /// connection dying can put the session back on the relay, but it does not
+    /// hold this slot and cannot clear it. Left alone, the dead slot would
+    /// answer "already connected" forever and no later offer would ever be
+    /// made — one dropped connection would cost the session the peer path for
+    /// as long as the relay socket lived. The driver owns the receiving end of
+    /// `data`, so its return closes this sender, which is the signal.
+    pub fn is_live(&self) -> bool {
+        match self {
+            PeerSlot::Idle => false,
+            PeerSlot::Offered { .. } => true,
+            PeerSlot::Running { data, .. } => !data.is_closed(),
+        }
+    }
+
+    /// The offer still waiting for an answer, if there is one.
+    pub fn pending_offer(&self) -> Option<SignalFrame> {
+        match self {
+            PeerSlot::Offered { offer, .. } => Some(offer.clone()),
+            _ => None,
         }
     }
 }
@@ -100,8 +135,16 @@ pub async fn begin(
     ice_servers: &[crate::config::IceServerConfig],
     slot: &mut PeerSlot,
 ) -> Option<SignalFrame> {
-    if matches!(slot, PeerSlot::Offered { .. } | PeerSlot::Running { .. }) {
-        return None; // already negotiating
+    if slot.is_live() {
+        return None; // already negotiating, or already connected
+    }
+    // Checked here as well as in the transport, which remains the authority on
+    // it. This call is retried whenever the portal is heard from, and gathering
+    // costs a round trip to every configured server — work worth skipping when
+    // the answer cannot change.
+    if !sealed {
+        tracing::debug!(target: "rtc", "not offering on an unsealed channel");
+        return None;
     }
 
     // Port 0: the OS picks. A fixed port would collide between two sessions on
@@ -176,6 +219,7 @@ pub async fn begin(
         socket,
         early: Vec::new(),
         relay,
+        offer: offer.clone(),
     };
     Some(offer)
 }
@@ -268,6 +312,7 @@ pub fn on_signal(
                 socket,
                 early,
                 relay,
+                ..
             } = std::mem::take(slot)
             else {
                 tracing::debug!(target: "rtc", "an answer with no outstanding offer");
@@ -501,5 +546,75 @@ mod tests {
         assert!(!slot.try_send(vec![1, 2, 3]));
         begin(true, &[], &mut slot).await.unwrap();
         assert!(!slot.try_send(vec![1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn the_outstanding_offer_is_kept_so_it_can_be_sent_again() {
+        // The relay delivers nothing to an empty channel, so the first offer is
+        // routinely thrown away. Sending this one again is what a portal that
+        // arrived late gets to answer.
+        let mut slot = PeerSlot::Idle;
+        let offer = begin(true, &[], &mut slot).await.expect("should offer");
+        assert_eq!(slot.pending_offer(), Some(offer));
+    }
+
+    #[tokio::test]
+    async fn there_is_nothing_to_resend_once_the_answer_is_in() {
+        let mut slot = PeerSlot::Idle;
+        begin(true, &[], &mut slot).await.unwrap();
+        // A junk answer frees the slot; either way the offer is no longer the
+        // thing to repeat.
+        on_signal(
+            SignalFrame::RtcAnswer {
+                sdp: "not sdp".into(),
+            },
+            "test-session",
+            &mut slot,
+            state(),
+        );
+        assert_eq!(slot.pending_offer(), None);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_ended_does_not_block_the_next_one() {
+        // The task watching a connection die can put the session back on the
+        // relay but cannot clear this slot. Left counting as live, one dropped
+        // connection would cost the session the peer path for good — every
+        // later offer refused on the grounds that one already exists.
+        let (data, data_rx) = mpsc::channel(1);
+        let (signals, _sig_rx) = mpsc::channel(1);
+        let mut slot = PeerSlot::Running { data, signals };
+        assert!(slot.is_live());
+        assert!(begin(true, &[], &mut slot).await.is_none());
+
+        // The driver owns the receiver; its return is what closes the sender.
+        drop(data_rx);
+        assert!(!slot.is_live());
+        assert!(
+            begin(true, &[], &mut slot).await.is_some(),
+            "a dead connection must not veto the next offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsealed_channel_is_refused_before_any_gathering() {
+        // This is retried every time the portal is heard from, and gathering
+        // costs a round trip to every configured server — including the full
+        // timeout on a network that drops UDP. A server here that were ever
+        // contacted would make the refusal expensive; the address is
+        // unroutable, so a run that finishes instantly proves it was not.
+        let unroutable = [crate::config::IceServerConfig {
+            url: "stun:192.0.2.1:3478".into(),
+            username: None,
+            credential: None,
+        }];
+        let mut slot = PeerSlot::Idle;
+        let started = std::time::Instant::now();
+        assert!(begin(false, &unroutable, &mut slot).await.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the unsealed refusal waited on a server: {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -72,9 +72,15 @@ pub struct PortalGateway {
     /// STUN/TURN servers for the peer path. Empty means host candidates only,
     /// which reaches a phone on the same network and nothing else.
     ice_servers: Vec<crate::config::IceServerConfig>,
+    /// A TURN key whose credentials are minted rather than configured, for a
+    /// provider that issues no lasting password.
+    cloudflare_turn: Option<crate::config::CloudflareTurnConfig>,
     /// This session's peer connection, when the feature is compiled in.
     #[cfg(feature = "webrtc")]
     peer: Mutex<super::rtc_peer::PeerSlot>,
+    /// When an offer was last put on the wire, so repeats stay cheap.
+    #[cfg(feature = "webrtc")]
+    last_offer: Mutex<Option<std::time::Instant>>,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -92,6 +98,18 @@ const UPLOAD_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
 /// How much disk one session's downstream media may occupy. Larger than the
 /// upload quota because this side carries recordings, not just pictures.
 const ASSET_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How often an offer may go out while no connection has formed.
+///
+/// The relay's presence notice is what normally triggers one, and that arrives
+/// exactly once per portal arriving — so this is not the mechanism, it is the
+/// bound on the backstop. Short enough that a portal whose notice went missing
+/// waits seconds rather than minutes, long enough that the repeats are nothing
+/// next to what the channel already carries: an SDP is a few KB, so a session
+/// where the peer path never forms spends well under a kilobyte a second on
+/// trying, and stops the moment it does form.
+#[cfg(feature = "webrtc")]
+const REOFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The upload ids a frame declares. A non-string entry is skipped rather than
 /// failing the whole message.
@@ -139,8 +157,11 @@ impl PortalGateway {
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
             rtc: Arc::new(super::rtc::RtcState::new()),
             ice_servers: Vec::new(),
+            cloudflare_turn: None,
             #[cfg(feature = "webrtc")]
             peer: Mutex::new(super::rtc_peer::PeerSlot::default()),
+            #[cfg(feature = "webrtc")]
+            last_offer: Mutex::new(None),
             media_sink: None,
         }
     }
@@ -164,6 +185,33 @@ impl PortalGateway {
     pub fn with_ice_servers(mut self, servers: Vec<crate::config::IceServerConfig>) -> Self {
         self.ice_servers = servers;
         self
+    }
+
+    /// A Cloudflare TURN key to mint relay credentials from.
+    ///
+    /// Separate from `with_ice_servers` because it is not a server — it is the
+    /// authority to ask for one. Cloudflare issues credentials that expire, so
+    /// the usable entries cannot be known until a connection is being offered.
+    pub fn with_cloudflare_turn(
+        mut self,
+        cfg: Option<crate::config::CloudflareTurnConfig>,
+    ) -> Self {
+        self.cloudflare_turn = cfg;
+        self
+    }
+
+    /// Every server this session can actually use, right now.
+    ///
+    /// The configured ones are constant; a minted relay is fetched (and cached
+    /// until shortly before it expires). Configured entries come first so a
+    /// deployment's own STUN server is asked before a third party's.
+    #[cfg(feature = "webrtc")]
+    async fn effective_ice_servers(&self) -> Vec<crate::config::IceServerConfig> {
+        let mut out = self.ice_servers.clone();
+        if let Some(cf) = self.cloudflare_turn.as_ref() {
+            out.extend(super::turn_creds::cloudflare(cf).await);
+        }
+        out
     }
 
     /// Start draining pushed frames onto the wire.
@@ -514,17 +562,74 @@ impl PortalGateway {
         }
     }
 
-    /// Offer a peer connection to the portal, if this build and channel allow.
+    /// Offer without making the read loop wait for it.
     ///
-    /// Called once the portal is attached. Failing is the ordinary case — an
-    /// unsealed channel, a build without the feature, a machine with no route
-    /// out — and it costs nothing: the session stays on the relay, which works.
+    /// The first offer after a portal arrives pays for a round trip to every
+    /// configured STUN and TURN server, and on a network that silently drops
+    /// UDP it pays the full timeout for each. The read loop is what delivers
+    /// everything the person is typing; it must not stop for this.
+    #[cfg(feature = "webrtc")]
+    fn spawn_offer(self: &std::sync::Arc<Self>) {
+        let gw = std::sync::Arc::clone(self);
+        tokio::spawn(async move { gw.offer_peer_connection().await });
+    }
+
+    /// No-op without the feature, so the call sites need no `cfg`.
+    #[cfg(not(feature = "webrtc"))]
+    fn spawn_offer(self: &std::sync::Arc<Self>) {}
+
+    /// Make sure the portal has an offer it can answer.
+    ///
+    /// Called when there is reason to believe somebody is on the channel, and
+    /// never merely because the relay socket came up. The relay keeps nothing
+    /// for a channel with no one attached, so an offer sent into an empty one
+    /// is not delivered late — it is dropped, and the portal that opened a
+    /// moment afterwards waits forever for it.
+    ///
+    /// Safe to call as often as that seems true. An offer already outstanding
+    /// is repeated rather than replaced, repeats are capped by
+    /// [`REOFFER_INTERVAL`], and a connection that is already carrying media is
+    /// left alone.
+    ///
+    /// Failing is the ordinary case — an unsealed channel, a build without the
+    /// feature, a machine with no route out — and it costs nothing: the session
+    /// stays on the relay, which works.
     #[cfg(feature = "webrtc")]
     pub async fn offer_peer_connection(&self) {
+        // Nothing to negotiate once the connection is up, and re-offering under
+        // a live channel would tear down the very thing being asked for.
+        if self.rtc.path() == super::rtc::Path::Peer {
+            return;
+        }
+        {
+            let mut last = self.last_offer.lock().await;
+            if last.is_some_and(|t| t.elapsed() < REOFFER_INTERVAL) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+
         let sealed = self.session.lock().await.is_sealed();
-        let offer = {
-            let mut slot = self.peer.lock().await;
-            super::rtc_peer::begin(sealed, &self.ice_servers, &mut slot).await
+        // An offer already outstanding is sent again rather than replaced.
+        // Building a fresh one would abandon a socket whose NAT pinhole the
+        // existing candidates describe, and hand the portal a second
+        // fingerprint to choose between.
+        // Bound to a name first, and deliberately: a guard taken in a `match`
+        // scrutinee lives until the end of the whole `match`, so reaching for
+        // the same lock in an arm deadlocks the task holding it.
+        let outstanding = self.peer.lock().await.pending_offer();
+        let offer = match outstanding {
+            Some(offer) => Some(offer),
+            None => {
+                // Resolved before the slot is taken, and not held on the
+                // gateway: a minted TURN credential expires, so one fetched
+                // when the channel opened would be stale by the time anyone
+                // connected — and minting is a round trip that an arriving
+                // answer must not have to queue behind.
+                let servers = self.effective_ice_servers().await;
+                let mut slot = self.peer.lock().await;
+                super::rtc_peer::begin(sealed, &servers, &mut slot).await
+            }
         };
         let Some(offer) = offer else { return };
         let Ok(value) = serde_json::to_value(&offer) else {
@@ -566,7 +671,29 @@ impl PortalGateway {
 
     /// Route one inbound WS message (the read loop's core): decode → inject an
     /// uplink `SidebarMessage` via `injector`, honor a `resume`, or ignore.
-    pub async fn on_wire_in(&self, wire: Wire, session_id: &str, injector: &dyn Injector) {
+    pub async fn on_wire_in(
+        self: &std::sync::Arc<Self>,
+        wire: Wire,
+        session_id: &str,
+        injector: &dyn Injector,
+    ) {
+        // The relay's own presence notice, which is plaintext and not a
+        // `WireMessage`. It is how this end finds out a portal is there, so it
+        // is read before anything tries to decrypt it.
+        if let Wire::Text(text) = &wire {
+            if let Some(n) = super::relay_protocol::peer_count(text) {
+                if n > 0 {
+                    self.spawn_offer();
+                }
+                return;
+            }
+        }
+        // Anything arriving also proves someone is there — a backstop for a
+        // notice or an offer that went missing, and the only thing that
+        // recovers a connection whose answer was lost. Cheap: an offer already
+        // outstanding is re-sent rather than rebuilt, and repeats are capped.
+        self.spawn_offer();
+
         let Some(msg) = self.session.lock().await.decode_wire(&wire) else {
             return;
         };
@@ -780,8 +907,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink, "sess", Some("agent".into()), None, "chan")
-            .with_upload_root(dir.path().to_path_buf());
+        let gw = Arc::new(
+            PortalGateway::new(None, sink, "sess", Some("agent".into()), None, "chan")
+                .with_upload_root(dir.path().to_path_buf()),
+        );
 
         let png = {
             use image::{ImageBuffer, Rgb};
@@ -815,8 +944,10 @@ mod tests {
     async fn a_rejected_upload_tells_the_phone_instead_of_going_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan")
-            .with_upload_root(dir.path().to_path_buf());
+        let gw = Arc::new(
+            PortalGateway::new(None, sink.clone(), "sess", None, None, "chan")
+                .with_upload_root(dir.path().to_path_buf()),
+        );
         let inj = CollectInjector::default();
 
         // A chunk for an upload that never began.
@@ -1108,14 +1239,14 @@ mod tests {
 
     #[tokio::test]
     async fn on_wire_in_user_message_injects_uplink() {
-        let gw = PortalGateway::new(
+        let gw = Arc::new(PortalGateway::new(
             None,
             Arc::new(CollectSink::default()),
             "sess",
             None,
             None,
             "chan",
-        );
+        ));
         let inj = CollectInjector::default();
         gw.on_wire_in(
             frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
@@ -1137,14 +1268,14 @@ mod tests {
         // The portal is their audience; the daemon receives them because the
         // relay cannot tell the two ends apart. They must never become a turn
         // — and swallowing them must not cost the next real frame either.
-        let gw = PortalGateway::new(
+        let gw = Arc::new(PortalGateway::new(
             None,
             Arc::new(CollectSink::default()),
             "sess",
             None,
             None,
             "chan",
-        );
+        ));
         let inj = CollectInjector::default();
         for notice in [r#"{"k":"peers","n":0}"#, r#"{"k":"peers","n":1}"#] {
             gw.on_wire_in(Wire::Text(notice.into()), "sess", &inj).await;
@@ -1170,12 +1301,137 @@ mod tests {
     #[tokio::test]
     async fn on_wire_in_resume_resends_via_sink() {
         let sink = Arc::new(CollectSink::default());
-        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            sink.clone(),
+            "sess",
+            None,
+            None,
+            "chan",
+        ));
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1 buffered
         sink.sent.lock().await.clear();
         let resume = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 1 }).unwrap());
         gw.on_wire_in(resume, "sess", &CollectInjector::default())
             .await;
         assert_eq!(sink.sent.lock().await.len(), 1); // resent seq 1
+    }
+
+    /// A gateway whose channel is sealed, which is the only kind that will
+    /// negotiate a peer connection at all.
+    #[cfg(feature = "webrtc")]
+    fn sealed_gw(sink: Arc<CollectSink>) -> Arc<PortalGateway> {
+        Arc::new(PortalGateway::new(
+            Some([7u8; 32]),
+            sink,
+            "sess",
+            None,
+            None,
+            "chan",
+        ))
+    }
+
+    /// Wait for the sink to hold `n` frames, or give up.
+    ///
+    /// The offer is made off the read loop, so there is nothing to await. A
+    /// deadline rather than a sleep: the assertion is what the loop is for, and
+    /// a fixed pause would either be flaky or slow.
+    #[cfg(feature = "webrtc")]
+    async fn wait_for_frames(sink: &CollectSink, n: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let got = sink.sent.lock().await.len();
+            if got >= n || std::time::Instant::now() > deadline {
+                return got;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_empty_channel_is_not_offered_a_peer_connection() {
+        // The relay delivers nothing to a channel nobody is attached to, so an
+        // offer sent now is not delivered late — it is thrown away, and the
+        // gathering that built it was spent for nothing.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+        gw.on_wire_in(
+            Wire::Text(r#"{"k":"peers","n":0}"#.into()),
+            "sess",
+            &CollectInjector::default(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "offered a peer connection to an empty channel"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_portal_arriving_is_what_triggers_the_offer() {
+        // The bug this exists to prevent: offering when the socket came up,
+        // which reaches whoever happened to be watching at that instant and
+        // nobody else. A portal opened a second later waited forever for an
+        // offer that had already been thrown away.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+        gw.on_wire_in(
+            Wire::Text(r#"{"k":"peers","n":1}"#.into()),
+            "sess",
+            &CollectInjector::default(),
+        )
+        .await;
+        assert_eq!(wait_for_frames(&sink, 1).await, 1, "no offer was sent");
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn the_same_offer_is_repeated_rather_than_renegotiated() {
+        // Building a fresh offer would abandon a socket whose NAT pinhole the
+        // existing candidates describe, and hand the portal a second
+        // fingerprint to choose between.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+
+        gw.offer_peer_connection().await;
+        let first = gw.peer.lock().await.pending_offer();
+        assert!(first.is_some(), "nothing was offered");
+        assert_eq!(sink.sent.lock().await.len(), 1);
+
+        // A repeat inside the interval costs nothing at all.
+        gw.offer_peer_connection().await;
+        assert_eq!(
+            sink.sent.lock().await.len(),
+            1,
+            "an offer went out inside the interval"
+        );
+
+        // Past it, the same offer goes again.
+        *gw.last_offer.lock().await = None;
+        gw.offer_peer_connection().await;
+        assert_eq!(sink.sent.lock().await.len(), 2);
+        assert_eq!(
+            gw.peer.lock().await.pending_offer(),
+            first,
+            "the repeat renegotiated instead of resending"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_live_connection_is_never_offered_over() {
+        // Re-offering under an open channel tears down the very thing being
+        // asked for: the portal replaces its peer connection on a second offer.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+        gw.rtc.set_path(super::super::rtc::Path::Peer);
+        gw.offer_peer_connection().await;
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "offered over a connection that was already carrying media"
+        );
     }
 }

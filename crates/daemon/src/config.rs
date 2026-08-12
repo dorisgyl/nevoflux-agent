@@ -114,6 +114,49 @@ pub struct RemoteControlConfig {
     /// ```
     #[serde(default)]
     pub ice_servers: Vec<IceServerConfig>,
+
+    /// A Cloudflare Realtime TURN key, for a relay whose credentials this head
+    /// mints for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_turn: Option<CloudflareTurnConfig>,
+}
+
+/// `[remote_control.cloudflare_turn]` — a TURN key rather than a TURN password.
+///
+/// Cloudflare does not issue long-lived TURN credentials: a key mints
+/// short-lived ones on demand. So this cannot be expressed as an
+/// [`IceServerConfig`] with a password in it — anything written into
+/// `config.toml` by hand would work until it expired and then fail in the one
+/// way that is hardest to recognise, as a connection that simply stops forming.
+///
+/// ```toml
+/// [remote_control.cloudflare_turn]
+/// key_id = "..."          # Realtime → TURN Keys in the dashboard
+/// api_token = "..."       # shown once, when the key is created
+/// ```
+///
+/// Any other provider — coturn, or a service that issues static passwords —
+/// belongs in `ice_servers` instead and needs nothing here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareTurnConfig {
+    /// The TURN key's id.
+    pub key_id: String,
+    /// The token that authorises minting credentials against that key.
+    pub api_token: String,
+    /// How long a minted credential should last, in seconds.
+    ///
+    /// Not a security boundary — a leaked credential relays somebody else's
+    /// encrypted packets at this account's expense and can read none of them.
+    /// It is a bound on that expense, and on how long a head keeps using an
+    /// allocation it can no longer refresh.
+    #[serde(default = "default_turn_ttl")]
+    pub ttl_seconds: u64,
+}
+
+/// An hour: long enough that a session does not re-mint mid-call, short enough
+/// that a credential which escapes is worth little.
+fn default_turn_ttl() -> u64 {
+    3600
 }
 
 /// One STUN or TURN server, as written in `config.toml`.

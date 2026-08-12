@@ -27,5 +27,6 @@ pub mod screencast;
 pub mod session;
 pub mod start;
 pub mod translate;
+pub mod turn_creds;
 pub mod upload;
 pub mod ws;

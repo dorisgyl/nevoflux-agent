@@ -478,6 +478,74 @@ async fn a_real_stun_server_reports_this_machine_s_public_address() {
     assert!(!public.ip().is_loopback());
 }
 
+/// Ask a real TURN server for a relay.
+///
+/// The one thing the stand-in server below cannot establish: whether the
+/// credentials in `config.toml` are accepted, and whether this network can
+/// reach the provider at all. A relayed candidate is what carries a session
+/// between two NATs that will not hole-punch — a phone on a carrier network
+/// and a desktop behind a corporate firewall is the ordinary case — so a
+/// deployment that has configured TURN wants to know it works before somebody
+/// is waiting on a picture that never arrives.
+///
+/// Reads the server from the environment rather than naming one, because the
+/// point is to test the deployment's own:
+///
+/// ```sh
+/// NEVOFLUX_TURN_URL=turn:turn.example.com:3478 /// NEVOFLUX_TURN_USER=u NEVOFLUX_TURN_PASS=p ///   cargo test -p nevoflux-rtc-transport --features tokio-driver ///   -- --ignored --nocapture a_real_turn_server
+/// ```
+#[tokio::test]
+#[ignore = "needs the internet and a configured TURN server"]
+async fn a_real_turn_server_grants_a_relay() {
+    use nevoflux_rtc_transport::gather;
+
+    let (Ok(url), Ok(user), Ok(pass)) = (
+        std::env::var("NEVOFLUX_TURN_URL"),
+        std::env::var("NEVOFLUX_TURN_USER"),
+        std::env::var("NEVOFLUX_TURN_PASS"),
+    ) else {
+        panic!(
+            "set NEVOFLUX_TURN_URL, NEVOFLUX_TURN_USER and NEVOFLUX_TURN_PASS              to the server this deployment uses"
+        );
+    };
+
+    // The same parse the daemon does, so a URL that works here works there.
+    let host_port = url
+        .split_once(':')
+        .map(|(_, rest)| rest.to_string())
+        .expect("a turn: url");
+    let host_port = if host_port.contains(':') {
+        host_port
+    } else {
+        format!("{host_port}:3478")
+    };
+    let addr = tokio::net::lookup_host(&host_port)
+        .await
+        .expect("resolves")
+        .next()
+        .expect("resolves to an address");
+
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    let (relayed, _creds) = gather::allocate(&socket, addr, &user, &pass)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "{host_port} ({addr}) granted no relay: wrong credentials, an                  unreachable server, or UDP blocked on this network"
+            )
+        });
+
+    eprintln!("{host_port} ({addr}) relays through {relayed}");
+    // A relayed address on the server's own network is the whole point; one
+    // that came back pointing at this machine would relay nothing.
+    assert!(!relayed.ip().is_loopback());
+    assert!(!relayed.ip().is_unspecified());
+    assert_ne!(
+        relayed,
+        socket.local_addr().unwrap(),
+        "the server handed back our own address"
+    );
+}
+
 /// A stand-in TURN server: answers the allocate challenge, binds a channel, and
 /// forwards what it is given.
 ///

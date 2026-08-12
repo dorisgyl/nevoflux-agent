@@ -35,6 +35,10 @@ pub struct ChannelRequest {
     /// internet has to configure at least a STUN server.
     #[allow(dead_code)] // read only under the `webrtc` feature
     pub ice_servers: Vec<crate::config::IceServerConfig>,
+    /// A Cloudflare TURN key, for a relay whose credentials expire and so
+    /// cannot be written into `ice_servers` by hand.
+    #[allow(dead_code)] // read only under the `webrtc` feature
+    pub cloudflare_turn: Option<crate::config::CloudflareTurnConfig>,
 }
 
 /// Why a channel could not be opened.
@@ -140,7 +144,8 @@ pub async fn open_channel_with_token(
             &req.channel_id,
         )
         .with_media_sink(media_sink.clone())
-        .with_ice_servers(req.ice_servers.clone()),
+        .with_ice_servers(req.ice_servers.clone())
+        .with_cloudflare_turn(req.cloudflare_turn.clone()),
     );
     registry.lock().await.register(gateway.clone());
     gateway.spawn_pump().await;
@@ -199,6 +204,7 @@ mod tests {
             execution_tier: Some("full-auto".into()),
             injector_proxy_id: "remote-control".into(),
             ice_servers: Vec::new(),
+            cloudflare_turn: None,
         }
     }
 

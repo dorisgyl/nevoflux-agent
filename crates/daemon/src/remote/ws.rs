@@ -257,11 +257,13 @@ pub async fn run_gateway(
                 sink.set(write).await;
                 // Tell the portal what this head is set to, before any chat.
                 gateway.announce().await;
-                // Then offer a direct path. Sent after the announce so a portal
-                // that only wants to talk is never left waiting on a
-                // negotiation it does not need, and a no-op in a build without
-                // the feature or on a channel with no key.
-                gateway.offer_peer_connection().await;
+                // No offer here. The relay keeps nothing for a channel with no
+                // one attached, so an offer made now reaches whoever happens to
+                // be watching at this instant and nobody else — and a portal
+                // opened a second later would wait forever for one that had
+                // already been thrown away. The relay tells this end when a
+                // portal is there, on joining and on arrival; that is what
+                // triggers the offer, in `on_wire_in`.
                 serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
                 sink.clear().await;
                 // A dropped socket is not a failed attempt; reconnect promptly.
@@ -287,7 +289,7 @@ pub async fn run_gateway(
 async fn serve(
     mut read: WsRead,
     sink: &WsSink,
-    gateway: &PortalGateway,
+    gateway: &Arc<PortalGateway>,
     session_id: &str,
     injector: &dyn Injector,
 ) {

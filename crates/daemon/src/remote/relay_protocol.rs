@@ -34,6 +34,23 @@ pub enum WireMessage {
     Resync,
 }
 
+/// How many other ends are on the channel, if this text is the relay saying so.
+///
+/// The relay volunteers this — to a socket as it joins, to the survivors when
+/// one leaves, and to a sender whose message reached nobody. It holds no
+/// channel key, so these notices arrive as plaintext on a channel that is
+/// otherwise ciphertext and none of them is a [`WireMessage`].
+///
+/// It is also the only evidence this end ever gets that somebody is listening.
+/// The relay keeps nothing for a channel with no one attached, so a frame sent
+/// into an empty channel is not delivered late — it is not delivered at all,
+/// and the sender is told so by an `n` of zero. Anything that only makes sense
+/// to send when there is an audience has to wait for this to say there is one.
+pub fn peer_count(text: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    (v.get("k")?.as_str()? == "peers").then(|| v.get("n")?.as_u64())?
+}
+
 /// Upper bound on retained entries. A ceiling on the deque itself, not the
 /// memory policy — [`SEND_BUFFER_BYTES`] is what actually decides how far back
 /// resume reaches. A `resume{from}` older than what the buffer still holds
@@ -528,6 +545,33 @@ mod tests {
         match seq.tag(frame("s")) {
             WireMessage::Frame { seq: Some(0), .. } => {}
             other => panic!("after reset seq restarts at 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_relays_presence_notice_is_recognised() {
+        // This is the only thing that tells the head a portal is listening, and
+        // the head sends nothing worth sending until it hears it.
+        assert_eq!(peer_count(r#"{"k":"peers","n":0}"#), Some(0));
+        assert_eq!(peer_count(r#"{"k":"peers","n":1}"#), Some(1));
+        assert_eq!(peer_count(r#"{"n":2,"k":"peers"}"#), Some(2));
+    }
+
+    #[test]
+    fn nothing_else_is_mistaken_for_one() {
+        // Read before decryption, so it sees ciphertext, chat and control
+        // frames alike. Anything it claims is a presence notice is a frame that
+        // never reaches the conversation.
+        for not_a_notice in [
+            r#"{"k":"frame","frame":{"kind":"user_message"}}"#,
+            r#"{"k":"resume","from":3}"#,
+            r#"{"k":"peers"}"#,
+            r#"{"k":"peers","n":"1"}"#,
+            r#"{"k":"peers","n":-1}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(peer_count(not_a_notice), None, "{not_a_notice}");
         }
     }
 }
