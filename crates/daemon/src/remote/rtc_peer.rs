@@ -121,6 +121,12 @@ pub async fn begin(
     let addr = std::net::SocketAddr::new(outbound_ip().await?, port);
 
     let mut endpoint = RtcEndpoint::new(sealed, std::time::Instant::now());
+    // Negotiated up front rather than when someone asks for it. Adding a track
+    // to a live connection is a renegotiation — a full offer/answer over the
+    // relay at the exact moment a person is waiting to see a screen. The cost
+    // of carrying an unused m-line is an SSRC and some RTCP; the cost of the
+    // round trip is the thing anyone would actually notice.
+    endpoint.want_video();
     if let Err(e) = driver::add_host_candidate(endpoint.rtc_mut(), addr) {
         tracing::debug!(target: "rtc", "cannot advertise {addr}: {e}");
         return None;
@@ -249,7 +255,12 @@ async fn allocate_relay(
 ///
 /// `state` is updated as the connection forms and dies, so whoever routes a
 /// range can ask one question and get an answer that is currently true.
-pub fn on_signal(frame: SignalFrame, slot: &mut PeerSlot, state: Arc<RtcState>) -> Option<Vec<u8>> {
+pub fn on_signal(
+    frame: SignalFrame,
+    session_id: &str,
+    slot: &mut PeerSlot,
+    state: Arc<RtcState>,
+) -> Option<Vec<u8>> {
     match frame {
         SignalFrame::RtcAnswer { .. } => {
             let PeerSlot::Offered {
@@ -278,20 +289,32 @@ pub fn on_signal(frame: SignalFrame, slot: &mut PeerSlot, state: Arc<RtcState>) 
                 state.set_path(Path::Relay);
                 return None;
             };
+            let video_mid = endpoint.video_mid();
 
             let (data_tx, data_rx) = mpsc::channel(OUTBOUND_QUEUE);
             let (sig_tx, sig_rx) = mpsc::channel(OUTBOUND_QUEUE);
             let (ev_tx, mut ev_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
             state.set_path(Path::Forming);
+            // A video feed only when the track was negotiated. Registered
+            // before the driver starts so a tool asking "can this session
+            // share a screen?" gets a true answer immediately rather than
+            // racing the first frame.
+            let video = video_mid.map(|mid| {
+                let (vtx, vrx) = mpsc::channel::<Vec<u8>>(4);
+                super::screencast::register_sink(&session_id, vtx);
+                nevoflux_rtc_transport::driver::VideoFeed { mid, frames: vrx }
+            });
+
             tokio::spawn(driver::run(
-                *endpoint, socket, channel, data_rx, ev_tx, sig_rx, relay,
+                *endpoint, socket, channel, data_rx, ev_tx, sig_rx, relay, video,
             ));
 
             // The path is only `Peer` while the channel is genuinely open, and
             // goes back to `Relay` the moment it is not. A session left
             // claiming a dead path would send every range into nothing.
             let watch = Arc::clone(&state);
+            let gone = session_id.to_string();
             tokio::spawn(async move {
                 while let Some(ev) = ev_rx.recv().await {
                     match ev {
@@ -304,6 +327,9 @@ pub fn on_signal(frame: SignalFrame, slot: &mut PeerSlot, state: Arc<RtcState>) 
                     }
                 }
                 tracing::info!(target: "rtc", "peer connection gone; back on the relay");
+                // A screencast outliving its connection is a camera left
+                // running with nowhere to send the picture.
+                super::screencast::forget_session(&gone);
                 watch.set_path(Path::Relay);
             });
 
@@ -392,6 +418,7 @@ mod tests {
                 candidate: "candidate:1 1 UDP 1 192.0.2.1 5000 typ host".into(),
                 mid: None,
             },
+            "test-session",
             &mut slot,
             state(),
         );
@@ -410,6 +437,7 @@ mod tests {
             SignalFrame::RtcAnswer {
                 sdp: "v=0\r\n".into(),
             },
+            "test-session",
             &mut slot,
             Arc::clone(&s),
         );
@@ -426,6 +454,7 @@ mod tests {
             SignalFrame::RtcAnswer {
                 sdp: "not sdp".into(),
             },
+            "test-session",
             &mut slot,
             Arc::clone(&s),
         );
@@ -442,6 +471,7 @@ mod tests {
         s.set_path(Path::Forming);
         on_signal(
             SignalFrame::RtcClose { reason: None },
+            "test-session",
             &mut slot,
             Arc::clone(&s),
         );
@@ -458,6 +488,7 @@ mod tests {
             SignalFrame::RtcOffer {
                 sdp: "v=0\r\n".into(),
             },
+            "test-session",
             &mut slot,
             state(),
         );

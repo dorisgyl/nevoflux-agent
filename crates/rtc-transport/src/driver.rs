@@ -110,6 +110,18 @@ pub fn send_on_channel(rtc: &mut Rtc, id: ChannelId, binary: bool, data: &[u8]) 
     }
 }
 
+/// A screencast to put on the connection's video track.
+///
+/// Handed in at start rather than attached later, because attaching a track to
+/// a live connection is a renegotiation — a full offer/answer round trip at the
+/// moment someone asked to see the screen, which is the worst moment to spend
+/// one.
+#[cfg(feature = "tokio-driver")]
+pub struct VideoFeed {
+    pub mid: str0m::media::Mid,
+    pub frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
 /// What the driver reports upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
@@ -190,6 +202,7 @@ mod tokio_driver {
         events: mpsc::Sender<DriverEvent>,
         mut signals: mpsc::Receiver<crate::signal::SignalFrame>,
         mut relay: Option<crate::turn::Relay>,
+        video: Option<VideoFeed>,
     ) {
         let local = match socket.local_addr() {
             Ok(a) => a,
@@ -201,6 +214,11 @@ mod tokio_driver {
         };
         let mut buf = vec![0u8; RECV_BUF];
         let mut refresh_due = Instant::now();
+        let (video_mid, mut video_rx) = match video {
+            Some(v) => (Some(v.mid), Some(v.frames)),
+            None => (None, None),
+        };
+        let started = Instant::now();
 
         loop {
             let rtc = endpoint.rtc_mut();
@@ -311,6 +329,30 @@ mod tokio_driver {
                 // trickles srflx and relay ones as its own gathering finishes.
                 // Without this they would have nowhere to go, and a connection
                 // that needed a relayed path would simply never form.
+                // Encoded frames from the capture process, when there is one.
+                // `recv` on a `None` receiver would resolve immediately and spin
+                // the loop, so a session with no screencast has this arm
+                // disabled rather than firing constantly.
+                frame = async {
+                    match video_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match (frame, video_mid) {
+                    (Some(data), Some(mid)) => {
+                        // Dropped silently before the track is live. Capture
+                        // starts when the user asks and the connection takes a
+                        // moment; those frames are stale by the time anyone
+                        // could see them.
+                        send_video(endpoint.rtc_mut(), mid, started.elapsed(), &data);
+                    }
+                    (None, _) => {
+                        // Capture ended. The connection carries on — the data
+                        // channel is still doing its job.
+                        video_rx = None;
+                    }
+                    _ => {}
+                },
                 sig = signals.recv() => match sig {
                     Some(crate::signal::SignalFrame::RtcCandidate { candidate, .. }) => {
                         let rtc = endpoint.rtc_mut();

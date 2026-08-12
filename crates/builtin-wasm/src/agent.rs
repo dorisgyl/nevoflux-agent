@@ -2448,6 +2448,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "screencast_start" => {
+                let resp = self.host.screencast_start(&tool_call.arguments)?;
+                serde_json::to_string(&resp).unwrap_or_default()
+            }
+            "screencast_stop" => {
+                let resp = self.host.screencast_stop(&tool_call.arguments)?;
+                serde_json::to_string(&resp).unwrap_or_default()
+            }
             "play_local_file" => {
                 let resp = self.host.play_local_file(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
@@ -2625,6 +2633,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "canvas_attach_asset"
                 | "canvas_inspect_layout"
                 | "play_local_file"
+                | "screencast_start"
+                | "screencast_stop"
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_voices"
@@ -3505,6 +3515,27 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                         "path": { "type": "string", "description": "Absolute path to the file, or one starting with ~/." }
                     },
                     "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "screencast_start".into(),
+                description: "Share this machine's screen LIVE with whoever is watching this session, as video they see in real time. Use this when asked to show what you are doing, share your screen, or let someone watch along -- NOT for a still picture (take a screenshot) and NOT for a file already on disk (play_local_file). Needs a direct peer connection to the viewer: it will refuse if the session is on the relay path, because a relay carries files and pictures but not a live stream. Asks the user's permission first, since it records the screen. Keeps running until screencast_stop, the connection drops, or the session ends -- say so in your reply, because nothing else tells them it is on.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "fps": { "type": "integer", "description": "Frames per second, 1-60. Defaults to 30. Lower it for a slow link; the bitrate estimate adapts on its own either way." },
+                        "bitrate_bps": { "type": "integer", "description": "Starting bitrate in bits per second; defaults to 4000000. Congestion control moves it from there, so this is a starting point rather than a limit." }
+                    },
+                    "required": []
+                }),
+            },
+            ToolDefinition {
+                name: "screencast_stop".into(),
+                description: "Stop sharing this machine's screen. No arguments. Say that sharing has stopped -- the viewer's picture simply freezes and then goes, which on its own looks like a fault rather than an ending.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }),
             },
             ToolDefinition {

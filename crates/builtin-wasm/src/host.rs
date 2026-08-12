@@ -654,6 +654,24 @@ pub trait HostFunctions {
         })
     }
 
+    /// Start sharing this machine's screen with whoever is watching the
+    /// session, over the peer connection's video track. Hosts without one
+    /// inherit the default Unsupported.
+    fn screencast_start(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "screencast_start not supported by this host".into(),
+        })
+    }
+
+    /// Stop sharing the screen.
+    fn screencast_stop(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "screencast_stop not supported by this host".into(),
+        })
+    }
+
     /// Synthesize speech via local Kokoro ONNX inference (P5b-2).
     /// Daemon-side reads `[tts.kokoro] model_path / voices_path` and
     /// returns ConfigMissing until the model files exist. Hosts without

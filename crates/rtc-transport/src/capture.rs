@@ -621,7 +621,7 @@ pub fn rtp_time(elapsed: Duration) -> u64 {
 }
 
 #[cfg(feature = "tokio-driver")]
-pub use spawn::{run_capture, CaptureHandle};
+pub use spawn::{run_capture, CaptureHandle, Frame};
 
 #[cfg(feature = "tokio-driver")]
 mod spawn {

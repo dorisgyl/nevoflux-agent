@@ -500,7 +500,12 @@ impl PortalGateway {
             ) {
                 Ok(f) => {
                     let mut slot = self.peer.lock().await;
-                    super::rtc_peer::on_signal(f, &mut slot, Arc::clone(&self.rtc));
+                    super::rtc_peer::on_signal(
+                        f,
+                        &self.session_id,
+                        &mut slot,
+                        Arc::clone(&self.rtc),
+                    );
                 }
                 Err(e) => {
                     tracing::debug!(target: "remote", "unreadable signalling frame: {e}");
