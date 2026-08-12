@@ -174,6 +174,10 @@ mod tokio_driver {
     /// that does not fit is one this connection was never going to receive.
     const RECV_BUF: usize = 2048;
 
+    /// How often to renew a TURN allocation. Well inside the ten minutes a
+    /// server grants, because losing it drops the call with no other symptom.
+    const RELAY_REFRESH: std::time::Duration = std::time::Duration::from_secs(240);
+
     /// Own the socket and the clock until the connection ends.
     ///
     /// Returns when the connection dies, so the caller can fall back. Outbound
@@ -185,6 +189,7 @@ mod tokio_driver {
         mut outbound: mpsc::Receiver<Vec<u8>>,
         events: mpsc::Sender<DriverEvent>,
         mut signals: mpsc::Receiver<crate::signal::SignalFrame>,
+        mut relay: Option<crate::turn::Relay>,
     ) {
         let local = match socket.local_addr() {
             Ok(a) => a,
@@ -195,6 +200,7 @@ mod tokio_driver {
             }
         };
         let mut buf = vec![0u8; RECV_BUF];
+        let mut refresh_due = Instant::now();
 
         loop {
             let rtc = endpoint.rtc_mut();
@@ -207,6 +213,20 @@ mod tokio_driver {
             };
 
             for t in turn.transmits {
+                // A transmit whose source is the relayed address is one str0m
+                // wants to go through TURN. Sending it directly would work
+                // exactly once — from the wrong address, so the far end's ICE
+                // would reject it — and then never.
+                let via_relay = match relay.as_mut() {
+                    Some(r) if t.source == r.relayed => {
+                        r.send_to(&socket, t.destination, &t.contents).await;
+                        true
+                    }
+                    _ => false,
+                };
+                if via_relay {
+                    continue;
+                }
                 if let Err(e) = socket.send_to(&t.contents, t.destination).await {
                     // One undeliverable datagram is not the end of a call —
                     // ICE and SCTP both retransmit. A closed socket will come
@@ -233,8 +253,25 @@ mod tokio_driver {
             tokio::select! {
                 got = socket.recv_from(&mut buf) => match got {
                     Ok((n, from)) => {
+                        // Anything from the TURN server is either data it
+                        // forwarded — which has to be unwrapped and presented
+                        // as coming from the peer, not from the relay, or ICE
+                        // would pair it with the wrong candidate — or an answer
+                        // about a channel binding.
+                        let (source, payload) = match relay.as_mut() {
+                            Some(r) if from == r.server => {
+                                match r.unwrap_from(&buf[..n]) {
+                                    Some((peer, data)) => (peer, data),
+                                    None => {
+                                        r.on_reply(&buf[..n]);
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => (from, buf[..n].to_vec()),
+                        };
                         let rtc = endpoint.rtc_mut();
-                        if let Err(e) = receive(rtc, Instant::now(), from, local, &buf[..n]) {
+                        if let Err(e) = receive(rtc, Instant::now(), source, local, &payload) {
                             tracing::warn!(target: "rtc", "input rejected: {e}");
                             break;
                         }
@@ -245,6 +282,15 @@ mod tokio_driver {
                     }
                 },
                 _ = tokio::time::sleep(sleep) => {
+                    // Kept alive on the same tick as everything else. An
+                    // allocation the server times out takes the relay path with
+                    // it, mid-call, with no other symptom.
+                    if let Some(r) = relay.as_mut() {
+                        if refresh_due.elapsed() >= RELAY_REFRESH {
+                            r.refresh(&socket).await;
+                            refresh_due = Instant::now();
+                        }
+                    }
                     let rtc = endpoint.rtc_mut();
                     if let Err(e) = tick(rtc, Instant::now()) {
                         tracing::warn!(target: "rtc", "timeout rejected: {e}");
@@ -480,6 +526,22 @@ pub fn add_reflexive_candidate(
     base: SocketAddr,
 ) -> Result<(), RtcError> {
     let c = Candidate::server_reflexive(public, base, Protocol::Udp).map_err(RtcError::from)?;
+    rtc.add_local_candidate(c);
+    Ok(())
+}
+
+/// Announce an address on a relay that will forward for this socket.
+///
+/// Only worth adding once the relay can actually carry traffic — ICE will
+/// select a relayed pair if it is the only one that works, and a candidate
+/// whose data path is missing turns "no connection" into "a connection that
+/// forms and then delivers nothing".
+pub fn add_relayed_candidate(
+    rtc: &mut Rtc,
+    relayed: SocketAddr,
+    base: SocketAddr,
+) -> Result<(), RtcError> {
+    let c = Candidate::relayed(relayed, base, Protocol::Udp).map_err(RtcError::from)?;
     rtc.add_local_candidate(c);
     Ok(())
 }

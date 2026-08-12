@@ -29,6 +29,7 @@ declared-SSRC track, which silently kills all receive-side feedback.
 | `ice.rs` | STUN/TURN configuration, validated when it is read rather than when a call fails |
 | `gather.rs` | Asking a STUN server for the reflexive address, and a TURN server for a relay |
 | `stun_wire.rs` | Reading server replies — see below for why `is::stun::parse` cannot |
+| `turn.rs` | ChannelData framing, channel binds, refreshes — the relay's data path |
 
 The first two are sans-IO and unit-tested, including a negotiation between two
 endpoints passing nothing but serialized `SignalFrame`s. `driver.rs` is split
@@ -64,15 +65,14 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **Relaying through TURN.** `gather::allocate` performs the allocation, but
-  nothing yet routes traffic through the relay — a relayed candidate has to be
-  wrapped in ChannelData or Send indications on the way out and unwrapped on the
-  way in, and until that exists advertising one would be offering a path that
-  cannot carry anything. So today: host and reflexive candidates.
-- **Proof between two networks.** Loopback proves the driver; the live STUN test
-  proves this machine can learn its public address. Whether hole-punching
-  actually succeeds, and how often, can only be measured phone-to-machine across
-  real NATs.
+- **Proof between two networks.** Loopback proves the driver, the live STUN test
+  proves this machine can learn its public address, and a stand-in TURN server
+  proves the relay path allocates, binds and forwards. Whether hole-punching
+  succeeds against a *particular* pair of real NATs, and how often, can only be
+  measured phone-to-machine.
+- **A real TURN provider.** The protocol side is done and tested against a
+  stand-in; nothing has been run against a commercial service, which is where
+  quirks live.
 
 The channel payloads, at least, need no new protocol.
 `crates/daemon/src/remote/media_frame.rs` already frames a range as bytes and

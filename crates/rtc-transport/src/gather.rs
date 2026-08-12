@@ -52,7 +52,7 @@ const MSG_BUF: usize = 1500;
 ///
 /// Passed to the codec as a closure because `is` does not want to choose a
 /// crypto implementation for its users.
-fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
+pub(crate) fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
     let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("hmac accepts any key length");
     for p in parts {
         mac.update(p);
@@ -65,7 +65,7 @@ fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
 /// MD5 is not a choice — RFC 5389 specifies it, and a TURN server will reject
 /// anything else. It is a key derivation the protocol fixes, not a security
 /// decision being made here.
-fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
+pub(crate) fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
     md5::compute(format!("{username}:{realm}:{password}").as_bytes())
         .0
         .to_vec()
@@ -233,17 +233,32 @@ mod io {
     /// request with a 401 carrying the realm and a nonce, and only then can the
     /// request be signed. Anything else — unreachable, refused, timed out —
     /// returns `None` and the session goes without a relayed candidate.
+    ///
+    /// The negotiated credentials come back with the address because every
+    /// later request on this allocation — binding a channel, refreshing it —
+    /// has to be signed with the same realm and nonce. Discarding them would
+    /// mean an allocation nothing could then use.
     pub async fn allocate(
         socket: &UdpSocket,
         server: SocketAddr,
         username: &str,
         password: &str,
-    ) -> Option<SocketAddr> {
+    ) -> Option<(SocketAddr, crate::turn::Credentials)> {
         let challenge = allocate_once(socket, server, None).await?;
         let (realm, nonce) = match challenge {
             AllocateReply::NeedsAuth { realm, nonce } => (realm, nonce),
             // A server that allocates without credentials is unusual but legal.
-            AllocateReply::Allocated { relayed, .. } => return Some(relayed),
+            AllocateReply::Allocated { relayed, .. } => {
+                return Some((
+                    relayed,
+                    crate::turn::Credentials {
+                        username: username.into(),
+                        password: password.into(),
+                        realm: String::new(),
+                        nonce: String::new(),
+                    },
+                ));
+            }
             AllocateReply::Rejected { code } => {
                 tracing::debug!(target: "rtc", %server, code, "TURN refused");
                 return None;
@@ -253,7 +268,15 @@ mod io {
         match allocate_once(socket, server, Some((username, &realm, &nonce, password))).await? {
             AllocateReply::Allocated { relayed, lifetime } => {
                 tracing::info!(target: "rtc", %server, %relayed, lifetime, "relay allocated");
-                Some(relayed)
+                Some((
+                    relayed,
+                    crate::turn::Credentials {
+                        username: username.into(),
+                        password: password.into(),
+                        realm,
+                        nonce,
+                    },
+                ))
             }
             AllocateReply::Rejected { code } => {
                 // 401 here means the credentials themselves are wrong, which is

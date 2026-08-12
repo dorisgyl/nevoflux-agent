@@ -25,7 +25,10 @@ tokio-driver = ["dep:tokio"]
 
 [dependencies.tokio]
 workspace = true
-features = ["net", "time", "sync", "rt", "macros"]
+# `process` and `io-util` are for the capture child process. Without them
+# the library only builds when a dev-dependency happens to unify
+# tokio's features in — which the test build did, hiding this.
+features = ["net", "time", "sync", "rt", "macros", "process", "io-util"]
 optional = true
 
 [dev-dependencies]

@@ -50,6 +50,9 @@ pub enum PeerSlot {
         /// them needs a remote description, so they wait here rather than being
         /// dropped — on a fast link they routinely arrive first.
         early: Vec<String>,
+        /// The TURN allocation, when one was granted. Handed to the driver with
+        /// the endpoint, since it is the driver that has to route through it.
+        relay: Option<nevoflux_rtc_transport::turn::Relay>,
     },
     /// Connected or connecting; a task owns the endpoint.
     Running {
@@ -141,6 +144,18 @@ pub async fn begin(
         }
     }
 
+    // Last, because it costs credentials and bandwidth and is only needed where
+    // no direct path can exist. Advertised only once it actually exists —
+    // offering a relayed candidate the data path cannot carry would give ICE a
+    // route it selects and then fails on, which is worse than not offering it.
+    let relay = allocate_relay(&socket, ice_servers).await;
+    if let Some(r) = relay.as_ref() {
+        match driver::add_relayed_candidate(endpoint.rtc_mut(), r.relayed, addr) {
+            Ok(()) => tracing::info!(target: "rtc", relayed = %r.relayed, "advertising a relay"),
+            Err(e) => tracing::debug!(target: "rtc", "cannot advertise the relay: {e}"),
+        }
+    }
+
     let offer = match endpoint.offer() {
         Ok(o) => o,
         Err(e) => {
@@ -154,6 +169,7 @@ pub async fn begin(
         endpoint: Box::new(endpoint),
         socket,
         early: Vec::new(),
+        relay,
     };
     Some(offer)
 }
@@ -200,6 +216,35 @@ async fn resolve(url: &str) -> Option<std::net::SocketAddr> {
     tokio::net::lookup_host(with_port).await.ok()?.next()
 }
 
+/// Ask each configured TURN server for a relay, stopping at the first.
+///
+/// One is enough: a second allocation costs another port on another provider
+/// and ICE would only ever use one of them.
+async fn allocate_relay(
+    socket: &UdpSocket,
+    servers: &[crate::config::IceServerConfig],
+) -> Option<nevoflux_rtc_transport::turn::Relay> {
+    for s in servers {
+        let (Some(user), Some(pass)) = (s.username.as_deref(), s.credential.as_deref()) else {
+            continue; // a STUN entry, or a TURN one missing credentials
+        };
+        if !s.url.starts_with("turn:") && !s.url.starts_with("turns:") {
+            continue;
+        }
+        let Some(addr) = resolve(&s.url).await else {
+            continue;
+        };
+        if let Some((relayed, creds)) =
+            nevoflux_rtc_transport::gather::allocate(socket, addr, user, pass).await
+        {
+            return Some(nevoflux_rtc_transport::turn::Relay::new(
+                addr, relayed, creds,
+            ));
+        }
+    }
+    None
+}
+
 /// Take one signalling frame from the portal.
 ///
 /// `state` is updated as the connection forms and dies, so whoever routes a
@@ -211,6 +256,7 @@ pub fn on_signal(frame: SignalFrame, slot: &mut PeerSlot, state: Arc<RtcState>) 
                 mut endpoint,
                 socket,
                 early,
+                relay,
             } = std::mem::take(slot)
             else {
                 tracing::debug!(target: "rtc", "an answer with no outstanding offer");
@@ -239,7 +285,7 @@ pub fn on_signal(frame: SignalFrame, slot: &mut PeerSlot, state: Arc<RtcState>) 
 
             state.set_path(Path::Forming);
             tokio::spawn(driver::run(
-                *endpoint, socket, channel, data_rx, ev_tx, sig_rx,
+                *endpoint, socket, channel, data_rx, ev_tx, sig_rx, relay,
             ));
 
             // The path is only `Peer` while the channel is genuinely open, and

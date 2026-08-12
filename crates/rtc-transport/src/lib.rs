@@ -41,6 +41,7 @@ pub mod gather;
 pub mod ice;
 pub mod signal;
 pub mod stun_wire;
+pub mod turn;
 
 /// Signalling is refused on a channel with no key. See [`signal::SignalGuard`].
 ///

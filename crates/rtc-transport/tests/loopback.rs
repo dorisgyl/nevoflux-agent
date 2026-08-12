@@ -95,6 +95,8 @@ async fn connect() -> (Peer, Peer) {
         head_rx,
         head_ev_tx,
         head_sig_rx,
+        // No relay: loopback has nothing to traverse.
+        None,
     ));
 
     // The answerer learns its channel id from the ChannelOpen event, so the id
@@ -110,6 +112,7 @@ async fn connect() -> (Peer, Peer) {
         portal_rx,
         portal_ev_tx,
         portal_sig_rx,
+        None,
     ));
 
     (
@@ -298,6 +301,7 @@ async fn connect_with_video() -> (VideoPeer, Peer) {
         portal_rx,
         portal_ev_tx,
         sig_rx,
+        None,
     ));
 
     (
@@ -468,4 +472,191 @@ async fn a_real_stun_server_reports_this_machine_s_public_address() {
          behind a NAT and the test proves nothing about traversal"
     );
     assert!(!public.ip().is_loopback());
+}
+
+/// A stand-in TURN server: answers the allocate challenge, binds a channel, and
+/// forwards what it is given.
+///
+/// Not a conformant implementation — it exists to prove this side speaks the
+/// protocol well enough to get an allocation, bind a channel, and move a
+/// payload through it. Those three are exactly what a relayed candidate needs
+/// in order not to be a path ICE selects and then fails on.
+mod fake_turn {
+    use super::*;
+    use std::net::SocketAddr;
+
+    pub struct Seen {
+        pub allocated: bool,
+        pub bound: bool,
+        pub forwarded: Vec<Vec<u8>>,
+    }
+
+    /// Build a STUN reply by hand.
+    fn reply(typ: u16, trans_id: &[u8], attrs: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (a, v) in attrs {
+            body.extend_from_slice(&a.to_be_bytes());
+            body.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            body.extend_from_slice(v);
+            body.extend(std::iter::repeat_n(0u8, (4 - (v.len() % 4)) % 4));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&typ.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        out.extend_from_slice(&trans_id[..12]);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn xor_v4(addr: std::net::Ipv4Addr, port: u16) -> Vec<u8> {
+        const MAGIC: u32 = 0x2112_A442;
+        let mut v = vec![0u8, 0x01];
+        v.extend_from_slice(&(port ^ ((MAGIC >> 16) as u16)).to_be_bytes());
+        v.extend_from_slice(&(u32::from(addr) ^ MAGIC).to_be_bytes());
+        v
+    }
+
+    /// Serve until told to stop, reporting what it saw.
+    pub async fn serve(
+        socket: Arc<UdpSocket>,
+        relayed: SocketAddr,
+        report: tokio::sync::oneshot::Sender<Seen>,
+    ) {
+        let mut seen = Seen {
+            allocated: false,
+            bound: false,
+            forwarded: Vec::new(),
+        };
+        let mut buf = vec![0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let Ok(Ok((n, from))) = tokio::time::timeout(left, socket.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            let msg = &buf[..n];
+
+            // ChannelData: the payload the client wants relayed.
+            if nevoflux_rtc_transport::turn::is_channel_data(msg) {
+                if let Some((_, payload)) = nevoflux_rtc_transport::turn::unwrap(msg) {
+                    seen.forwarded.push(payload.to_vec());
+                    // One is all this proves and all it needs to.
+                    break;
+                }
+                continue;
+            }
+
+            let trans_id = &msg[8..20];
+            let typ = u16::from_be_bytes([msg[0], msg[1]]);
+            let method = (typ & 0x000F) | ((typ & 0x00E0) >> 1) | ((typ & 0x3E00) >> 2);
+
+            match method {
+                0x003 => {
+                    // Allocate. Challenge the first, grant the signed retry —
+                    // which is what a real server does and what the two-round-
+                    // trip handshake exists for.
+                    let signed = n > 60;
+                    let out = if signed {
+                        seen.allocated = true;
+                        reply(
+                            0x0103,
+                            trans_id,
+                            &[
+                                (
+                                    0x0016,
+                                    xor_v4(
+                                        match relayed.ip() {
+                                            std::net::IpAddr::V4(v) => v,
+                                            _ => unreachable!(),
+                                        },
+                                        relayed.port(),
+                                    ),
+                                ),
+                                (0x000D, 600u32.to_be_bytes().to_vec()),
+                            ],
+                        )
+                    } else {
+                        reply(
+                            0x0113,
+                            trans_id,
+                            &[
+                                (0x0009, vec![0, 0, 4, 1]),
+                                (0x0014, b"example.org".to_vec()),
+                                (0x0015, b"n0nce".to_vec()),
+                            ],
+                        )
+                    };
+                    let _ = socket.send_to(&out, from).await;
+                }
+                0x009 => {
+                    seen.bound = true;
+                    let out = reply(0x0109, trans_id, &[]);
+                    let _ = socket.send_to(&out, from).await;
+                }
+                _ => {}
+            }
+        }
+        let _ = report.send(seen);
+    }
+}
+
+#[tokio::test]
+async fn a_relay_is_allocated_bound_and_actually_carries_a_payload() {
+    // The three steps a relayed candidate needs in order not to be a path ICE
+    // selects and then fails on. Without the data path, an allocation is just
+    // an address that swallows everything sent to it.
+    use nevoflux_rtc_transport::{gather, turn};
+
+    let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_addr = server_sock.local_addr().unwrap();
+    let relayed: std::net::SocketAddr = "198.51.100.7:50000".parse().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(fake_turn::serve(server_sock, relayed, tx));
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (got_relayed, creds) = tokio::time::timeout(
+        Duration::from_secs(5),
+        gather::allocate(&client, server_addr, "u", "secret"),
+    )
+    .await
+    .expect("allocate did not finish")
+    .expect("no allocation");
+    assert_eq!(got_relayed, relayed);
+
+    let mut relay = turn::Relay::new(server_addr, relayed, creds);
+    let peer: std::net::SocketAddr = "203.0.113.4:9000".parse().unwrap();
+
+    // The first send binds and is dropped — an ICE check, and ICE retries.
+    assert!(!relay.send_to(&client, peer, b"first").await);
+
+    // Take the bind ack, then the same send goes through.
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("no bind reply")
+        .unwrap();
+    assert_eq!(relay.on_reply(&buf[..n]), Some(peer));
+    assert!(
+        relay.send_to(&client, peer, b"payload").await,
+        "the channel is bound; this must go out"
+    );
+
+    let seen = tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .expect("server never reported")
+        .unwrap();
+    assert!(seen.allocated, "the signed allocate was not accepted");
+    assert!(seen.bound, "no channel was bound");
+    assert_eq!(
+        seen.forwarded,
+        vec![b"payload".to_vec()],
+        "the relay did not receive the payload"
+    );
 }
