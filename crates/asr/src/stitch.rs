@@ -48,14 +48,24 @@ mod tests {
     use super::*;
 
     fn seg(start_ms: u32, end_ms: u32, text: &str) -> Segment {
-        Segment { start_ms, end_ms, text: text.into() }
+        Segment {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        }
     }
 
     #[test]
     fn single_span_at_origin_is_unchanged() {
-        let spans = [SpeechSpan { start_ms: 0, end_ms: 1000 }];
+        let spans = [SpeechSpan {
+            start_ms: 0,
+            end_ms: 1000,
+        }];
         let per = vec![vec![seg(0, 500, "a"), seg(500, 1000, "b")]];
-        assert_eq!(stitch(&spans, &per), vec![seg(0, 500, "a"), seg(500, 1000, "b")]);
+        assert_eq!(
+            stitch(&spans, &per),
+            vec![seg(0, 500, "a"), seg(500, 1000, "b")]
+        );
     }
 
     #[test]
@@ -64,12 +74,21 @@ mod tests {
         // Correct: the second lands at 12000 ms.
         // Running-total arithmetic would put it at 2000 ms -- ten seconds early.
         let spans = [
-            SpeechSpan { start_ms: 0, end_ms: 2000 },
-            SpeechSpan { start_ms: 12000, end_ms: 14000 },
+            SpeechSpan {
+                start_ms: 0,
+                end_ms: 2000,
+            },
+            SpeechSpan {
+                start_ms: 12000,
+                end_ms: 14000,
+            },
         ];
         let per = vec![vec![seg(0, 2000, "first")], vec![seg(0, 2000, "second")]];
         let out = stitch(&spans, &per);
-        assert_eq!(out[1].start_ms, 12000, "offset must be the absolute span start");
+        assert_eq!(
+            out[1].start_ms, 12000,
+            "offset must be the absolute span start"
+        );
         assert_eq!(out[1].end_ms, 14000);
     }
 
@@ -78,10 +97,14 @@ mod tests {
         // 50 utterances of 1 s, each followed by 4 s of silence. Running-total
         // arithmetic would put the last one 49 * 4 = 196 seconds early.
         let spans: Vec<SpeechSpan> = (0..50)
-            .map(|i| SpeechSpan { start_ms: i * 5000, end_ms: i * 5000 + 1000 })
+            .map(|i| SpeechSpan {
+                start_ms: i * 5000,
+                end_ms: i * 5000 + 1000,
+            })
             .collect();
-        let per: Vec<Vec<Segment>> =
-            (0..50).map(|i| vec![seg(0, 1000, &format!("s{i}"))]).collect();
+        let per: Vec<Vec<Segment>> = (0..50)
+            .map(|i| vec![seg(0, 1000, &format!("s{i}"))])
+            .collect();
         let out = stitch(&spans, &per);
         assert_eq!(out.len(), 50);
         assert_eq!(out[49].start_ms, 49 * 5000);
@@ -91,8 +114,14 @@ mod tests {
     #[test]
     fn output_is_sorted_by_start() {
         let spans = [
-            SpeechSpan { start_ms: 5000, end_ms: 6000 },
-            SpeechSpan { start_ms: 0, end_ms: 1000 },
+            SpeechSpan {
+                start_ms: 5000,
+                end_ms: 6000,
+            },
+            SpeechSpan {
+                start_ms: 0,
+                end_ms: 1000,
+            },
         ];
         let per = vec![vec![seg(0, 1000, "late")], vec![seg(0, 1000, "early")]];
         let out = stitch(&spans, &per);
@@ -105,8 +134,14 @@ mod tests {
         // VAD heard speech, the engine read nothing there. No empty segment,
         // and -- the point -- no shift applied to what follows.
         let spans = [
-            SpeechSpan { start_ms: 0, end_ms: 1000 },
-            SpeechSpan { start_ms: 3000, end_ms: 4000 },
+            SpeechSpan {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+            SpeechSpan {
+                start_ms: 3000,
+                end_ms: 4000,
+            },
         ];
         let per = vec![vec![], vec![seg(0, 1000, "only")]];
         let out = stitch(&spans, &per);
@@ -117,10 +152,14 @@ mod tests {
     #[test]
     fn timestamps_are_monotonic_and_well_formed() {
         let spans: Vec<SpeechSpan> = (0..10)
-            .map(|i| SpeechSpan { start_ms: i * 3000, end_ms: i * 3000 + 1500 })
+            .map(|i| SpeechSpan {
+                start_ms: i * 3000,
+                end_ms: i * 3000 + 1500,
+            })
             .collect();
-        let per: Vec<Vec<Segment>> =
-            (0..10).map(|_| vec![seg(0, 700, "x"), seg(700, 1500, "y")]).collect();
+        let per: Vec<Vec<Segment>> = (0..10)
+            .map(|_| vec![seg(0, 700, "x"), seg(700, 1500, "y")])
+            .collect();
         let out = stitch(&spans, &per);
         assert_eq!(out.len(), 20);
         for w in out.windows(2) {
@@ -134,8 +173,14 @@ mod tests {
     #[test]
     fn fewer_results_than_spans_is_not_a_panic() {
         let spans = [
-            SpeechSpan { start_ms: 0, end_ms: 1000 },
-            SpeechSpan { start_ms: 2000, end_ms: 3000 },
+            SpeechSpan {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+            SpeechSpan {
+                start_ms: 2000,
+                end_ms: 3000,
+            },
         ];
         let per = vec![vec![seg(0, 1000, "one")]];
         let out = stitch(&spans, &per);

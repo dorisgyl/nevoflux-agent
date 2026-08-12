@@ -5378,20 +5378,15 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         // Settled before anyone is asked, so the dialog names the file that
         // would actually be read rather than the words that led to it.
-        let (path, mime) =
-            crate::remote::local_media::resolve(path_arg).map_err(|message| HostError {
-                code: 4,
-                message,
-            })?;
+        let (path, mime) = crate::remote::local_media::resolve(path_arg)
+            .map_err(|message| HostError { code: 4, message })?;
         self.check_tool_permission("read_file", &path.display().to_string())?;
         let session = self.session_id.as_deref().ok_or_else(|| HostError {
             code: 4,
             message: "play_local_file: nobody is watching this session".into(),
         })?;
-        crate::remote::local_media::offer(session, &path, mime).map_err(|message| HostError {
-            code: 4,
-            message,
-        })
+        crate::remote::local_media::offer(session, &path, mime)
+            .map_err(|message| HostError { code: 4, message })
     }
 
     fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {

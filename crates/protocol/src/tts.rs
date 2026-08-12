@@ -242,7 +242,11 @@ mod tests {
     fn transcribe_response_round_trip_keeps_note() {
         let resp = TranscribeResponse {
             text: "x".into(),
-            segments: vec![TranscribeSegment { start_ms: 0, end_ms: 500, text: "x".into() }],
+            segments: vec![TranscribeSegment {
+                start_ms: 0,
+                end_ms: 500,
+                text: "x".into(),
+            }],
             engine: "sensevoice".into(),
             language: "zh".into(),
             note: Some("heads up".into()),

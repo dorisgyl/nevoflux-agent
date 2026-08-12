@@ -29,10 +29,11 @@ use crate::config::ElevenLabsConfig;
 use error::TtsError;
 use nevoflux_protocol::tts::{SynthesizeRequest, SynthesizeResponse};
 
-/// Re-export so dispatch arms can call `tts::synthesize_local` /
-/// `tts::transcribe` symmetric to `tts::synthesize_api`.
-pub use kokoro::{list_voices, synthesize_local};
+// Re-exported so dispatch arms reach every entry point the same way:
+// `tts::synthesize_api`, `tts::synthesize_local`, `tts::transcribe`. Which
+// module each one lives in is this module's business, not theirs.
 pub use asr::transcribe;
+pub use kokoro::{list_voices, synthesize_local};
 
 /// ElevenLabs' ceiling per umbrella §7.8 — roughly 60 s of speech.
 pub const MAX_TEXT_LEN_API: usize = 600;

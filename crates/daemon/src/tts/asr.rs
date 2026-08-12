@@ -142,7 +142,9 @@ async fn decode_to_pcm(audio_b64: &str) -> Result<Vec<f32>, TtsError> {
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(audio_b64.trim())
-        .map_err(|e| TtsError::InvalidRequest(format!("tts_transcribe: audio is not base64: {e}")))?;
+        .map_err(|e| {
+            TtsError::InvalidRequest(format!("tts_transcribe: audio is not base64: {e}"))
+        })?;
     if bytes.is_empty() {
         return Err(TtsError::InvalidRequest(
             "tts_transcribe: audio is empty".into(),
@@ -170,12 +172,18 @@ fn decode_blocking(ffmpeg: &std::path::Path, input: &[u8]) -> Result<Vec<f32>, T
     let mut child = Command::new(ffmpeg)
         .args([
             "-hide_banner",
-            "-loglevel", "error",
-            "-i", "pipe:0",
-            "-f", "f32le",
-            "-acodec", "pcm_f32le",
-            "-ar", &nevoflux_asr::SAMPLE_RATE.to_string(),
-            "-ac", "1",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-ar",
+            &nevoflux_asr::SAMPLE_RATE.to_string(),
+            "-ac",
+            "1",
             "pipe:1",
         ])
         .stdin(Stdio::piped())
@@ -360,7 +368,9 @@ mod tests {
         // checked after the decode, this would come back as an ffmpeg failure
         // and send the caller off to inspect a file that was never the problem.
         let cfg = TtsConfig::default();
-        let err = transcribe(&cfg, &req_inline("AAAA"), None).await.unwrap_err();
+        let err = transcribe(&cfg, &req_inline("AAAA"), None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, TtsError::EngineUnavailable(_)),
             "expected the engine to be blamed, got: {err}"

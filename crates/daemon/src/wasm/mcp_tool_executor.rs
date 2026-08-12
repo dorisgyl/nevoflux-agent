@@ -2235,8 +2235,7 @@ async fn execute_tts_synthesize_local(
     let mut out = serde_json::to_value(&resp)
         .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))?;
     crate::tts::strip_delivered_audio(&mut out, req.composition_id.is_some());
-    serde_json::to_string(&out)
-        .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
+    serde_json::to_string(&out).map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_voices`. Reports what the configured voice

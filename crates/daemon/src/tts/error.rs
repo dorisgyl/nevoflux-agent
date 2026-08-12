@@ -102,13 +102,21 @@ mod tests {
             TtsError::AuthFailed(String::new()).code(),
             TtsError::RateLimit(String::new()).code(),
             TtsError::Network(String::new()).code(),
-            TtsError::BackendError { status: 500, body: String::new() }.code(),
+            TtsError::BackendError {
+                status: 500,
+                body: String::new(),
+            }
+            .code(),
             TtsError::EngineUnavailable(String::new()).code(),
             TtsError::Internal(String::new()).code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), codes.len(), "duplicate error codes: {codes:?}");
+        assert_eq!(
+            sorted.len(),
+            codes.len(),
+            "duplicate error codes: {codes:?}"
+        );
     }
 }

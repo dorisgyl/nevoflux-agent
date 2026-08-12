@@ -126,6 +126,9 @@ mod tests {
         let err = check_length(&s, Engine::Sensevoice).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("split it"), "{msg}");
-        assert!(!msg.contains("engine=\"sensevoice\""), "circular advice: {msg}");
+        assert!(
+            !msg.contains("engine=\"sensevoice\""),
+            "circular advice: {msg}"
+        );
     }
 }

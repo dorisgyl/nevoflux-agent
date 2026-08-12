@@ -96,7 +96,11 @@ mod tests {
     #[test]
     fn auto_routes_other_languages_to_whisper() {
         for lang in ["de", "fr", "ru", "ar", "hi", "pt"] {
-            assert_eq!(route(None, Some(lang)).unwrap(), Engine::Whisper, "lang={lang}");
+            assert_eq!(
+                route(None, Some(lang)).unwrap(),
+                Engine::Whisper,
+                "lang={lang}"
+            );
         }
     }
 
