@@ -106,10 +106,24 @@ pub struct TranscribeRequest {
     pub composition_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
-    /// Whisper model size: `"tiny"` / `"base"` / `"small"` / `"medium"`.
-    /// Defaults to `"base"` if omitted.
+    /// Whisper model size: `"tiny"` / `"base"` / `"small"` / `"medium"` /
+    /// `"large-v3-turbo"`. Whisper only — SenseVoice ships a single size and
+    /// ignores this. Defaults to config, else `"large-v3-turbo"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_size: Option<String>,
+    /// Engine selection: `"auto"` (default) / `"sensevoice"` / `"whisper"`.
+    ///
+    /// `auto` decides from `language`; see the daemon's `tts::asr` routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// BCP-47 language hint (`"zh"`, `"yue"`, `"en"`, `"ja"`, `"ko"`, `"de"`, …).
+    ///
+    /// Omitted means the engine detects it. That is not free: SenseVoice's
+    /// detection chooses among the five languages it knows and nothing else,
+    /// so audio in a sixth language comes back as the nearest of the five
+    /// rather than as an error. The response's `note` says when this applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// `tts_transcribe` response.
@@ -119,6 +133,22 @@ pub struct TranscribeResponse {
     pub text: String,
     /// Per-segment timestamps (millisecond precision).
     pub segments: Vec<TranscribeSegment>,
+    /// The engine that actually ran.
+    ///
+    /// Symmetric with `SynthesizeResponse.voice_id`: a value that was resolved
+    /// rather than given has to be visible, or nobody can tell when the
+    /// default was the wrong one.
+    pub engine: String,
+    /// The language the engine reports having heard.
+    pub language: String,
+    /// Set only when the caller named no language and SenseVoice was used.
+    ///
+    /// That is the one combination where the answer can be confidently wrong,
+    /// and this rides along with the answer itself — a caller acts on what is
+    /// in front of them, not on a tool description read long ago. Emitting it
+    /// on every call would make it furniture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,5 +205,51 @@ mod tests {
         let back: SynthesizeResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.duration_sec, 12.4);
         assert_eq!(back.wrote_to_files.as_deref(), Some("narration.mp3"));
+    }
+    #[test]
+    fn transcribe_request_accepts_engine_and_language() {
+        let json = r#"{"audio_b64":"AAAA","engine":"whisper","language":"de"}"#;
+        let req: TranscribeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.engine.as_deref(), Some("whisper"));
+        assert_eq!(req.language.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn transcribe_request_without_new_fields_still_deserializes() {
+        // Callers written before routing existed must keep working.
+        let json = r#"{"audio_b64":"AAAA"}"#;
+        let req: TranscribeRequest = serde_json::from_str(json).unwrap();
+        assert!(req.engine.is_none());
+        assert!(req.language.is_none());
+    }
+
+    #[test]
+    fn transcribe_response_omits_note_when_absent() {
+        let resp = TranscribeResponse {
+            text: "hello".into(),
+            segments: vec![],
+            engine: "sensevoice".into(),
+            language: "zh".into(),
+            note: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("note"), "{json}");
+        assert!(json.contains("\"engine\":\"sensevoice\""), "{json}");
+        assert!(json.contains("\"language\":\"zh\""), "{json}");
+    }
+
+    #[test]
+    fn transcribe_response_round_trip_keeps_note() {
+        let resp = TranscribeResponse {
+            text: "x".into(),
+            segments: vec![TranscribeSegment { start_ms: 0, end_ms: 500, text: "x".into() }],
+            engine: "sensevoice".into(),
+            language: "zh".into(),
+            note: Some("heads up".into()),
+        };
+        let back: TranscribeResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back.note.as_deref(), Some("heads up"));
+        assert_eq!(back.segments.len(), 1);
     }
 }
