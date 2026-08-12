@@ -62,10 +62,10 @@ Each is substantial:
 - **Wiring into the daemon.** Routing `rtc_*` frames off the relay wire,
   preferring the channel over the relay once it is up, and falling back when it
   drops. Nothing routes between the two paths yet.
-- **The fallback.** When no connection forms, the session has to stay on the
-  relay path. That path exists and works; nothing routes between them yet.
-- **The portal side.** `RTCPeerConnection`, SDP exchange through the sealed
-  wire, a `ChatTransport` over the data channel, `<video srcObject>`.
+- **The last mile of wiring.** `remote::rtc` classifies signalling and holds
+  the session's path; `PortalGateway::apply_rtc_signal` is where the driver gets
+  attached, and that call is still a stub under the `webrtc` feature. Until it
+  is filled in, a head never offers and the portal's peer support stays inert.
 
 The channel payloads, at least, need no new protocol.
 `crates/daemon/src/remote/media_frame.rs` already frames a range as bytes and
@@ -83,6 +83,12 @@ member so it compiles and tests in CI, and nothing depends on it.
 `cargo test -p nevoflux-rtc-transport --features tokio-driver` covers everything
 here, including the loopback connection. Without the feature the driver loop and
 its integration test are skipped.
+
+### The portal side
+
+Landed and released: `nevoflux-portal` answers an offer, trickles candidates,
+takes bytes on the data channel and the screencast on a track, and keeps
+signalling away from chat subscribers. It is inert until a head offers.
 
 ### Capture, and what is actually untested
 
