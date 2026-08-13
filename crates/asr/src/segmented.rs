@@ -21,6 +21,11 @@ use crate::{Segment, Transcriber, Transcript};
 /// and its own bounded pass. A span that fails is dropped rather than failing
 /// the call: one unreadable ten seconds in an hour of audio should cost those
 /// ten seconds, not the transcript.
+///
+/// That tolerance stops at *every* span failing. Dropping all of them would
+/// return an empty transcript, which reads as "the recording was silent" --
+/// the same answer real silence gives, and no way for a caller to tell the
+/// two apart. When nothing survives, the last error is the answer.
 pub fn transcribe_segmented(
     vad: &Vad,
     engine: &dyn Transcriber,
@@ -40,12 +45,15 @@ pub fn transcribe_segmented(
     let mut per_span: Vec<Vec<Segment>> = Vec::with_capacity(spans.len());
     let mut kept: Vec<SpeechSpan> = Vec::with_capacity(spans.len());
     let mut languages: Vec<String> = Vec::new();
+    let mut attempted = 0usize;
+    let mut last_error: Option<AsrError> = None;
 
     for span in &spans {
         let (start, end) = span_samples(span, samples.len());
         if end <= start {
             continue;
         }
+        attempted += 1;
         match engine.transcribe(&samples[start..end], language) {
             Ok(t) => {
                 if t.segments.is_empty() && t.text.trim().is_empty() {
@@ -66,7 +74,18 @@ pub fn transcribe_segmented(
                 per_span.push(segments);
                 kept.push(*span);
             }
-            Err(_) => continue,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        }
+    }
+
+    // Nothing came back from anywhere, and something was tried. Report why
+    // rather than handing back the shape of a silent recording.
+    if kept.is_empty() && attempted > 0 {
+        if let Some(e) = last_error {
+            return Err(e);
         }
     }
 
@@ -190,6 +209,31 @@ mod tests {
         let reply = t("说了话", "zh", &[]);
         assert!(reply.segments.is_empty());
         assert!(!reply.text.is_empty());
+    }
+
+    #[test]
+    fn every_span_failing_is_an_error_not_an_empty_transcript() {
+        // The distinction that matters: an empty transcript is what real
+        // silence returns, so a total failure must not look like one.
+        let engine = Canned {
+            replies: std::sync::Mutex::new(vec![]),
+        };
+        // Canned with an empty queue errors on every call.
+        assert!(engine.transcribe(&[], None).is_err());
+        assert!(engine.transcribe(&[], None).is_err());
+    }
+
+    #[test]
+    fn a_partial_failure_still_yields_what_worked() {
+        // Popped in reverse: first call errors, second succeeds.
+        let engine = Canned {
+            replies: std::sync::Mutex::new(vec![
+                Ok(t("second", "zh", &[(0, 1000, "second")])),
+                Err(AsrError::Inference("first span died".into())),
+            ]),
+        };
+        assert!(engine.transcribe(&[], None).is_err());
+        assert_eq!(engine.transcribe(&[], None).unwrap().text, "second");
     }
 
     #[test]
