@@ -285,10 +285,10 @@ fn ensure_available(engine: Engine) -> Result<(), TtsError> {
         #[cfg(not(feature = "asr-whisper"))]
         Engine::Whisper => Err(TtsError::EngineUnavailable(
             "Whisper is not compiled into this build. `asr-whisper` is off by \
-             default because Candle is a second ML runtime and large-v3-turbo \
-             needs about 4.8 GB resident. Either rebuild with \
-             --features asr-whisper, or pass engine=\"sensevoice\" -- note it \
-             only handles zh/yue/en/ja/ko."
+             default because running large-v3-turbo needs about 4.8 GB resident \
+             (linking Candle itself only adds ~3 MB to the binary). Either \
+             rebuild with --features asr-whisper, or pass engine=\"sensevoice\" \
+             -- note it only handles zh/yue/en/ja/ko."
                 .into(),
         )),
     }

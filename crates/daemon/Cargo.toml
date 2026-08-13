@@ -18,9 +18,11 @@ tts-local = ["dep:nevoflux-tts"]
 # SenseVoice transcription. On by default: it is the engine `auto` routes to,
 # and without it `tts_transcribe` can only report that it is absent.
 asr-sensevoice = ["nevoflux-asr/sensevoice"]
-# Whisper via Candle. OFF by default, and the reason is size in two senses:
-# Candle is a second ML runtime in the binary, and large-v3-turbo needs about
-# 4.8 GB resident to run. Turn it on for builds that need the languages
+# Whisper via Candle. OFF by default because of memory, not binary size:
+# linking Candle costs +3.3 MB stripped (measured), while running
+# large-v3-turbo costs 4.8 GB resident. The weights load lazily, so a build
+# with this on pays nothing until something actually routes to Whisper --
+# and then pays a lot. Turn it on for builds that need the languages
 # SenseVoice cannot tell apart.
 asr-whisper = ["nevoflux-asr/whisper"]
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:

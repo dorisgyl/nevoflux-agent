@@ -13,9 +13,11 @@ description = "Local speech recognition (SenseVoice + Whisper) for NevoFlux Agen
 default = []
 # SenseVoice: ONNX via `ort`, the default engine. Chinese and low latency.
 sensevoice = ["dep:ort", "dep:ndarray"]
-# Whisper via Candle. OFF by default: Candle is a second ML runtime and a
-# large one, while `auto` routes to SenseVoice for every language SenseVoice
-# knows. Turn it on for builds that need the other 94 languages.
+# Whisper via Candle. OFF by default -- for what it costs at runtime, not for
+# what it costs in the binary: linking Candle measures +3.3 MB stripped
+# (110.0 against 106.7), which is nothing. Loading large-v3-turbo is 4.8 GB
+# resident, which is not. Turn it on for builds that need the languages
+# SenseVoice cannot tell apart.
 whisper = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 # ONNX Runtime linking strategy, forwarded to `ort`. Mirrors nevoflux-tts;
 # see the workspace CLAUDE.md for why load-dynamic is the default there.
