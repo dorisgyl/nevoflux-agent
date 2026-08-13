@@ -372,6 +372,7 @@ fn sensevoice(
     let threads = cfg
         .threads
         .unwrap_or_else(nevoflux_asr::ort_env::default_threads);
+    tracing::info!(model = %model.display(), threads, "loading SenseVoice");
     let engine = nevoflux_asr::sensevoice::SenseVoice::new(&model, &tokens, threads)
         .map_err(|e| TtsError::Internal(format!("load SenseVoice: {e}")))?;
     // A racing thread may have won; either instance is equally good.
@@ -400,6 +401,7 @@ fn vad(cfg: &SenseVoiceConfig) -> Result<std::sync::Arc<nevoflux_asr::vad::Vad>,
             nevoflux_asr::audio::max_seconds(Engine::Sensevoice)
         )));
     }
+    tracing::info!(path = %path.display(), "loading VAD for segmentation");
     let v = nevoflux_asr::vad::Vad::new(&path)
         .map_err(|e| TtsError::Internal(format!("load VAD: {e}")))?;
     Ok(VAD.get_or_init(|| Arc::new(v)).clone())
@@ -492,6 +494,11 @@ fn whisper(
             dir.display()
         )));
     }
+    // Which size loaded is the first thing anyone asks when memory or latency
+    // looks wrong, and it is not otherwise recoverable: the model is resident
+    // for the life of the process, and by the time anyone looks the process
+    // that loaded it has often exited.
+    tracing::info!(size = %size, dir = %dir.display(), "loading Whisper");
     let e = nevoflux_asr::whisper::WhisperEngine::new(&dir)
         .map_err(|e| TtsError::Internal(format!("load Whisper: {e}")))?;
     Ok(ENGINE.get_or_init(|| Arc::new(e)).clone())
