@@ -519,8 +519,14 @@ impl PortalGateway {
         }
     }
 
-    /// Push the current mode / execution tier to the portal. Called on each
-    /// (re)connect so a reconnecting peer is not left showing stale settings.
+    /// Push the current mode / execution tier to the portal.
+    ///
+    /// Sent when the relay says a portal is there, and not merely when this end
+    /// connected: the relay keeps nothing for a channel nobody is attached to,
+    /// so an announce made before the phone arrived was dropped and never
+    /// repeated. The phone then had no session state to render a reply into —
+    /// every chunk was projected, written to the socket without error, and
+    /// showed nothing. Same mistake as the offer, in the line above it.
     pub async fn announce(&self) {
         let wires = self.session.lock().await.session_state();
         for w in wires {
@@ -723,6 +729,11 @@ impl PortalGateway {
         if let Wire::Text(text) = &wire {
             if let Some(n) = super::relay_protocol::peer_count(text) {
                 if n > 0 {
+                    // Whoever just arrived miscounted nothing: they may have
+                    // missed the announce this end sent into an empty channel.
+                    // Cheap, idempotent, and the portal cannot render a reply
+                    // without it.
+                    self.announce().await;
                     self.spawn_offer();
                 } else {
                     // The relay saying a frame reached nobody. Worth a line:
@@ -1531,5 +1542,38 @@ mod tests {
         *gw.last_offer.lock().await = Some(std::time::Instant::now() - REOFFER_INTERVAL * 2);
         gw.offer_peer_connection().await;
         assert_eq!(sink.sent.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_portal_that_arrives_late_is_told_what_this_head_is_set_to() {
+        // The announce carries the session state a portal renders replies into.
+        // Sent only when this end connected, it went into an empty channel and
+        // was dropped -- and the relay keeps nothing, so the phone that opened
+        // a minute later never had it. Every chunk after that was projected,
+        // written to the socket without error, and showed nothing.
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            sink.clone(),
+            "sess",
+            Some("agent".into()),
+            None,
+            "chan",
+        ));
+        let inj = CollectInjector::default();
+
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":0}"#.into()), "sess", &inj)
+            .await;
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "nothing to say to an empty channel"
+        );
+
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), "sess", &inj)
+            .await;
+        assert!(
+            !sink.sent.lock().await.is_empty(),
+            "a portal arrived and was told nothing"
+        );
     }
 }

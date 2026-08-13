@@ -256,6 +256,8 @@ pub async fn run_gateway(
                 let (write, read) = ws.split();
                 sink.set(write).await;
                 // Tell the portal what this head is set to, before any chat.
+                // Repeated when the relay says someone arrived, because this
+                // one goes nowhere if the channel is still empty.
                 gateway.announce().await;
                 // No offer here. The relay keeps nothing for a channel with no
                 // one attached, so an offer made now reaches whoever happens to
