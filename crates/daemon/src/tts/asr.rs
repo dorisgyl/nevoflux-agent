@@ -446,7 +446,9 @@ fn run_whisper(
 /// Whisper's default size.
 ///
 /// `base` at 585 MB resident and 2.5x realtime, measured, against `small` at
-/// 1.90 GB / 0.9x and `large-v3-turbo` at 4.77 GB / 0.3x. On the English clip
+/// 1.90 GB / 0.9x and `large-v3-turbo` at 4.77 GB / 0.3x. Those are the models
+/// in isolation; the daemon around them holds Kokoro and the embedding model
+/// too, and was observed at 2.09 GB total on `base`. On the English clip
 /// used to compare them, `base` and `small` produced the same transcript, so
 /// the extra gigabyte bought nothing there.
 ///

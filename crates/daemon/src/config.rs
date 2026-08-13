@@ -186,8 +186,14 @@ pub struct WhisperConfig {
     /// Which size to look for (`tiny` / `base` / `small` / `medium` /
     /// `large-v3-turbo`). Defaults to `base`.
     ///
-    /// Measured peak resident memory: base 585 MB, small 1.90 GB,
-    /// large-v3-turbo 4.77 GB. `base` is the default for footprint, and it
+    /// Measured peak resident memory *for the model alone*: base 585 MB,
+    /// small 1.90 GB, large-v3-turbo 4.77 GB. A running daemon is larger than
+    /// any of these and not by a little: it also holds Kokoro (442 MB) once
+    /// something synthesizes, the embedding model from the `embedding`
+    /// feature, and ONNX Runtime arenas, which grow and are never returned.
+    /// One observed daemon sat at 2.09 GB after a synthesize-then-transcribe
+    /// round trip on `base`. Read these numbers as the cost of choosing a
+    /// size, not as the size of the process. `base` is the default for footprint, and it
     /// matched `small` on the English clip they were compared on -- but
     /// Whisper is only reached for languages SenseVoice cannot distinguish,
     /// and `base` is known to trail `small` on most non-English. Raise this if
