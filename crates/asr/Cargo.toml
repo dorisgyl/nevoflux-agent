@@ -30,3 +30,10 @@ dirs = "5.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Dev tool: prints a model's I/O signature and metadata. Kept because the
+# SenseVoice exports carry their preprocessing contract in that metadata, and
+# it has to be re-read whenever the model version moves.
+[[example]]
+name = "dump_model"
+required-features = ["sensevoice", "ort-load-dynamic"]

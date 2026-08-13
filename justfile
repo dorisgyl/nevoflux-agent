@@ -161,40 +161,70 @@ download-model:
     print(f'Model downloaded to {cache_dir}')
     "
 
-# Fetch SenseVoice + VAD models for local transcription
+# Fetch SenseVoice weights for local transcription
 fetch-asr-models:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The local filenames below are this project's convention, not the upstream
-    # ones -- the various exports disagree with each other, and daemon-side path
-    # resolution (crates/daemon/src/tts/asr.rs, following the kokoro.rs
-    # precedent) depends on them staying put. Rename here, rename there.
+    # Weights come from the sherpa-onnx exports, not FunAudioLLM's own repo,
+    # which ships only model.pt -- there is no official ONNX. These are
+    # maintained by sherpa-onnx's author and, importantly, carry the whole
+    # preprocessing contract inside the ONNX metadata (LFR window, CMVN
+    # vectors, language ids). That is why no am.mvn is fetched: reading those
+    # numbers from a side file would be a second source of truth for values
+    # the model already states. `just dump-asr-model` prints them.
     #
-    # The daemon never fetches anything itself. Adding network behaviour to a
-    # native-messaging host expected to start in under a second is a bad trade,
-    # and pulling gigabytes at a moment nobody chose is a worse one.
+    # 2024-07-17 is the original iic/SenseVoiceSmall export. Do not "upgrade"
+    # to the 2025-09-09 one without checking its metadata first: despite the
+    # newer date and identical tensor contract, it is the ASLP-lab WSYue
+    # Cantonese fine-tune, which is not what a Mandarin-first default wants.
+    # The `comment` and `url` metadata keys are what tell the two apart.
+    #
+    # curl rather than huggingface_hub: this needs no Python environment to be
+    # correct, and `pip install` into whichever interpreter happens to be first
+    # on PATH is a step that fails quietly on machines with a broken site-
+    # packages. Honour *_PROXY as curl already does.
+    #
+    # Local filenames are this project's convention. Daemon-side resolution
+    # (crates/daemon/src/tts/asr.rs, following kokoro.rs) depends on them
+    # staying put -- rename here, rename there.
+    #
+    # No VAD yet: it is only needed past the 30 s single-pass limit, and that
+    # path lands with the segmentation work.
+    #
+    # The daemon fetches nothing itself. Network behaviour in a native-
+    # messaging host expected to start in under a second is a bad trade, and
+    # pulling hundreds of megabytes at a moment nobody chose is a worse one.
     DEST="${HOME}/.cache/nevoflux/models"
+    REPO="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
     mkdir -p "$DEST"
-    pip install -q huggingface_hub
-    python3 - "$DEST" <<'PY'
-    import os, shutil, sys
-    from huggingface_hub import hf_hub_download
-
-    dest = sys.argv[1]
-    # (repo_id, filename in repo, local name this project uses)
-    wanted = [
-        ("FunAudioLLM/SenseVoiceSmall", "model_quant.onnx", "sensevoice-small.int8.onnx"),
-        ("FunAudioLLM/SenseVoiceSmall", "tokens.json",      "sensevoice-tokens.json"),
-        ("funasr/fsmn-vad",             "model.onnx",       "fsmn-vad.onnx"),
-    ]
-    for repo, remote, local in wanted:
-        src = hf_hub_download(repo_id=repo, filename=remote)
-        target = os.path.join(dest, local)
-        shutil.copyfile(src, target)
-        print(f"  {repo}/{remote} -> {target}")
-    PY
+    fetch() {
+        local remote="$1" local_name="$2"
+        if [ -s "$DEST/$local_name" ]; then
+            echo "  $local_name (already present)"
+            return
+        fi
+        echo "  $local_name ..."
+        curl -fL --retry 3 --progress-bar \
+            "https://huggingface.co/$REPO/resolve/main/$remote" \
+            -o "$DEST/$local_name.part"
+        mv "$DEST/$local_name.part" "$DEST/$local_name"
+    }
+    fetch "model.int8.onnx" "sensevoice-small.int8.onnx"
+    fetch "tokens.txt"      "sensevoice-tokens.txt"
     echo "ASR models are in $DEST"
-    echo "Whisper is optional and only needed for --features asr-whisper: just fetch-whisper-model"
+    echo "Whisper is optional, only for --features asr-whisper: just fetch-whisper-model"
+
+# Print an ASR model's ONNX I/O signature and metadata
+dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFILE="debug":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The SenseVoice exports state their own preprocessing contract in ONNX
+    # metadata. Read it from the file rather than from a blog post, and read it
+    # again whenever the model version moves -- two exports can share a tensor
+    # contract and still be different models (see the note in fetch-asr-models).
+    ORT_DYLIB_PATH="${ORT_DYLIB_PATH:-$PWD/target/{{PROFILE}}/lib/libonnxruntime.so}" \
+    cargo run -q -p nevoflux-asr --example dump_model \
+        --features sensevoice,ort-load-dynamic -- "$(eval echo {{MODEL}})"
 
 # Fetch Whisper weights (only needed for --features asr-whisper)
 fetch-whisper-model SIZE="large-v3-turbo":
@@ -205,17 +235,13 @@ fetch-whisper-model SIZE="large-v3-turbo":
     # download a gigabyte to find that out.
     DEST="${HOME}/.cache/nevoflux/models"
     mkdir -p "$DEST"
-    pip install -q huggingface_hub
-    python3 - "$DEST" "{{SIZE}}" <<'PY'
-    import os, shutil, sys
-    from huggingface_hub import hf_hub_download
-
-    dest, size = sys.argv[1], sys.argv[2]
-    src = hf_hub_download(repo_id="ggerganov/whisper.cpp", filename=f"ggml-{size}.bin")
-    target = os.path.join(dest, f"whisper-{size}.q8.gguf")
-    shutil.copyfile(src, target)
-    print(f"  {target}")
-    PY
+    TARGET="$DEST/whisper-{{SIZE}}.ggml.bin"
+    if [ -s "$TARGET" ]; then echo "  already present: $TARGET"; exit 0; fi
+    curl -fL --retry 3 --progress-bar \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{{SIZE}}.bin" \
+        -o "$TARGET.part"
+    mv "$TARGET.part" "$TARGET"
+    echo "  $TARGET"
 
 # ONNX Runtime version for load-dynamic builds. Keep in lockstep with
 # EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 5 -> ORT 1.24.x).
