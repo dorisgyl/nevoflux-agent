@@ -3531,14 +3531,24 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_transcribe".into(),
-                description: "Transcribe audio to text + per-segment timestamps via local Whisper ONNX (drives P5c auto-captions). REGISTERED but inference not yet wired -- returns ConfigMissing today. Provide EXACTLY ONE of audio_b64, or composition_id + file_path (e.g. narration.mp3). See skill_load(\"video\").".into(),
+                description: "Transcribe audio to text + per-segment timestamps (drives P5c auto-captions). \
+                              Provide EXACTLY ONE of audio_b64, or composition_id + file_path (e.g. narration.mp3).\n\n\
+                              Two engines. 'sensevoice' (the default) is fast and the most accurate for Chinese, \
+                              but it only distinguishes zh/yue/en/ja/ko -- given audio in any other language it \
+                              returns the nearest of those five rather than an error, so the transcript looks \
+                              plausible and is wrong. For anything outside those five pass engine='whisper'.\n\n\
+                              Always set `language` when you know it: it is what makes 'auto' route correctly, \
+                              and it suppresses the warning the response otherwise carries. \
+                              See skill_load(\"video\").".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "audio_b64":      { "type": "string", "description": "Base64-encoded audio bytes." },
                         "composition_id": { "type": "string", "description": "Read audio from this artifact's files map (use with file_path)." },
                         "file_path":      { "type": "string", "description": "Path inside the artifact's files map (e.g. 'narration.mp3')." },
-                        "model_size":     { "type": "string", "enum": ["tiny", "base", "small", "medium"], "description": "Whisper model size; defaults to config or 'base'." }
+                        "engine":         { "type": "string", "enum": ["auto", "sensevoice", "whisper"], "description": "Which engine transcribes. 'auto' (default) decides from `language`: zh/yue/en/ja/ko go to sensevoice, anything else to whisper. With no language given, auto uses sensevoice -- see the note field on the response." },
+                        "language":       { "type": "string", "description": "BCP-47 hint such as 'zh', 'en', 'de'. Strongly recommended: this is what makes engine routing correct, and without it a non-CJK recording can be transcribed as confident nonsense." },
+                        "model_size":     { "type": "string", "enum": ["tiny", "base", "small", "medium", "large-v3-turbo"], "description": "Whisper only; sensevoice ships a single size and ignores this. Defaults to config, else 'base'. Larger sizes transcribe non-English better at much higher memory: base 585MB, small 1.9GB, large-v3-turbo 4.8GB." }
                     }
                 }),
             },

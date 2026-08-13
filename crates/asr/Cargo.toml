@@ -1,0 +1,52 @@
+# crates/asr/Cargo.toml
+
+[package]
+name = "nevoflux-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Local speech recognition (SenseVoice + Whisper) for NevoFlux Agent"
+
+[features]
+default = []
+# SenseVoice: ONNX via `ort`, the default engine. Chinese and low latency.
+sensevoice = ["dep:ort", "dep:ndarray"]
+# Whisper via Candle. OFF by default -- for what it costs at runtime, not for
+# what it costs in the binary: linking Candle measures +3.3 MB stripped
+# (110.0 against 106.7), which is nothing. Loading large-v3-turbo is 4.8 GB
+# resident, which is not. Turn it on for builds that need the languages
+# SenseVoice cannot tell apart.
+whisper = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
+# ONNX Runtime linking strategy, forwarded to `ort`. Mirrors nevoflux-tts;
+# see the workspace CLAUDE.md for why load-dynamic is the default there.
+ort-download-binaries = ["ort?/download-binaries"]
+ort-load-dynamic = ["ort?/load-dynamic"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "api-24"], optional = true }
+ndarray = { version = "0.17", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Dev tool: prints a model's I/O signature and metadata. Kept because the
+# SenseVoice exports carry their preprocessing contract in that metadata, and
+# it has to be re-read whenever the model version moves.
+[[example]]
+name = "dump_model"
+required-features = ["sensevoice", "ort-load-dynamic"]
+
+# Dev tool: transcribe a 16 kHz mono WAV. Doubles as the smoke test against
+# real weights, which unit tests on synthetic audio cannot be.
+[[example]]
+name = "transcribe"
+required-features = ["sensevoice", "ort-load-dynamic"]

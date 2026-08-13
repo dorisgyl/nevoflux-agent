@@ -2235,8 +2235,7 @@ async fn execute_tts_synthesize_local(
     let mut out = serde_json::to_value(&resp)
         .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))?;
     crate::tts::strip_delivered_audio(&mut out, req.composition_id.is_some());
-    serde_json::to_string(&out)
-        .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
+    serde_json::to_string(&out).map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_voices`. Reports what the configured voice
@@ -2254,20 +2253,17 @@ async fn execute_tts_voices(services: &HostServices) -> Result<String, String> {
         .map_err(|e| format!("serialize tts_voices response: {e}"))
 }
 
-/// MCP/ACP dispatch arm for `tts_transcribe` (P5b-3). Reads
-/// `[tts.whisper]` config; ConfigMissing until Whisper ONNX wires up.
+/// MCP/ACP dispatch arm for `tts_transcribe`. Routing, audio decode and the
+/// engines themselves all live in `crate::tts::asr`; this arm only supplies
+/// the config and the database the artifact path needs.
 async fn execute_tts_transcribe(
     arguments: &serde_json::Value,
     services: &HostServices,
 ) -> Result<String, String> {
     let req: nevoflux_protocol::tts::TranscribeRequest = serde_json::from_value(arguments.clone())
         .map_err(|e| format!("invalid tts_transcribe args: {e}"))?;
-    let cfg = services
-        .tts_config
-        .as_ref()
-        .map(|c| c.whisper.clone())
-        .unwrap_or_default();
-    let resp = crate::tts::transcribe(&cfg, &req)
+    let cfg = services.tts_config.clone().unwrap_or_default();
+    let resp = crate::tts::transcribe(&cfg, &req, Some(&services.database))
         .await
         .map_err(|e| e.to_string())?;
     serde_json::to_string(&resp).map_err(|e| format!("serialize tts_transcribe response: {e}"))

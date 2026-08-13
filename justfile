@@ -161,6 +161,120 @@ download-model:
     print(f'Model downloaded to {cache_dir}')
     "
 
+# Fetch SenseVoice + Silero VAD weights for local transcription
+fetch-asr-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Weights come from the sherpa-onnx exports, not FunAudioLLM's own repo,
+    # which ships only model.pt -- there is no official ONNX. These are
+    # maintained by sherpa-onnx's author and, importantly, carry the whole
+    # preprocessing contract inside the ONNX metadata (LFR window, CMVN
+    # vectors, language ids). That is why no am.mvn is fetched: reading those
+    # numbers from a side file would be a second source of truth for values
+    # the model already states. `just dump-asr-model` prints them.
+    #
+    # 2024-07-17 is the original iic/SenseVoiceSmall export. Do not "upgrade"
+    # to the 2025-09-09 one without checking its metadata first: despite the
+    # newer date and identical tensor contract, it is the ASLP-lab WSYue
+    # Cantonese fine-tune, which is not what a Mandarin-first default wants.
+    # The `comment` and `url` metadata keys are what tell the two apart.
+    #
+    # curl rather than huggingface_hub: this needs no Python environment to be
+    # correct, and `pip install` into whichever interpreter happens to be first
+    # on PATH is a step that fails quietly on machines with a broken site-
+    # packages. Honour *_PROXY as curl already does.
+    #
+    # Local filenames are this project's convention. Daemon-side resolution
+    # (crates/daemon/src/tts/asr.rs, following kokoro.rs) depends on them
+    # staying put -- rename here, rename there.
+    #
+    # The daemon fetches nothing itself. Network behaviour in a native-
+    # messaging host expected to start in under a second is a bad trade, and
+    # pulling hundreds of megabytes at a moment nobody chose is a worse one.
+    DEST="${HOME}/.cache/nevoflux/models"
+    REPO="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    mkdir -p "$DEST"
+    fetch_url() {
+        local url="$1" local_name="$2"
+        if [ -s "$DEST/$local_name" ]; then
+            echo "  $local_name (already present)"
+            return
+        fi
+        echo "  $local_name ..."
+        curl -fL --retry 3 --progress-bar "$url" -o "$DEST/$local_name.part"
+        mv "$DEST/$local_name.part" "$DEST/$local_name"
+    }
+    fetch() {
+        local repo="$1" remote="$2" local_name="$3"
+        fetch_url "https://huggingface.co/$repo/resolve/main/$remote" "$local_name"
+    }
+    fetch "$REPO" "model.int8.onnx" "sensevoice-small.int8.onnx"
+    fetch "$REPO" "tokens.txt"      "sensevoice-tokens.txt"
+    # Silero VAD v6.2.1, for audio past the single-pass ceiling. Taken from the
+    # upstream release rather than a HuggingFace mirror: onnx-community's copy
+    # is v5, last touched 2024-12, and the two are a year and a major version
+    # apart. The v6 graph takes the same inputs, so only the weights differ --
+    # which is exactly the kind of silent substitution worth pinning against.
+    fetch_url \
+        "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/src/silero_vad/data/silero_vad.onnx" \
+        "silero-vad.onnx"
+    echo "ASR models are in $DEST"
+    echo "Whisper weights are fetched separately, and only if you need a"
+    echo "language outside zh/yue/en/ja/ko: just whisper-model"
+
+# End-to-end ASR check against real models (needs a release build)
+verify-asr:
+    #!/usr/bin/env bash
+    # Unit tests cover the pipeline on synthetic input; this exercises the
+    # release binary on real speech, which is where preprocessing drift and
+    # engine wiring actually show up. Release because the debug build reads
+    # about a third of the throughput and is not what ships.
+    cargo build --release -q -p nevoflux-asr --example transcribe \
+        --features sensevoice,whisper,ort-load-dynamic
+    bash scripts/verify-asr.sh
+
+# Print an ASR model's ONNX I/O signature and metadata
+dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFILE="debug":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The SenseVoice exports state their own preprocessing contract in ONNX
+    # metadata. Read it from the file rather than from a blog post, and read it
+    # again whenever the model version moves -- two exports can share a tensor
+    # contract and still be different models (see the note in fetch-asr-models).
+    ORT_DYLIB_PATH="${ORT_DYLIB_PATH:-$PWD/target/{{PROFILE}}/lib/libonnxruntime.so}" \
+    cargo run -q -p nevoflux-asr --example dump_model \
+        --features sensevoice,ort-load-dynamic -- "$(eval echo {{MODEL}})"
+
+# Fetch Whisper weights (only needed for languages SenseVoice cannot handle)
+whisper-model MODEL="base":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Candle loads config.json + tokenizer.json + model.safetensors. It does
+    # NOT read whisper.cpp's ggml-*.bin, which is the obvious thing to reach
+    # for and is a different format entirely.
+    #
+    # Separate from fetch-asr-models on purpose. The engine is compiled in by
+    # default now, but the weights are not fetched by default: most recordings
+    # are in a language SenseVoice handles, and those users never need this.
+    # A stock build that meets German says so and names this command.
+    #
+    # `base` is the default size for footprint (585 MB resident). `small`
+    # (1.9 GB) and `large-v3-turbo` (4.8 GB) transcribe non-English better.
+    DEST="${HOME}/.cache/nevoflux/models/whisper-{{MODEL}}"
+    REPO="openai/whisper-{{MODEL}}"
+    mkdir -p "$DEST"
+    for f in config.json tokenizer.json model.safetensors; do
+        if [ -s "$DEST/$f" ]; then
+            echo "  $f (already present)"
+            continue
+        fi
+        echo "  $f ..."
+        curl -fL --retry 3 --progress-bar \
+            "https://huggingface.co/$REPO/resolve/main/$f" -o "$DEST/$f.part"
+        mv "$DEST/$f.part" "$DEST/$f"
+    done
+    echo "Whisper {{MODEL}} is in $DEST"
+
 # ONNX Runtime version for load-dynamic builds. Keep in lockstep with
 # EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 5 -> ORT 1.24.x).
 ort_version := "1.24.2"

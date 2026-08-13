@@ -111,11 +111,14 @@ pub struct TtsConfig {
     /// then `tts_synthesize_local` returns ConfigMissing.
     #[serde(default)]
     pub kokoro: KokoroConfig,
-    /// Whisper local ONNX path config (P5b-3). Same gating contract as
-    /// Kokoro — `tts_transcribe` returns ConfigMissing until
-    /// `model_path` resolves.
+    /// Whisper local config. Only reachable in a build with `asr-whisper`;
+    /// otherwise `tts_transcribe` reports EngineUnavailable rather than
+    /// anything about this section.
     #[serde(default)]
     pub whisper: WhisperConfig,
+    /// SenseVoice local ONNX config — the default transcription engine.
+    #[serde(default)]
+    pub sensevoice: SenseVoiceConfig,
 }
 
 /// Kokoro local TTS config.
@@ -172,13 +175,63 @@ pub struct KokoroConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WhisperConfig {
-    /// Filesystem path to the Whisper ONNX model. None → tool returns
-    /// ConfigMissing.
+    /// Directory holding `config.json`, `tokenizer.json` and
+    /// `model.safetensors` -- the HuggingFace layout Candle reads. None → look
+    /// for `whisper-<default_size>` under `~/.cache/nevoflux/models/`.
+    ///
+    /// Not whisper.cpp's `ggml-*.bin`: that is the file most people reach for
+    /// and Candle cannot read it. `just whisper-model` fetches the right one.
     #[serde(default)]
     pub model_path: Option<String>,
-    /// Default model size (`tiny` / `base` / `small` / `medium`).
+    /// Which size to look for (`tiny` / `base` / `small` / `medium` /
+    /// `large-v3-turbo`). Defaults to `base`.
+    ///
+    /// Measured peak resident memory *for the model alone*: base 585 MB,
+    /// small 1.90 GB, large-v3-turbo 4.77 GB. A running daemon is larger than
+    /// any of these and not by a little: it also holds Kokoro (442 MB) once
+    /// something synthesizes, the embedding model from the `embedding`
+    /// feature, and ONNX Runtime arenas, which grow and are never returned.
+    /// One observed daemon sat at 2.09 GB after a synthesize-then-transcribe
+    /// round trip on `base`. Read these numbers as the cost of choosing a
+    /// size, not as the size of the process. `base` is the default for footprint, and it
+    /// matched `small` on the English clip they were compared on -- but
+    /// Whisper is only reached for languages SenseVoice cannot distinguish,
+    /// and `base` is known to trail `small` on most non-English. Raise this if
+    /// non-English transcription is weak; that is the trade it exists for.
     #[serde(default)]
     pub default_size: Option<String>,
+}
+
+/// SenseVoice local ASR config — the default transcription engine.
+///
+/// `[tts.sensevoice]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.sensevoice]
+/// model_path  = "~/.cache/nevoflux/models/sensevoice-small.int8.onnx"
+/// tokens_path = "~/.cache/nevoflux/models/sensevoice-tokens.txt"
+/// threads     = 4
+/// ```
+///
+/// Both paths are optional: unset means look in `~/.cache/nevoflux/models/`
+/// for the names `just fetch-asr-models` writes. Those names are a local
+/// convention rather than the upstream ones, which disagree with each other.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SenseVoiceConfig {
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Token table. Must be the one shipped beside the weights: the model
+    /// states its vocab size in metadata, and a table of a different length
+    /// silently decodes the tail of the vocabulary to nothing.
+    #[serde(default)]
+    pub tokens_path: Option<String>,
+    /// fsmn-vad weights. Only consulted for audio longer than 30 s, which is
+    /// the most SenseVoice can take in one pass.
+    #[serde(default)]
+    pub vad_path: Option<String>,
+    /// ONNX intra-op thread count. None → logical cores capped at four,
+    /// matching the Kokoro default.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 /// ElevenLabs HTTP API config.
