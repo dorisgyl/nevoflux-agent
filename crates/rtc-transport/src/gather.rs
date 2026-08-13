@@ -129,32 +129,92 @@ pub enum AllocateReply {
     Rejected { code: u16 },
 }
 
+/// STUN attribute types this module writes. `is` models the rest.
+const ATTR_USERNAME: u16 = 0x0006;
+const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+const ATTR_REALM: u16 = 0x0014;
+const ATTR_NONCE: u16 = 0x0015;
+const ATTR_LIFETIME: u16 = 0x000D;
+/// RFC 5766 §14.7. Four bytes: the protocol, then three reserved.
+const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+/// The IANA protocol number for UDP, which is the only transport this relays.
+const TRANSPORT_UDP: u8 = 17;
+
+/// How long an allocation should last, in seconds.
+///
+/// One hour. The refresh timer runs well inside it; shorter means more
+/// refreshes and longer means an abandoned session holds a relay port for
+/// longer than anyone is paying attention.
+const ALLOCATION_LIFETIME: u32 = 3600;
+
+/// Append one attribute, padded to the four-byte boundary STUN requires.
+fn push_attr(out: &mut Vec<u8>, typ: u16, value: &[u8]) {
+    out.extend_from_slice(&typ.to_be_bytes());
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value);
+    out.resize(out.len().next_multiple_of(4), 0);
+}
+
 /// Serialize an ALLOCATE request, signed when a realm and nonce are known.
+///
+/// # Why this is written by hand
+///
+/// Everything else here goes through `is`, which is str0m's STUN codec — but
+/// `is` exists to run ICE connectivity checks, and has no notion of
+/// REQUESTED-TRANSPORT at all: no constant, no builder method, nothing to set.
+/// RFC 5766 §6.1 makes that attribute mandatory in an Allocate, and a server
+/// that does not see it must answer 400. Cloudflare does exactly that.
+///
+/// It cannot be spliced into a message `is` has already built, either, because
+/// MESSAGE-INTEGRITY covers every byte before it — inserting an attribute after
+/// the fact invalidates the signature. So the request is assembled here, which
+/// is a header and at most six attributes.
 pub fn allocate_request(
     trans_id: TransId,
     auth: Option<(&str, &str, &str, &str)>, // username, realm, nonce, password
     buf: &mut [u8],
 ) -> Option<usize> {
-    let b = StunMessageBuilder::new()
-        .allocate()
-        .request()
-        // One hour. The refresh timer runs well inside it; a shorter lifetime
-        // means more refreshes and a longer one means an abandoned session
-        // holds a relay port for longer than anyone is paying attention.
-        .lifetime(3600);
+    let mut body = Vec::with_capacity(192);
+    // Ordering is not specified for these, but MESSAGE-INTEGRITY must come
+    // after everything it signs, which is why it is added last.
+    push_attr(
+        &mut body,
+        ATTR_REQUESTED_TRANSPORT,
+        &[TRANSPORT_UDP, 0, 0, 0],
+    );
+    push_attr(&mut body, ATTR_LIFETIME, &ALLOCATION_LIFETIME.to_be_bytes());
 
-    match auth {
-        None => b.build(trans_id).to_bytes(None, buf, hmac_sha1).ok(),
-        Some((user, realm, nonce, pass)) => {
-            let key = long_term_key(user, realm, pass);
-            b.username(user)
-                .realm(realm)
-                .nonce(nonce)
-                .build(trans_id)
-                .to_bytes(Some(&key), buf, hmac_sha1)
-                .ok()
-        }
+    let signing = auth.map(|(user, realm, nonce, pass)| {
+        push_attr(&mut body, ATTR_USERNAME, user.as_bytes());
+        push_attr(&mut body, ATTR_REALM, realm.as_bytes());
+        push_attr(&mut body, ATTR_NONCE, nonce.as_bytes());
+        long_term_key(user, realm, pass)
+    });
+
+    let tid = trans_id_bytes(trans_id);
+    let mut msg = Vec::with_capacity(20 + body.len() + 24);
+    msg.extend_from_slice(&stun_wire::request_type(METHOD_ALLOCATE).to_be_bytes());
+    // Patched below; MESSAGE-INTEGRITY is computed over a header whose length
+    // already counts the signature that is not written yet.
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&stun_wire::MAGIC.to_be_bytes());
+    msg.extend_from_slice(&tid);
+    msg.extend_from_slice(&body);
+
+    if let Some(key) = signing {
+        let signed_len = (body.len() + 4 + 20) as u16;
+        msg[2..4].copy_from_slice(&signed_len.to_be_bytes());
+        let mac = hmac_sha1(&key, &[&msg]);
+        push_attr(&mut msg, ATTR_MESSAGE_INTEGRITY, &mac);
+    } else {
+        msg[2..4].copy_from_slice(&(body.len() as u16).to_be_bytes());
     }
+
+    if msg.len() > buf.len() {
+        return None;
+    }
+    buf[..msg.len()].copy_from_slice(&msg);
+    Some(msg.len())
 }
 
 /// Read what a TURN server answered.
@@ -514,5 +574,122 @@ mod tests {
             allocate_reply(&buf[..n], id),
             Some(AllocateReply::Rejected { code: 403 })
         );
+    }
+
+    /// The attributes a serialized request carries, in order.
+    fn attrs_of(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let end = 20 + u16::from_be_bytes([msg[2], msg[3]]) as usize;
+        let mut out = Vec::new();
+        let mut i = 20;
+        while i + 4 <= end.min(msg.len()) {
+            let typ = u16::from_be_bytes([msg[i], msg[i + 1]]);
+            let len = u16::from_be_bytes([msg[i + 2], msg[i + 3]]) as usize;
+            if i + 4 + len > msg.len() {
+                break;
+            }
+            out.push((typ, msg[i + 4..i + 4 + len].to_vec()));
+            i += 4 + len + ((4 - len % 4) % 4);
+        }
+        out
+    }
+
+    #[test]
+    fn an_allocate_asks_for_udp() {
+        // RFC 5766 §6.1 makes REQUESTED-TRANSPORT mandatory, and a server that
+        // does not see it must answer 400 rather than allocate. `is` -- str0m's
+        // STUN codec, which builds everything else here -- has no notion of the
+        // attribute at all, which is why this request is assembled by hand.
+        // Cloudflare rejected every Allocate this sent until it was.
+        let mut buf = [0u8; MSG_BUF];
+        let n = allocate_request(TransId::new(), None, &mut buf).unwrap();
+        let got = attrs_of(&buf[..n]);
+        let transport = got
+            .iter()
+            .find(|(t, _)| *t == ATTR_REQUESTED_TRANSPORT)
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            transport,
+            Some(vec![TRANSPORT_UDP, 0, 0, 0]),
+            "no usable REQUESTED-TRANSPORT in {got:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_allocate_carries_no_credentials() {
+        let mut buf = [0u8; MSG_BUF];
+        let n = allocate_request(TransId::new(), None, &mut buf).unwrap();
+        let types: Vec<u16> = attrs_of(&buf[..n]).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(types, vec![ATTR_REQUESTED_TRANSPORT, ATTR_LIFETIME]);
+    }
+
+    #[test]
+    fn a_signed_allocate_ends_with_the_signature() {
+        // MESSAGE-INTEGRITY covers every byte before it, so anything added
+        // after it is unsigned and anything added before it after the fact
+        // invalidates it. Last is the only place it can go.
+        let mut buf = [0u8; MSG_BUF];
+        let n = allocate_request(
+            TransId::new(),
+            Some(("user", "realm.example", "n0nce", "pass")),
+            &mut buf,
+        )
+        .unwrap();
+        let types: Vec<u16> = attrs_of(&buf[..n]).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            types,
+            vec![
+                ATTR_REQUESTED_TRANSPORT,
+                ATTR_LIFETIME,
+                ATTR_USERNAME,
+                ATTR_REALM,
+                ATTR_NONCE,
+                ATTR_MESSAGE_INTEGRITY,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_signature_is_taken_over_the_length_the_server_will_use() {
+        // The header length must already count MESSAGE-INTEGRITY when the HMAC
+        // is computed, because that is the message the server verifies. Getting
+        // this wrong produces a request that looks perfect and is rejected as
+        // 401 forever.
+        let mut buf = [0u8; MSG_BUF];
+        let n = allocate_request(
+            TransId::new(),
+            Some(("user", "realm.example", "n0nce", "pass")),
+            &mut buf,
+        )
+        .unwrap();
+        let declared = 20 + u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        assert_eq!(declared, n, "the declared length must cover the signature");
+
+        let key = long_term_key("user", "realm.example", "pass");
+        let signed_part = &buf[..n - 24]; // everything before the MI attribute
+        let expected = hmac_sha1(&key, &[signed_part]);
+        let mac = &buf[n - 20..n];
+        assert_eq!(
+            mac, expected,
+            "the signature does not cover the right bytes"
+        );
+    }
+
+    #[test]
+    fn a_request_this_side_writes_is_one_this_side_can_read() {
+        let tid = TransId::new();
+        let mut buf = [0u8; MSG_BUF];
+        let n = allocate_request(tid, None, &mut buf).unwrap();
+        let parsed = stun_wire::parse(&buf[..n]).expect("our own message must parse");
+        assert_eq!(parsed.method, METHOD_ALLOCATE);
+        assert_eq!(parsed.class, Some(Class::Request));
+        assert_eq!(parsed.trans_id, trans_id_bytes(tid));
+        assert_eq!(parsed.lifetime, Some(ALLOCATION_LIFETIME));
+    }
+
+    #[test]
+    fn a_buffer_too_small_is_refused_rather_than_truncated() {
+        // A truncated request would be sent and silently rejected.
+        let mut tiny = [0u8; 24];
+        assert!(allocate_request(TransId::new(), None, &mut tiny).is_none());
     }
 }

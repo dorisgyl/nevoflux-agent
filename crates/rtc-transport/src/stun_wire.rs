@@ -8,9 +8,12 @@
 //! an unauthenticated query sends exactly that, which means the one reply this
 //! code exists to read is the one `is` will not accept.
 //!
-//! So building requests still uses `is` (it is correct and already there) and
-//! reading replies happens here, where the strictness can match what servers
-//! actually send.
+//! So reading replies happens here, where the strictness can match what
+//! servers actually send. Most requests are still built by `is` — it is
+//! correct and already there — with one exception: an Allocate needs
+//! REQUESTED-TRANSPORT, which `is` cannot express at all, so
+//! [`gather::allocate_request`](crate::gather::allocate_request) assembles that
+//! one itself and uses [`request_type`] from here to do it.
 //!
 //! Only what is needed is decoded. This is not a STUN library.
 
@@ -18,8 +21,18 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Every STUN message carries this, and nothing else does. It is what makes
 /// STUN distinguishable from the media sharing its port.
-const MAGIC: u32 = 0x2112_A442;
+pub const MAGIC: u32 = 0x2112_A442;
 const HEADER: usize = 20;
+
+/// The type field for a request of `method`.
+///
+/// Method and class are interleaved through that field, so neither can be
+/// written with a single shift — this is the inverse of the decoding in
+/// [`parse`], and lives beside it so the two cannot drift.
+pub fn request_type(method: u16) -> u16 {
+    // Class `Request` is both class bits zero, so only the method is spread.
+    (method & 0x000F) | ((method & 0x0070) << 1) | ((method & 0x0F80) << 2)
+}
 
 // Attributes, from the IANA registry.
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
@@ -359,5 +372,28 @@ mod tests {
         msg[HEADER + 2] = 0xff;
         msg[HEADER + 3] = 0xff;
         assert_eq!(parse(&msg), None);
+    }
+
+    #[test]
+    fn the_type_field_encodes_back_to_the_method_it_came_from() {
+        // Method and class are interleaved through that field, so an encoder
+        // and a decoder that disagree produce a message the far end reads as
+        // some other method entirely.
+        for method in [METHOD_BINDING, METHOD_ALLOCATE, 0x009, 0x004, 0xFFF] {
+            let typ = request_type(method);
+            let decoded = (typ & 0x000F) | ((typ & 0x00E0) >> 1) | ((typ & 0x3E00) >> 2);
+            assert_eq!(
+                decoded, method,
+                "type 0x{typ:04x} decodes to 0x{decoded:03x}"
+            );
+            // Both class bits clear is what makes it a request.
+            assert_eq!(typ & 0x0110, 0, "0x{typ:04x} is not a request");
+        }
+    }
+
+    #[test]
+    fn the_well_known_request_types_are_the_ones_on_the_wire() {
+        assert_eq!(request_type(METHOD_BINDING), 0x0001);
+        assert_eq!(request_type(METHOD_ALLOCATE), 0x0003);
     }
 }

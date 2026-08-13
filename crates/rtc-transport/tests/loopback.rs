@@ -581,6 +581,32 @@ mod fake_turn {
         out
     }
 
+    /// The value of one attribute, if the message carries it.
+    ///
+    /// The stand-in used to tell a signed request from an unsigned one by its
+    /// length, and never looked at what was in it. That is how it accepted an
+    /// Allocate with no REQUESTED-TRANSPORT for as long as it did, while every
+    /// real server answered 400 -- the test mirrored the client's own
+    /// misunderstanding instead of checking it. Reading attributes is the
+    /// difference.
+    pub fn attr<'a>(msg: &'a [u8], want: u16) -> Option<&'a [u8]> {
+        let body_len = u16::from_be_bytes([msg[2], msg[3]]) as usize;
+        let end = (20 + body_len).min(msg.len());
+        let mut i = 20;
+        while i + 4 <= end {
+            let typ = u16::from_be_bytes([msg[i], msg[i + 1]]);
+            let len = u16::from_be_bytes([msg[i + 2], msg[i + 3]]) as usize;
+            if i + 4 + len > end {
+                return None;
+            }
+            if typ == want {
+                return Some(&msg[i + 4..i + 4 + len]);
+            }
+            i += 4 + len + ((4 - len % 4) % 4);
+        }
+        None
+    }
+
     fn xor_v4(addr: std::net::Ipv4Addr, port: u16) -> Vec<u8> {
         const MAGIC: u32 = 0x2112_A442;
         let mut v = vec![0u8, 0x01];
@@ -630,10 +656,20 @@ mod fake_turn {
 
             match method {
                 0x003 => {
-                    // Allocate. Challenge the first, grant the signed retry —
-                    // which is what a real server does and what the two-round-
-                    // trip handshake exists for.
-                    let signed = n > 60;
+                    // Allocate. RFC 5766 §6.1 makes REQUESTED-TRANSPORT
+                    // mandatory, and a server that does not see it must answer
+                    // 400 rather than allocate. Checked before the credentials
+                    // so a client that omits it cannot pass by signing.
+                    if attr(msg, 0x0019).map(|v| v.first().copied()) != Some(Some(17)) {
+                        let out = reply(0x0113, trans_id, &[(0x0009, vec![0, 0, 4, 0])]);
+                        let _ = socket.send_to(&out, from).await;
+                        continue;
+                    }
+                    // Challenge the first, grant the signed retry — which is
+                    // what a real server does and what the two-round-trip
+                    // handshake exists for. Told apart by the signature being
+                    // there, not by the message being longer.
+                    let signed = attr(msg, 0x0008).is_some();
                     let out = if signed {
                         seen.allocated = true;
                         reply(

@@ -206,18 +206,32 @@ fn usable(url: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The shape Cloudflare answers with.
+    /// Exactly what Cloudflare answered, captured from a real mint.
+    ///
+    /// Two entries rather than the single object the docs show, and the STUN
+    /// one carries no credentials — so the parser has to read username and
+    /// credential per entry rather than once for the whole answer.
     const REAL_SHAPE: &str = r#"{
-      "iceServers": {
-        "urls": [
-          "stun:stun.cloudflare.com:3478",
-          "turn:turn.cloudflare.com:3478?transport=udp",
-          "turn:turn.cloudflare.com:3478?transport=tcp",
-          "turns:turn.cloudflare.com:5349?transport=tcp"
-        ],
-        "username": "user-abc",
-        "credential": "secret-xyz"
-      }
+      "iceServers": [
+        {
+          "urls": [
+            "stun:stun.cloudflare.com:3478",
+            "stun:stun.cloudflare.com:53"
+          ]
+        },
+        {
+          "urls": [
+            "turn:turn.cloudflare.com:3478?transport=udp",
+            "turn:turn.cloudflare.com:3478?transport=tcp",
+            "turns:turn.cloudflare.com:5349?transport=tcp",
+            "turn:turn.cloudflare.com:53?transport=udp",
+            "turn:turn.cloudflare.com:80?transport=tcp",
+            "turns:turn.cloudflare.com:443?transport=tcp"
+          ],
+          "username": "user-abc",
+          "credential": "secret-xyz"
+        }
+      ]
     }"#;
 
     #[test]
@@ -228,7 +242,9 @@ mod tests {
             urls,
             vec![
                 "stun:stun.cloudflare.com:3478",
+                "stun:stun.cloudflare.com:53",
                 "turn:turn.cloudflare.com:3478?transport=udp",
+                "turn:turn.cloudflare.com:53?transport=udp",
             ],
             "kept a transport this client cannot speak"
         );
