@@ -256,6 +256,16 @@ impl PortalSession {
         self.encode(&wire)
     }
 
+    /// Send a frame that must not be replayed to a portal that reconnects.
+    ///
+    /// WebRTC signalling: an offer is worth exactly one delivery, and a resume
+    /// that hands back an old one costs the portal the connection it currently
+    /// has. See `relay_protocol::spent_signal`.
+    pub fn downlink_signal(&mut self, frame: Value) -> Wire {
+        let wire = self.sequencer.tag_transient(frame);
+        self.encode(&wire)
+    }
+
     /// Send one media range as bytes rather than as base64 inside JSON.
     ///
     /// Only for a portal that asked for it (`asset_pull.binary`) — see

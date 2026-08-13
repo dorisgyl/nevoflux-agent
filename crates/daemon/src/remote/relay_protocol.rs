@@ -125,6 +125,29 @@ fn base64_source_len(s: &str) -> usize {
     (s.len() / 4).saturating_mul(3).saturating_sub(pad)
 }
 
+/// What a frame that must not be replayed leaves behind in its place.
+///
+/// A signalling frame is only meaningful at the moment it is sent. Replaying an
+/// offer from ten seconds ago tells the portal to tear down the connection it
+/// has and answer a negotiation that no longer exists — which it dutifully
+/// does, sending an answer for an offer this end has forgotten. One reconnect
+/// replayed every offer the session had ever sent, the portal answered each,
+/// and the log filled with thousands of `an answer with no outstanding offer`
+/// while the conversation stopped being delivered.
+///
+/// The sequence number still has to be spent, though: the portal asks for a
+/// resume whenever it sees a gap, so skipping one entirely trades this loop for
+/// a resume loop. So the slot is kept and something inert goes in it.
+///
+/// A candidate with an empty string is that inert thing, and deliberately not a
+/// new frame kind: the portal already routes `rtc_candidate` out of the
+/// conversation before any reducer sees it, and an empty candidate is the
+/// end-of-candidates marker every implementation ignores. A kind the portal did
+/// not know would reach the chat instead.
+fn spent_signal() -> Value {
+    serde_json::json!({ "kind": "rtc_candidate", "candidate": "" })
+}
+
 /// Assigns monotonic `seq` to downlink frames and retains them for resume
 /// (design Y2). Send-side only; the receive-side gap tracker lives in the
 /// portal (`sequence.ts`).
@@ -160,6 +183,29 @@ impl SendSequencer {
         };
 
         self.buffer.push_back((seq, retained, cost));
+        self.bytes = self.bytes.saturating_add(cost);
+        self.evict();
+
+        WireMessage::Frame {
+            seq: Some(seq),
+            frame,
+        }
+    }
+
+    /// Tag a frame that is worth sending once and never again.
+    ///
+    /// Sent as given; what is kept for a resume is [`spent_signal`], so the
+    /// sequence stays whole and the replay says nothing.
+    pub fn tag_transient(&mut self, frame: Value) -> WireMessage {
+        let seq = self.next;
+        self.next += 1;
+
+        let placeholder = spent_signal();
+        let cost = serde_json::to_string(&placeholder)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        self.buffer
+            .push_back((seq, Retained::Frame(placeholder), cost));
         self.bytes = self.bytes.saturating_add(cost);
         self.evict();
 
@@ -573,5 +619,64 @@ mod tests {
         ] {
             assert_eq!(peer_count(not_a_notice), None, "{not_a_notice}");
         }
+    }
+
+    #[test]
+    fn a_signalling_frame_is_sent_once_and_replayed_as_nothing() {
+        // Replaying an offer tells the portal to tear down the connection it
+        // has and answer a negotiation this end has forgotten. One reconnect
+        // replayed every offer the session had sent, the portal answered each,
+        // and the conversation stopped being delivered while the log filled
+        // with thousands of "an answer with no outstanding offer".
+        let mut s = SendSequencer::new();
+        let offer = json!({ "kind": "rtc_offer", "sdp": "v=0
+real offer
+" });
+        let sent = s.tag_transient(offer.clone());
+        match &sent {
+            WireMessage::Frame { seq, frame } => {
+                assert_eq!(*seq, Some(0));
+                assert_eq!(frame, &offer, "the portal must get the real offer once");
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+
+        let again = s.resend_from(0).expect("still buffered");
+        assert_eq!(again.len(), 1, "the slot must still be there");
+        match &again[0] {
+            Resend::Ready(WireMessage::Frame { seq, frame }) => {
+                assert_eq!(*seq, Some(0));
+                assert_ne!(frame, &offer, "the offer was replayed");
+                assert_eq!(frame["kind"], "rtc_candidate");
+                assert_eq!(frame["candidate"], "");
+            }
+            other => panic!("expected a ready frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_transient_frame_still_spends_its_sequence_number() {
+        // Skipping one instead would leave a hole, and the portal asks for a
+        // resume whenever it sees a hole — trading one loop for another.
+        let mut s = SendSequencer::new();
+        s.tag(json!({ "kind": "stream_delta", "delta": "a" }));
+        s.tag_transient(json!({ "kind": "rtc_offer", "sdp": "v=0
+" }));
+        let after = s.tag(json!({ "kind": "stream_delta", "delta": "b" }));
+        match after {
+            WireMessage::Frame { seq: Some(2), .. } => {}
+            other => panic!("the sequence skipped: {other:?}"),
+        }
+        // And a resume covers every one of them, with no gap to chase.
+        let seqs: Vec<u64> = s
+            .resend_from(0)
+            .expect("still buffered")
+            .iter()
+            .filter_map(|r| match r {
+                Resend::Ready(WireMessage::Frame { seq, .. }) => *seq,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
     }
 }

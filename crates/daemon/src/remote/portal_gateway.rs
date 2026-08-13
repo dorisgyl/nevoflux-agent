@@ -675,7 +675,9 @@ impl PortalGateway {
         };
 
         self.rtc.set_path(super::rtc::Path::Forming);
-        let wire = self.session.lock().await.downlink_frame(value);
+        // Not `downlink_frame`: an offer replayed on a resume is worse than one
+        // lost, because the portal acts on it.
+        let wire = self.session.lock().await.downlink_signal(value);
         self.sink.send(wire).await;
         tracing::info!(target: "remote", "offered a peer connection to the portal");
     }
