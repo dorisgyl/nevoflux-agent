@@ -3,40 +3,60 @@
 //! Resampling and channel folding are ffmpeg's job, on the daemon side; audio
 //! is already 16 kHz mono by the time it reaches this crate. What is left here
 //! is the ceiling, and the ceiling is load-bearing rather than decorative:
-//! none of the three dispatch surfaces imposes a tool timeout, and a
-//! transcription holds a runtime worker thread for its entire duration. This
-//! is the only guard rail there is.
+//! none of the three dispatch surfaces imposes a tool timeout, a transcription
+//! holds a runtime worker for its whole duration, and its activations grow
+//! with the length of the audio. This is the only guard rail there is.
 
 use crate::error::AsrError;
 use crate::{Engine, SAMPLE_RATE};
 
-/// How long a single call may block, in minutes.
+/// Peak inference memory a single call may claim, in megabytes.
 ///
-/// The two ceilings below are this number scaled by each engine's realtime
-/// factor, so retuning both is a one-number change.
-pub const MAX_BLOCKING_MINUTES: u32 = 10;
+/// The ceiling is derived from memory rather than from time, because memory
+/// binds first and it is not close. Measured on the int8 export: activations
+/// grow about 6 MB per second of audio on top of the ~240 MB model, so five
+/// minutes peaks near 2 GB. Meanwhile the realtime factor decays from 14x to
+/// 5.9x across the same range, which would put a ten-minute *blocking* budget
+/// somewhere past 1500 s of audio -- by which point the process would be
+/// asking for roughly 9 GB.
+///
+/// An earlier version of this file did derive the ceiling from a blocking
+/// budget, and landed on 8400 s. That would have been about 50 GB.
+pub const MAX_INFERENCE_MEMORY_MB: u32 = 1500;
 
-/// Measured, not assumed: 14x realtime.
+/// Measured activation growth: about 6 MB per second of audio.
 ///
-/// Taken on CPU with the int8 export at four intra-op threads, over the four
-/// sherpa test clips (zh/en/ja/yue, 5-7 s each): 13.9, 14.3, 14.2, 14.1.
-/// Rounded down.
-///
-/// The published SenseVoice figures -- 70 ms for 10 s of audio, 169x realtime
-/// -- are GPU numbers and were never evidence for a CPU ceiling. Re-measure
-/// with `cargo run -p nevoflux-asr --example transcribe` if the export or the
-/// thread count changes.
-pub const SENSEVOICE_ASSUMED_RTF: u32 = 14;
+/// CPU, int8 export, four intra-op threads; peak RSS minus the loaded model:
+/// 30.5 s → 223 MB, 60.9 s → 454 MB, 121.8 s → 738 MB, 304.6 s → 1771 MB.
+/// Close enough to linear over that range to divide by.
+pub const SENSEVOICE_MB_PER_SECOND: u32 = 6;
 
-/// Provisional, pending the Task 12 benchmark: Whisper assumed to run at one
-/// third of realtime. Expressed as a divisor to keep the arithmetic integral.
+/// Measured throughput on short clips: 14x realtime.
+///
+/// CPU, int8 export, four threads, over the four sherpa test clips
+/// (zh/en/ja/yue, 5-7 s each): 13.9, 14.3, 14.2, 14.1. It decays with length
+/// -- 12.9x at 30 s, 9.1x at 122 s, 5.9x at 305 s -- so this describes the
+/// short-clip path and is not what the ceiling rests on.
+///
+/// The published 169x is a GPU number and was never evidence for any of this.
+/// Re-measure with `cargo run -p nevoflux-asr --example transcribe` when the
+/// export or the thread count changes.
+pub const SENSEVOICE_SHORT_CLIP_RTF: u32 = 14;
+
+/// Whisper: unmeasured, and deliberately pessimistic until it is. Assumed to
+/// run at a third of realtime. Revisit when the engine lands.
 pub const WHISPER_ASSUMED_RTF_DIVISOR: u32 = 3;
+const WHISPER_MAX_BLOCKING_MINUTES: u32 = 10;
 
-/// The longest audio, in seconds, this engine will accept in one call.
+/// The longest audio, in seconds, an engine accepts in one call.
+///
+/// These are single-pass limits. Segmenting long audio at speech pauses keeps
+/// every pass short, and therefore every pass cheap, which is what lifts them
+/// -- and that is not implemented yet.
 pub fn max_seconds(engine: Engine) -> u32 {
     match engine {
-        Engine::Sensevoice => MAX_BLOCKING_MINUTES * 60 * SENSEVOICE_ASSUMED_RTF,
-        Engine::Whisper => MAX_BLOCKING_MINUTES * 60 / WHISPER_ASSUMED_RTF_DIVISOR,
+        Engine::Sensevoice => MAX_INFERENCE_MEMORY_MB / SENSEVOICE_MB_PER_SECOND,
+        Engine::Whisper => WHISPER_MAX_BLOCKING_MINUTES * 60 / WHISPER_ASSUMED_RTF_DIVISOR,
     }
 }
 
@@ -104,8 +124,27 @@ mod tests {
     }
 
     #[test]
-    fn whisper_ceiling_is_tighter_than_sensevoice() {
-        assert!(max_seconds(Engine::Whisper) < max_seconds(Engine::Sensevoice));
+    fn sensevoice_ceiling_keeps_peak_memory_within_budget() {
+        let secs = max_seconds(Engine::Sensevoice);
+        assert!(
+            secs * SENSEVOICE_MB_PER_SECOND <= MAX_INFERENCE_MEMORY_MB,
+            "{secs}s of audio would want {} MB",
+            secs * SENSEVOICE_MB_PER_SECOND
+        );
+        assert!(secs >= 120, "a two-minute clip must still fit; got {secs}s");
+    }
+
+    #[test]
+    fn no_ceiling_is_anywhere_near_the_old_time_derived_one() {
+        // 8400 s came from a blocking budget that ignored memory; it would
+        // have asked for roughly 50 GB. Guard against that order returning.
+        for engine in [Engine::Sensevoice, Engine::Whisper] {
+            assert!(
+                max_seconds(engine) < 1000,
+                "{engine:?}: {}",
+                max_seconds(engine)
+            );
+        }
     }
 
     #[test]
