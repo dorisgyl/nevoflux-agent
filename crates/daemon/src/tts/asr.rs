@@ -441,10 +441,20 @@ fn run_whisper(
     ))
 }
 
-/// Whisper's default size. The smallest that transcribes well, at roughly
-/// 4.8 GB resident.
+/// Whisper's default size.
+///
+/// `base` at 585 MB resident and 2.5x realtime, measured, against `small` at
+/// 1.90 GB / 0.9x and `large-v3-turbo` at 4.77 GB / 0.3x. On the English clip
+/// used to compare them, `base` and `small` produced the same transcript, so
+/// the extra gigabyte bought nothing there.
+///
+/// The honest limit of that comparison: Whisper's job here is the languages
+/// SenseVoice cannot distinguish, and published WER puts `base` clearly behind
+/// `small` on most non-English languages. One English sample cannot speak to
+/// that. Anyone finding non-English transcription weak should raise
+/// `[tts.whisper] default_size` -- the error and config docs say so.
 #[cfg(feature = "asr-whisper")]
-const WHISPER_DEFAULT_SIZE: &str = "large-v3-turbo";
+const WHISPER_DEFAULT_SIZE: &str = "base";
 
 /// The loaded Whisper, kept for the life of the process.
 ///
@@ -562,6 +572,9 @@ mod tests {
         assert!(matches!(err, TtsError::Internal(_)), "{err}");
     }
 
+    /// Only meaningful where Whisper is absent -- which is no longer the
+    /// stock build. Run with `--no-default-features` to exercise these.
+    #[cfg(not(feature = "asr-whisper"))]
     #[tokio::test]
     async fn whisper_is_unavailable_and_says_so_in_build_terms() {
         // engine="whisper" is explicit, so routing must honour it and the
@@ -577,6 +590,9 @@ mod tests {
         assert!(!msg.contains("config missing"), "{msg}");
     }
 
+    /// Needs an engine that is genuinely absent, so it only runs in a build
+    /// without Whisper. The ordering it guards is not build-specific.
+    #[cfg(not(feature = "asr-whisper"))]
     #[tokio::test]
     async fn engine_availability_is_reported_before_audio_problems() {
         // "AAAA" is valid base64 but not decodable audio, and Whisper is not
@@ -596,6 +612,21 @@ mod tests {
             matches!(err, TtsError::EngineUnavailable(_)),
             "expected the engine to be blamed, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_engine_is_rejected_before_the_audio_is_touched() {
+        // The build-independent half of the ordering guarantee: "AAAA" is
+        // valid base64 and not decodable audio, so if routing ran after the
+        // decode this would come back blaming ffmpeg.
+        let cfg = TtsConfig::default();
+        let mut r = req_inline("AAAA");
+        r.engine = Some("kaldi".into());
+        let err = transcribe(&cfg, &r, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, TtsError::InvalidRequest(_)), "{msg}");
+        assert!(msg.contains("expected one of"), "{msg}");
+        assert!(!msg.contains("ffmpeg"), "{msg}");
     }
 
     #[tokio::test]

@@ -219,7 +219,8 @@ fetch-asr-models:
         "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/src/silero_vad/data/silero_vad.onnx" \
         "silero-vad.onnx"
     echo "ASR models are in $DEST"
-    echo "Whisper is optional, only for --features asr-whisper: just whisper-model"
+    echo "Whisper weights are fetched separately, and only if you need a"
+    echo "language outside zh/yue/en/ja/ko: just whisper-model"
 
 # End-to-end ASR check against real models (needs a release build)
 verify-asr:
@@ -244,18 +245,21 @@ dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFI
     cargo run -q -p nevoflux-asr --example dump_model \
         --features sensevoice,ort-load-dynamic -- "$(eval echo {{MODEL}})"
 
-# Fetch Whisper weights (only needed for --features asr-whisper)
-whisper-model MODEL="large-v3-turbo":
+# Fetch Whisper weights (only needed for languages SenseVoice cannot handle)
+whisper-model MODEL="base":
     #!/usr/bin/env bash
     set -euo pipefail
     # Candle loads config.json + tokenizer.json + model.safetensors. It does
     # NOT read whisper.cpp's ggml-*.bin, which is the obvious thing to reach
     # for and is a different format entirely.
     #
-    # Separate from fetch-asr-models on purpose: the default build has no
-    # Whisper engine, so most people never need these and should not have to
-    # download 1.6 GB to find that out. `just whisper-model tiny` is the small
-    # one to develop against.
+    # Separate from fetch-asr-models on purpose. The engine is compiled in by
+    # default now, but the weights are not fetched by default: most recordings
+    # are in a language SenseVoice handles, and those users never need this.
+    # A stock build that meets German says so and names this command.
+    #
+    # `base` is the default size for footprint (585 MB resident). `small`
+    # (1.9 GB) and `large-v3-turbo` (4.8 GB) transcribe non-English better.
     DEST="${HOME}/.cache/nevoflux/models/whisper-{{MODEL}}"
     REPO="openai/whisper-{{MODEL}}"
     mkdir -p "$DEST"

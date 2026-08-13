@@ -108,7 +108,7 @@ pub struct TranscribeRequest {
     pub file_path: Option<String>,
     /// Whisper model size: `"tiny"` / `"base"` / `"small"` / `"medium"` /
     /// `"large-v3-turbo"`. Whisper only — SenseVoice ships a single size and
-    /// ignores this. Defaults to config, else `"large-v3-turbo"`.
+    /// ignores this. Defaults to config, else `"base"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_size: Option<String>,
     /// Engine selection: `"auto"` (default) / `"sensevoice"` / `"whisper"`.

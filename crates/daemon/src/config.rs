@@ -184,8 +184,14 @@ pub struct WhisperConfig {
     #[serde(default)]
     pub model_path: Option<String>,
     /// Which size to look for (`tiny` / `base` / `small` / `medium` /
-    /// `large-v3-turbo`). Defaults to `large-v3-turbo`, which is the smallest
-    /// that transcribes well -- at a cost of roughly 4.8 GB resident.
+    /// `large-v3-turbo`). Defaults to `base`.
+    ///
+    /// Measured peak resident memory: base 585 MB, small 1.90 GB,
+    /// large-v3-turbo 4.77 GB. `base` is the default for footprint, and it
+    /// matched `small` on the English clip they were compared on -- but
+    /// Whisper is only reached for languages SenseVoice cannot distinguish,
+    /// and `base` is known to trail `small` on most non-English. Raise this if
+    /// non-English transcription is weak; that is the trade it exists for.
     #[serde(default)]
     pub default_size: Option<String>,
 }

@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Core daemon for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
@@ -18,12 +18,17 @@ tts-local = ["dep:nevoflux-tts"]
 # SenseVoice transcription. On by default: it is the engine `auto` routes to,
 # and without it `tts_transcribe` can only report that it is absent.
 asr-sensevoice = ["nevoflux-asr/sensevoice"]
-# Whisper via Candle. OFF by default because of memory, not binary size:
-# linking Candle costs +3.3 MB stripped (measured), while running
-# large-v3-turbo costs 4.8 GB resident. The weights load lazily, so a build
-# with this on pays nothing until something actually routes to Whisper --
-# and then pays a lot. Turn it on for builds that need the languages
-# SenseVoice cannot tell apart.
+# Whisper via Candle. ON by default, which it was not at first.
+#
+# Linking Candle costs +3.3 MB stripped (measured: 106.7 -> 110.0), and the
+# weights load lazily, so a build with this on costs almost nothing until
+# something routes to Whisper. Off by default meant the opposite of a saving:
+# `auto` sends every language SenseVoice cannot distinguish here, so a German
+# recording failed on a stock build and the remedy was a rebuild.
+#
+# What the size costs is memory when it runs, and that is why the default
+# model is `base` (585 MB) rather than large-v3-turbo (4.8 GB). See
+# WHISPER_DEFAULT_SIZE.
 asr-whisper = ["nevoflux-asr/whisper"]
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:
 #   * ort-load-dynamic (default): load `libonnxruntime` at startup via

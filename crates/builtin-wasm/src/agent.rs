@@ -3548,7 +3548,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                         "file_path":      { "type": "string", "description": "Path inside the artifact's files map (e.g. 'narration.mp3')." },
                         "engine":         { "type": "string", "enum": ["auto", "sensevoice", "whisper"], "description": "Which engine transcribes. 'auto' (default) decides from `language`: zh/yue/en/ja/ko go to sensevoice, anything else to whisper. With no language given, auto uses sensevoice -- see the note field on the response." },
                         "language":       { "type": "string", "description": "BCP-47 hint such as 'zh', 'en', 'de'. Strongly recommended: this is what makes engine routing correct, and without it a non-CJK recording can be transcribed as confident nonsense." },
-                        "model_size":     { "type": "string", "enum": ["tiny", "base", "small", "medium", "large-v3-turbo"], "description": "Whisper only; sensevoice ships a single size and ignores this. Defaults to config, else 'large-v3-turbo'." }
+                        "model_size":     { "type": "string", "enum": ["tiny", "base", "small", "medium", "large-v3-turbo"], "description": "Whisper only; sensevoice ships a single size and ignores this. Defaults to config, else 'base'. Larger sizes transcribe non-English better at much higher memory: base 585MB, small 1.9GB, large-v3-turbo 4.8GB." }
                     }
                 }),
             },
