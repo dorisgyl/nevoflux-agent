@@ -97,6 +97,11 @@ impl PeerSlot {
         }
     }
 
+    /// Whether an answer has been taken and a driver owns the connection.
+    pub fn is_running(&self) -> bool {
+        matches!(self, PeerSlot::Running { .. })
+    }
+
     /// The offer still waiting for an answer, if there is one.
     pub fn pending_offer(&self) -> Option<SignalFrame> {
         match self {

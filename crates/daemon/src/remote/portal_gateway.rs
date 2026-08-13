@@ -81,6 +81,9 @@ pub struct PortalGateway {
     /// When an offer was last put on the wire, so repeats stay cheap.
     #[cfg(feature = "webrtc")]
     last_offer: Mutex<Option<std::time::Instant>>,
+    /// Offers sent since one was last answered. Reset by an accepted answer.
+    #[cfg(feature = "webrtc")]
+    unanswered_offers: Mutex<u32>,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -99,17 +102,28 @@ const UPLOAD_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
 /// upload quota because this side carries recordings, not just pictures.
 const ASSET_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 
-/// How often an offer may go out while no connection has formed.
+/// How long to wait before the first repeat of an unanswered offer.
 ///
-/// The relay's presence notice is what normally triggers one, and that arrives
-/// exactly once per portal arriving — so this is not the mechanism, it is the
-/// bound on the backstop. Short enough that a portal whose notice went missing
-/// waits seconds rather than minutes, long enough that the repeats are nothing
-/// next to what the channel already carries: an SDP is a few KB, so a session
-/// where the peer path never forms spends well under a kilobyte a second on
-/// trying, and stops the moment it does form.
+/// The relay's presence notice is what normally triggers an offer, and that
+/// arrives exactly once per portal arriving — so this is not the mechanism, it
+/// is the floor on the backstop, and it doubles with each repeat.
 #[cfg(feature = "webrtc")]
 const REOFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many offers may go unanswered before this session stops asking.
+///
+/// There are networks where a peer connection cannot form — both ends behind a
+/// symmetric NAT with no relay between them is the common one — and on those,
+/// asking again is not eventually going to work. Repeating forever is not
+/// harmless either: each offer is a few KB of SDP on the sealed channel, and
+/// the portal tears down and rebuilds a peer connection for every one it gets,
+/// on a phone, alongside the conversation it is supposed to be showing.
+///
+/// A session that gives up stays on the relay, which is where it already was.
+/// Five attempts with the interval doubling covers about two and a half
+/// minutes, which is far longer than a connection that is going to form takes.
+#[cfg(feature = "webrtc")]
+const MAX_UNANSWERED_OFFERS: u32 = 5;
 
 /// The upload ids a frame declares. A non-string entry is skipped rather than
 /// failing the whole message.
@@ -162,6 +176,8 @@ impl PortalGateway {
             peer: Mutex::new(super::rtc_peer::PeerSlot::default()),
             #[cfg(feature = "webrtc")]
             last_offer: Mutex::new(None),
+            #[cfg(feature = "webrtc")]
+            unanswered_offers: Mutex::new(0),
             media_sink: None,
         }
     }
@@ -554,6 +570,12 @@ impl PortalGateway {
                         &mut slot,
                         Arc::clone(&self.rtc),
                     );
+                    // An answer that was taken ends the backstop: the portal is
+                    // there and heard us, so whatever happens next is the
+                    // connection's business and not a reason to ask again.
+                    if slot.is_running() {
+                        *self.unanswered_offers.lock().await = 0;
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(target: "remote", "unreadable signalling frame: {e}");
@@ -602,11 +624,27 @@ impl PortalGateway {
             return;
         }
         {
+            let mut sent = self.unanswered_offers.lock().await;
+            if *sent >= MAX_UNANSWERED_OFFERS {
+                return; // said once, below, when the count was reached
+            }
+            // Doubling, so a portal that is simply slow still gets a second
+            // chance quickly while a network that will never work stops being
+            // asked. Left un-doubled this repeated every five seconds for as
+            // long as the session lived.
+            let wait = REOFFER_INTERVAL * (1u32 << (*sent).min(4));
             let mut last = self.last_offer.lock().await;
-            if last.is_some_and(|t| t.elapsed() < REOFFER_INTERVAL) {
+            if last.is_some_and(|t| t.elapsed() < wait) {
                 return;
             }
             *last = Some(std::time::Instant::now());
+            *sent += 1;
+            if *sent >= MAX_UNANSWERED_OFFERS {
+                tracing::info!(
+                    target: "remote",
+                    "no answer to {MAX_UNANSWERED_OFFERS} offers; staying on the relay"
+                );
+            }
         }
 
         let sealed = self.session.lock().await.is_sealed();
@@ -684,6 +722,15 @@ impl PortalGateway {
             if let Some(n) = super::relay_protocol::peer_count(text) {
                 if n > 0 {
                     self.spawn_offer();
+                } else {
+                    // The relay saying a frame reached nobody. Worth a line:
+                    // otherwise a head goes on answering into an empty channel
+                    // and the only symptom is a phone that shows nothing, with
+                    // a log that says every reply was sent.
+                    tracing::info!(
+                        target: "remote",
+                        "nobody is attached to this channel; frames are going nowhere"
+                    );
                 }
                 return;
             }
@@ -1433,5 +1480,54 @@ mod tests {
             sink.sent.lock().await.is_empty(),
             "offered over a connection that was already carrying media"
         );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_session_that_is_never_answered_stops_asking() {
+        // On a network where no peer connection can form — both ends behind a
+        // symmetric NAT, no relay between them — repeating forever is not
+        // eventually going to work, and is not free: it was observed sending an
+        // offer every five seconds for as long as the session lived, and the
+        // portal tears down and rebuilds a peer connection for each one, on a
+        // phone, next to the conversation it should be showing.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+
+        for _ in 0..MAX_UNANSWERED_OFFERS + 3 {
+            // Pretend the interval passed; the cap is what is under test.
+            *gw.last_offer.lock().await = None;
+            gw.offer_peer_connection().await;
+        }
+        assert_eq!(
+            sink.sent.lock().await.len() as u32,
+            MAX_UNANSWERED_OFFERS,
+            "kept asking past the cap"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn each_repeat_waits_longer_than_the_last() {
+        // A portal that is merely slow still gets a quick second chance; a
+        // network that will never work stops being asked.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+
+        gw.offer_peer_connection().await;
+        assert_eq!(sink.sent.lock().await.len(), 1);
+
+        // One interval is no longer enough for the second repeat.
+        *gw.last_offer.lock().await = Some(std::time::Instant::now() - REOFFER_INTERVAL);
+        gw.offer_peer_connection().await;
+        assert_eq!(
+            sink.sent.lock().await.len(),
+            1,
+            "the second repeat should wait twice as long"
+        );
+
+        *gw.last_offer.lock().await = Some(std::time::Instant::now() - REOFFER_INTERVAL * 2);
+        gw.offer_peer_connection().await;
+        assert_eq!(sink.sent.lock().await.len(), 2);
     }
 }
