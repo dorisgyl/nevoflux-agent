@@ -3771,7 +3771,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-agent"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-asr"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-brain"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-bridge"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3850,7 +3850,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-builtin-wasm"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "nevoflux-protocol",
  "rmp-serde",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-computer"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-daemon"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm-gateway"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-mcp"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "futures",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-pack"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "proptest",
  "semver",
@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-protocol"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -4055,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-skills"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "directories",
@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-storage"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "base64 0.22.1",
  "nevoflux-protocol",
@@ -4086,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-testing"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",
@@ -4105,7 +4105,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-tts"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "dirs 5.0.1",
  "misaki-rs",
