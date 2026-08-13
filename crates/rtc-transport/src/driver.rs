@@ -290,23 +290,34 @@ mod tokio_driver {
                     Ok((n, from)) => {
                         // Anything from the TURN server is either data it
                         // forwarded — which has to be unwrapped and presented
-                        // as coming from the peer, not from the relay, or ICE
-                        // would pair it with the wrong candidate — or an answer
-                        // about a channel binding.
-                        let (source, payload) = match relay.as_mut() {
+                        // as coming from the peer, not from the relay — or an
+                        // answer about a channel binding.
+                        //
+                        // Both ends of that have to be right. The source is who
+                        // sent it; the arrival address is which of *our*
+                        // candidates it came in on, and ICE matches a datagram
+                        // to a candidate pair with both. A packet the relay
+                        // forwarded arrived, as far as ICE is concerned, on the
+                        // relayed address — telling it the host address instead
+                        // files relayed traffic under the direct pair, and a
+                        // DTLS handshake fed records from two paths as though
+                        // they were one fails on a transcript neither end
+                        // agrees with: `signature verification failed`.
+                        let (source, arrived_on, payload) = match relay.as_mut() {
                             Some(r) if from == r.server => {
+                                let relayed = r.relayed;
                                 match r.unwrap_from(&buf[..n]) {
-                                    Some((peer, data)) => (peer, data),
+                                    Some((peer, data)) => (peer, relayed, data),
                                     None => {
                                         r.on_reply(&socket, &buf[..n]).await;
                                         continue;
                                     }
                                 }
                             }
-                            _ => (from, buf[..n].to_vec()),
+                            _ => (from, local, buf[..n].to_vec()),
                         };
                         let rtc = endpoint.rtc_mut();
-                        if let Err(e) = receive(rtc, Instant::now(), source, local, &payload) {
+                        if let Err(e) = receive(rtc, Instant::now(), source, arrived_on, &payload) {
                             tracing::warn!(target: "rtc", "input rejected: {e}");
                             break;
                         }
@@ -508,6 +519,38 @@ pub fn send_video(
 
 #[cfg(test)]
 mod video_tests {
+    #[test]
+    fn ice_matches_a_relayed_candidate_by_its_relayed_address() {
+        use str0m::CandidateKind;
+        // The assumption the receive path rests on, pinned against the str0m
+        // in use rather than against the RFC. `is` matches an inbound datagram
+        // to a local candidate with
+        //
+        //     matches!(v.kind(), Host | Relayed) && v.addr() == destination
+        //
+        // so a packet the relay forwarded has to be presented as having
+        // arrived on the *relayed* address. Were `addr()` ever to report the
+        // base instead, the driver would have to hand ICE the host address and
+        // this test is what would say so.
+        let relayed: SocketAddr = "203.0.113.9:20149".parse().unwrap();
+        let base: SocketAddr = "192.0.2.5:41000".parse().unwrap();
+        let c = Candidate::relayed(relayed, base, Protocol::Udp).expect("a relayed candidate");
+        assert_eq!(c.addr(), relayed, "ICE would match this against the base");
+        assert_eq!(c.kind(), CandidateKind::Relayed);
+
+        // And a reflexive one is matched on the base, because that is where its
+        // packets physically arrive — which is why the direct path is labelled
+        // with the socket's own address and only the relayed path is not.
+        let public: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let r = Candidate::server_reflexive(public, base, Protocol::Udp).expect("srflx");
+        assert_eq!(r.kind(), CandidateKind::ServerReflexive);
+        assert_ne!(
+            r.kind(),
+            CandidateKind::Host,
+            "a reflexive candidate is never matched against on receive"
+        );
+    }
+
     use super::*;
     use crate::connection::RtcEndpoint;
     use crate::signal::SignalFrame;
