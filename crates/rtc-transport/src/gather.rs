@@ -103,7 +103,7 @@ pub fn reflexive_from(reply: &[u8], expect: TransId) -> Option<SocketAddr> {
 ///
 /// Cheap, and it avoids keeping a parallel copy of the id that could drift from
 /// the one actually on the wire.
-fn trans_id_bytes(id: TransId) -> [u8; 12] {
+pub(crate) fn trans_id_bytes(id: TransId) -> [u8; 12] {
     let mut buf = [0u8; 128];
     let Some(n) = binding_request(id, &mut buf) else {
         return [0u8; 12];
@@ -129,14 +129,6 @@ pub enum AllocateReply {
     Rejected { code: u16 },
 }
 
-/// STUN attribute types this module writes. `is` models the rest.
-const ATTR_USERNAME: u16 = 0x0006;
-const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
-const ATTR_REALM: u16 = 0x0014;
-const ATTR_NONCE: u16 = 0x0015;
-const ATTR_LIFETIME: u16 = 0x000D;
-/// RFC 5766 §14.7. Four bytes: the protocol, then three reserved.
-const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 /// The IANA protocol number for UDP, which is the only transport this relays.
 const TRANSPORT_UDP: u8 = 17;
 
@@ -147,74 +139,33 @@ const TRANSPORT_UDP: u8 = 17;
 /// longer than anyone is paying attention.
 const ALLOCATION_LIFETIME: u32 = 3600;
 
-/// Append one attribute, padded to the four-byte boundary STUN requires.
-fn push_attr(out: &mut Vec<u8>, typ: u16, value: &[u8]) {
-    out.extend_from_slice(&typ.to_be_bytes());
-    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    out.extend_from_slice(value);
-    out.resize(out.len().next_multiple_of(4), 0);
-}
-
 /// Serialize an ALLOCATE request, signed when a realm and nonce are known.
 ///
-/// # Why this is written by hand
-///
-/// Everything else here goes through `is`, which is str0m's STUN codec — but
-/// `is` exists to run ICE connectivity checks, and has no notion of
-/// REQUESTED-TRANSPORT at all: no constant, no builder method, nothing to set.
-/// RFC 5766 §6.1 makes that attribute mandatory in an Allocate, and a server
-/// that does not see it must answer 400. Cloudflare does exactly that.
-///
-/// It cannot be spliced into a message `is` has already built, either, because
-/// MESSAGE-INTEGRITY covers every byte before it — inserting an attribute after
-/// the fact invalidates the signature. So the request is assembled here, which
-/// is a header and at most six attributes.
+/// REQUESTED-TRANSPORT is not optional: RFC 5766 §6.1 requires it and a server
+/// that does not see it must answer 400. See [`stun_wire::Request`] for why the
+/// message is assembled rather than handed to `is`.
 pub fn allocate_request(
     trans_id: TransId,
     auth: Option<(&str, &str, &str, &str)>, // username, realm, nonce, password
     buf: &mut [u8],
 ) -> Option<usize> {
-    let mut body = Vec::with_capacity(192);
-    // Ordering is not specified for these, but MESSAGE-INTEGRITY must come
-    // after everything it signs, which is why it is added last.
-    push_attr(
-        &mut body,
-        ATTR_REQUESTED_TRANSPORT,
+    let mut req = stun_wire::Request::new(METHOD_ALLOCATE);
+    req.push(
+        stun_wire::ATTR_REQUESTED_TRANSPORT,
         &[TRANSPORT_UDP, 0, 0, 0],
     );
-    push_attr(&mut body, ATTR_LIFETIME, &ALLOCATION_LIFETIME.to_be_bytes());
+    req.push(stun_wire::ATTR_LIFETIME, &ALLOCATION_LIFETIME.to_be_bytes());
 
-    let signing = auth.map(|(user, realm, nonce, pass)| {
-        push_attr(&mut body, ATTR_USERNAME, user.as_bytes());
-        push_attr(&mut body, ATTR_REALM, realm.as_bytes());
-        push_attr(&mut body, ATTR_NONCE, nonce.as_bytes());
-        long_term_key(user, realm, pass)
-    });
-
-    let tid = trans_id_bytes(trans_id);
-    let mut msg = Vec::with_capacity(20 + body.len() + 24);
-    msg.extend_from_slice(&stun_wire::request_type(METHOD_ALLOCATE).to_be_bytes());
-    // Patched below; MESSAGE-INTEGRITY is computed over a header whose length
-    // already counts the signature that is not written yet.
-    msg.extend_from_slice(&0u16.to_be_bytes());
-    msg.extend_from_slice(&stun_wire::MAGIC.to_be_bytes());
-    msg.extend_from_slice(&tid);
-    msg.extend_from_slice(&body);
-
-    if let Some(key) = signing {
-        let signed_len = (body.len() + 4 + 20) as u16;
-        msg[2..4].copy_from_slice(&signed_len.to_be_bytes());
-        let mac = hmac_sha1(&key, &[&msg]);
-        push_attr(&mut msg, ATTR_MESSAGE_INTEGRITY, &mac);
-    } else {
-        msg[2..4].copy_from_slice(&(body.len() as u16).to_be_bytes());
-    }
-
-    if msg.len() > buf.len() {
-        return None;
-    }
-    buf[..msg.len()].copy_from_slice(&msg);
-    Some(msg.len())
+    let key = auth.map(|(user, realm, _, pass)| long_term_key(user, realm, pass));
+    let auth = auth
+        .zip(key.as_ref())
+        .map(|((username, realm, nonce, _), key)| stun_wire::Auth {
+            username,
+            realm,
+            nonce,
+            key,
+        });
+    req.finish(trans_id_bytes(trans_id), auth, buf)
 }
 
 /// Read what a TURN server answered.
@@ -387,6 +338,10 @@ mod io {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stun_wire::{
+        ATTR_LIFETIME, ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_REQUESTED_TRANSPORT,
+        ATTR_USERNAME,
+    };
 
     #[test]
     fn a_binding_request_is_a_binding_request() {

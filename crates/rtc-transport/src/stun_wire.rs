@@ -34,13 +34,152 @@ pub fn request_type(method: u16) -> u16 {
     (method & 0x000F) | ((method & 0x0070) << 1) | ((method & 0x0F80) << 2)
 }
 
+/// Long-term credentials, ready to sign with.
+pub struct Auth<'a> {
+    pub username: &'a str,
+    pub realm: &'a str,
+    pub nonce: &'a str,
+    /// `MD5(user:realm:pass)`, from `gather::long_term_key`.
+    pub key: &'a [u8],
+}
+
+/// A STUN request being assembled.
+///
+/// # Why requests are written here and not by `is`
+///
+/// `is` can build most of them, and for a while it did. Two things made that
+/// untenable against a real TURN server, both found the same way — by a server
+/// refusing what looked correct:
+///
+/// * An Allocate needs REQUESTED-TRANSPORT, which `is` has no way to express,
+///   and a server that does not see it must answer 400.
+/// * Everything `is` signed was answered 401. It appends FINGERPRINT after
+///   MESSAGE-INTEGRITY, and the signature has to be taken over a header length
+///   that counts the signature and *not* the fingerprint; get that wrong and
+///   the server computes a different HMAC and rejects credentials that are
+///   perfectly good. Cloudflare rejected every ChannelBind this sent.
+///
+/// So the requests this code sends are built here, where the length the
+/// signature covers is explicit and tested.
+pub struct Request {
+    method: u16,
+    body: Vec<u8>,
+}
+
+/// What MESSAGE-INTEGRITY adds: four bytes of header and twenty of HMAC-SHA1.
+const INTEGRITY_LEN: usize = 24;
+
+impl Request {
+    pub fn new(method: u16) -> Self {
+        Self {
+            method,
+            body: Vec::with_capacity(192),
+        }
+    }
+
+    /// Append one attribute, padded to the four-byte boundary STUN requires.
+    pub fn push(&mut self, typ: u16, value: &[u8]) {
+        self.body.extend_from_slice(&typ.to_be_bytes());
+        self.body
+            .extend_from_slice(&(value.len() as u16).to_be_bytes());
+        self.body.extend_from_slice(value);
+        self.body.resize(self.body.len().next_multiple_of(4), 0);
+    }
+
+    /// Serialize into `buf`, signing when credentials are given.
+    ///
+    /// USERNAME, REALM and NONCE are appended here rather than by the caller so
+    /// they cannot end up after the signature that has to cover them.
+    ///
+    /// No FINGERPRINT. It is optional, no server has ever required it, and
+    /// getting its interaction with MESSAGE-INTEGRITY right buys nothing.
+    pub fn finish(
+        mut self,
+        trans_id: [u8; 12],
+        auth: Option<Auth<'_>>,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        let key = auth.map(|a| {
+            self.push(ATTR_USERNAME, a.username.as_bytes());
+            self.push(ATTR_REALM, a.realm.as_bytes());
+            self.push(ATTR_NONCE, a.nonce.as_bytes());
+            a.key.to_vec()
+        });
+
+        let mut msg = Vec::with_capacity(HEADER + self.body.len() + INTEGRITY_LEN);
+        msg.extend_from_slice(&request_type(self.method).to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes()); // patched below
+        msg.extend_from_slice(&MAGIC.to_be_bytes());
+        msg.extend_from_slice(&trans_id);
+        msg.extend_from_slice(&self.body);
+
+        let declared = match &key {
+            // The length the server will use when it recomputes the HMAC:
+            // already counting the signature that has not been written yet.
+            Some(_) => self.body.len() + INTEGRITY_LEN,
+            None => self.body.len(),
+        };
+        msg[2..4].copy_from_slice(&(declared as u16).to_be_bytes());
+
+        if let Some(key) = key {
+            let mac = crate::gather::hmac_sha1(&key, &[&msg]);
+            let mut signed = Request {
+                method: self.method,
+                body: Vec::new(),
+            };
+            signed.push(ATTR_MESSAGE_INTEGRITY, &mac);
+            msg.extend_from_slice(&signed.body);
+        }
+
+        if msg.len() > buf.len() {
+            return None;
+        }
+        buf[..msg.len()].copy_from_slice(&msg);
+        Some(msg.len())
+    }
+}
+
+/// Encode an address the way XOR-PEER-ADDRESS and friends carry it.
+///
+/// The inverse of [`xor_address`], and beside it for the same reason: an
+/// encoder and decoder that disagree here send a peer address the server reads
+/// as somewhere else entirely.
+pub fn xor_address_value(addr: SocketAddr, trans_id: &[u8; 12]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(20);
+    v.push(0);
+    let port = addr.port() ^ ((MAGIC >> 16) as u16);
+    match addr.ip() {
+        IpAddr::V4(a) => {
+            v.push(0x01);
+            v.extend_from_slice(&port.to_be_bytes());
+            v.extend_from_slice(&(u32::from(a) ^ MAGIC).to_be_bytes());
+        }
+        IpAddr::V6(a) => {
+            v.push(0x02);
+            v.extend_from_slice(&port.to_be_bytes());
+            let mut key = [0u8; 16];
+            key[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+            key[4..16].copy_from_slice(trans_id);
+            for (i, b) in a.octets().iter().enumerate() {
+                v.push(b ^ key[i]);
+            }
+        }
+    }
+    v
+}
+
 // Attributes, from the IANA registry.
+pub const ATTR_USERNAME: u16 = 0x0006;
+pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+pub const ATTR_LIFETIME: u16 = 0x000D;
+pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
+pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
+pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 const ATTR_ERROR_CODE: u16 = 0x0009;
-const ATTR_REALM: u16 = 0x0014;
-const ATTR_NONCE: u16 = 0x0015;
-const ATTR_LIFETIME: u16 = 0x000D;
+pub const ATTR_REALM: u16 = 0x0014;
+pub const ATTR_NONCE: u16 = 0x0015;
 
 /// STUN methods this cares about.
 pub const METHOD_BINDING: u16 = 0x001;

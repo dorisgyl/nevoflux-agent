@@ -526,7 +526,7 @@ async fn a_real_turn_server_grants_a_relay() {
         .expect("resolves to an address");
 
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-    let (relayed, _creds) = gather::allocate(&socket, addr, &user, &pass)
+    let (relayed, creds) = gather::allocate(&socket, addr, &user, &pass)
         .await
         .unwrap_or_else(|| {
             panic!(
@@ -544,6 +544,79 @@ async fn a_real_turn_server_grants_a_relay() {
         socket.local_addr().unwrap(),
         "the server handed back our own address"
     );
+
+    // An allocation nothing can be sent through is an address that swallows
+    // everything. Binding is the half that failed in the field while the
+    // allocation itself looked fine, so it is checked against a real server
+    // too — and checked for two peers at once, because that is the case the
+    // stand-in server could not reproduce: ICE tries every candidate pair, so
+    // several binds are in flight together and each answer has to find its own
+    // request.
+    // The transport reports a refused bind or a rotated nonce through tracing
+    // rather than by failing, so without this a broken bind looks like silence.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let mut relay = nevoflux_rtc_transport::turn::Relay::new(addr, relayed, creds);
+    // Two ordinary third-party addresses. Not documentation ranges and not
+    // Cloudflare's own (1.1.1.1), both of which it declines to relay to and
+    // refuses with a bare 401 — a policy choice, and one that looks exactly
+    // like a broken client until you try a third address.
+    let a: std::net::SocketAddr = "8.8.8.8:3478".parse().unwrap();
+    let b: std::net::SocketAddr = "8.8.4.4:3478".parse().unwrap();
+    assert!(
+        !relay.send_to(&socket, a, b"check").await,
+        "should bind first"
+    );
+    assert!(
+        !relay.send_to(&socket, b, b"check").await,
+        "should bind first"
+    );
+
+    // Driven the way the driver drives it: keep asking for whatever is not
+    // bound yet and keep reading. Cloudflare answers the first request on a
+    // nonce and hands back a fresh one with a 401 for the rest, so a single
+    // pass converges on nothing — which is not a failure to bind, it is the
+    // retry the protocol is built around.
+    let mut bound = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut buf = vec![0u8; 2048];
+    while bound.len() < 2 && tokio::time::Instant::now() < deadline {
+        for peer in [a, b] {
+            if !bound.contains(&peer) {
+                relay.send_to(&socket, peer, b"check").await;
+            }
+        }
+        // Drain whatever came back before asking again.
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(400), socket.recv_from(&mut buf)).await
+        {
+            if let Some(peer) = relay.on_reply(&socket, &buf[..n]).await {
+                eprintln!("bound a channel for {peer}");
+                bound.insert(peer);
+            }
+        }
+    }
+    assert_eq!(
+        bound,
+        [a, b].into_iter().collect::<std::collections::HashSet<_>>(),
+        "each answer must be attributed to the peer that asked"
+    );
+
+    // Distinct numbers. Asking for one channel on behalf of two peers is
+    // refused 400 by every conformant server, and asking again with the same
+    // number — which is what a counter that only moves on success does — is
+    // refused again, forever.
+    let (ca, cb) = (relay.channel(a), relay.channel(b));
+    assert!(
+        ca.is_some() && cb.is_some(),
+        "both channels must be current"
+    );
+    assert_ne!(ca, cb, "two peers were given the same channel");
+    // Nothing is sent to either: a bind proves the path exists, and these are
+    // somebody else's servers.
 }
 
 /// A stand-in TURN server: answers the allocate challenge, binds a channel, and
@@ -589,7 +662,7 @@ mod fake_turn {
     /// real server answered 400 -- the test mirrored the client's own
     /// misunderstanding instead of checking it. Reading attributes is the
     /// difference.
-    pub fn attr<'a>(msg: &'a [u8], want: u16) -> Option<&'a [u8]> {
+    pub fn attr(msg: &[u8], want: u16) -> Option<&[u8]> {
         let body_len = u16::from_be_bytes([msg[2], msg[3]]) as usize;
         let end = (20 + body_len).min(msg.len());
         let mut i = 20;
@@ -750,7 +823,7 @@ async fn a_relay_is_allocated_bound_and_actually_carries_a_payload() {
         .await
         .expect("no bind reply")
         .unwrap();
-    assert_eq!(relay.on_reply(&buf[..n]), Some(peer));
+    assert_eq!(relay.on_reply(&client, &buf[..n]).await, Some(peer));
     assert!(
         relay.send_to(&client, peer, b"payload").await,
         "the channel is bound; this must go out"

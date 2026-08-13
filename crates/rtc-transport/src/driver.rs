@@ -281,7 +281,7 @@ mod tokio_driver {
                                 match r.unwrap_from(&buf[..n]) {
                                     Some((peer, data)) => (peer, data),
                                     None => {
-                                        r.on_reply(&buf[..n]);
+                                        r.on_reply(&socket, &buf[..n]).await;
                                         continue;
                                     }
                                 }

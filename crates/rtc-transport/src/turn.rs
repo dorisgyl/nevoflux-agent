@@ -25,7 +25,7 @@
 
 use std::net::SocketAddr;
 
-use str0m::ice::{StunMessageBuilder, TransId};
+use str0m::ice::TransId;
 
 use crate::stun_wire::{self, Class};
 
@@ -108,18 +108,28 @@ pub fn channel_bind_request(
     creds: &Credentials,
     buf: &mut [u8],
 ) -> Option<usize> {
+    let tid = crate::gather::trans_id_bytes(trans_id);
     let key = crate::gather::long_term_key(&creds.username, &creds.realm, &creds.password);
-    StunMessageBuilder::new()
-        .channel_bind()
-        .request()
-        .channel_number(channel)
-        .xor_peer_address(peer)
-        .username(&creds.username)
-        .realm(&creds.realm)
-        .nonce(&creds.nonce)
-        .build(trans_id)
-        .to_bytes(Some(&key), buf, crate::gather::hmac_sha1)
-        .ok()
+    let mut req = stun_wire::Request::new(METHOD_CHANNEL_BIND);
+    // Two bytes of channel and two reserved, per RFC 5766 §14.1.
+    req.push(
+        stun_wire::ATTR_CHANNEL_NUMBER,
+        &[(channel >> 8) as u8, channel as u8, 0, 0],
+    );
+    req.push(
+        stun_wire::ATTR_XOR_PEER_ADDRESS,
+        &stun_wire::xor_address_value(peer, &tid),
+    );
+    req.finish(
+        tid,
+        Some(stun_wire::Auth {
+            username: &creds.username,
+            realm: &creds.realm,
+            nonce: &creds.nonce,
+            key: &key,
+        }),
+        buf,
+    )
 }
 
 /// Serialize a REFRESH request, keeping the allocation alive.
@@ -133,16 +143,18 @@ pub fn refresh_request(
     buf: &mut [u8],
 ) -> Option<usize> {
     let key = crate::gather::long_term_key(&creds.username, &creds.realm, &creds.password);
-    StunMessageBuilder::new()
-        .refresh()
-        .request()
-        .lifetime(lifetime)
-        .username(&creds.username)
-        .realm(&creds.realm)
-        .nonce(&creds.nonce)
-        .build(trans_id)
-        .to_bytes(Some(&key), buf, crate::gather::hmac_sha1)
-        .ok()
+    let mut req = stun_wire::Request::new(METHOD_REFRESH);
+    req.push(stun_wire::ATTR_LIFETIME, &lifetime.to_be_bytes());
+    req.finish(
+        crate::gather::trans_id_bytes(trans_id),
+        Some(stun_wire::Auth {
+            username: &creds.username,
+            realm: &creds.realm,
+            nonce: &creds.nonce,
+            key: &key,
+        }),
+        buf,
+    )
 }
 
 /// What a TURN server said to a CHANNEL-BIND or REFRESH.
@@ -160,22 +172,103 @@ pub enum Ack {
     Rejected {
         code: u16,
     },
+    /// Unauthorized, and the server did not say what to retry with.
+    ///
+    /// RFC 5389 wants a 401 to carry REALM and NONCE so the client can sign
+    /// again, and RFC 5766 wants a spent nonce to be a 438 that carries a fresh
+    /// one. Cloudflare answers a bare 401: no realm, no nonce, nothing to
+    /// recover from. Folding that into "unparseable" is what made a relay
+    /// retry the same dead request every second for the life of the call
+    /// without a word in the log.
+    Unauthorized,
+}
+
+/// The realm and nonce an unauthenticated request was challenged with.
+///
+/// The only way back from [`Ack::Unauthorized`]: ask for something without
+/// credentials and the server says what to use.
+pub fn read_challenge(reply: &[u8]) -> Option<(String, String)> {
+    let msg = stun_wire::parse(reply)?;
+    if msg.class != Some(Class::Error) {
+        return None;
+    }
+    match msg.error {
+        Some(401 | 438) => Some((msg.realm?, msg.nonce?)),
+        _ => None,
+    }
 }
 
 /// Read the answer to a CHANNEL-BIND or REFRESH.
+///
+/// See [`read_ack_for`] when the answer has to be matched to the request that
+/// asked for it.
 pub fn read_ack(reply: &[u8], expect_method: u16) -> Option<Ack> {
+    read_ack_for(reply, expect_method).map(|(ack, _)| ack)
+}
+
+/// The answer, and the transaction id it belongs to.
+///
+/// A CHANNEL-BIND response names neither the peer nor the channel — the
+/// transaction id is the only thing tying it to what was asked. ICE checks
+/// every candidate pair at once, so several binds really are in flight at the
+/// same time, and attributing an answer to the wrong one is worse than losing
+/// it: the channel gets recorded against a peer it was never bound to, and
+/// every datagram the relay forwards on it is then handed to the wrong sender.
+pub fn read_ack_for(reply: &[u8], expect_method: u16) -> Option<(Ack, [u8; 12])> {
     let msg = stun_wire::parse(reply)?;
     if msg.method != expect_method {
         return None;
     }
-    match (msg.class, msg.error) {
-        (Some(Class::Success), _) => Some(Ack::Ok),
-        (_, Some(438)) | (_, Some(401)) => Some(Ack::Stale {
-            realm: msg.realm?,
-            nonce: msg.nonce?,
-        }),
-        (_, Some(code)) => Some(Ack::Rejected { code }),
-        _ => None,
+    let tid = msg.trans_id;
+    let ack = match (msg.class, msg.error) {
+        (Some(Class::Success), _) => Ack::Ok,
+        (_, Some(438)) | (_, Some(401)) => match (msg.realm, msg.nonce) {
+            (Some(realm), Some(nonce)) => Ack::Stale { realm, nonce },
+            // Nothing to retry with. Recovered by re-challenging, not here.
+            _ => Ack::Unauthorized,
+        },
+        (_, Some(code)) => Ack::Rejected { code },
+        _ => return None,
+    };
+    Some((ack, tid))
+}
+
+/// Whether a TURN server could plausibly forward to this address.
+///
+/// ICE offers every address a peer has, including the ones behind its own NAT.
+/// Asking a public relay to reach `10.x` or `192.168.x` is asking it to route
+/// somewhere it has no path to, and a server that is paying attention answers
+/// 400. The bind is refused, retried, refused again — noise that hides the
+/// binds that matter, and on a rate-limiting server, harm.
+///
+/// A private peer is never worth relaying to anyway: if this end can reach it
+/// directly the host candidate already works, and if it cannot, no relay on the
+/// internet will help.
+pub fn relayable(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            // 100.64/10 is carrier-grade NAT space — a phone really does offer
+            // one of these as a host candidate, and it is no more routable from
+            // a relay than 10/8 is.
+            let cgnat = v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]);
+            // Documentation ranges are deliberately *not* excluded. Nothing
+            // real ever offers one as a candidate, so excluding them buys
+            // nothing — and they are exactly what a test should use to stand in
+            // for a public peer.
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || cgnat)
+        }
+        std::net::IpAddr::V6(v6) => {
+            // Unique-local (fc00::/7) and link-local (fe80::/10) by hand: the
+            // std predicates for them are still unstable.
+            let unique_local = v6.octets()[0] & 0xfe == 0xfc;
+            let link_local = v6.octets()[0] == 0xfe && v6.octets()[1] & 0xc0 == 0x80;
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
     }
 }
 
@@ -210,10 +303,37 @@ mod runtime {
         pub relayed: SocketAddr,
         creds: Credentials,
         channels: HashMap<SocketAddr, (u16, Instant)>,
-        /// Peers a bind is in flight for, so a burst of ICE checks does not
-        /// send one request per packet.
-        binding: HashMap<SocketAddr, Instant>,
+        /// The channel number reserved for each peer, bound or not.
+        ///
+        /// Assigned when the peer is first seen rather than when its bind
+        /// succeeds. Taking it from a counter that only moved on success gave
+        /// every concurrent bind the same number, and a channel may be bound to
+        /// exactly one peer — so the first won and the rest were refused 400
+        /// forever, because each retry asked for the same taken number again.
+        reserved: HashMap<SocketAddr, u16>,
+        /// Binds in flight, keyed by the transaction that will answer them.
+        ///
+        /// Keyed by transaction rather than by peer because that is the only
+        /// thing a CHANNEL-BIND response carries: it names neither the peer nor
+        /// the channel.
+        binding: HashMap<[u8; 12], InFlight>,
+        /// When a bind was last asked for, per peer, so a burst of ICE checks
+        /// does not send one request per packet.
+        asked: HashMap<SocketAddr, Instant>,
+        /// The nonce has been spent and nothing signed with it will be
+        /// accepted, so a fresh one must be drawn before anything else is sent.
+        needs_nonce: bool,
+        /// When a challenge was last asked for, so a burst of refusals does not
+        /// become a burst of challenges.
+        challenged: Option<Instant>,
         next_index: usize,
+    }
+
+    /// A CHANNEL-BIND waiting for its answer.
+    struct InFlight {
+        peer: SocketAddr,
+        channel: u16,
+        at: Instant,
     }
 
     impl Relay {
@@ -223,7 +343,11 @@ mod runtime {
                 relayed,
                 creds,
                 channels: HashMap::new(),
+                reserved: HashMap::new(),
                 binding: HashMap::new(),
+                asked: HashMap::new(),
+                needs_nonce: false,
+                challenged: None,
                 next_index: 0,
             }
         }
@@ -246,26 +370,68 @@ mod runtime {
                 let framed = wrap(channel, data);
                 return socket.send_to(&framed, self.server).await.is_ok();
             }
+            if self.needs_nonce {
+                // Signing with a spent nonce earns another bare 401. Draw a
+                // fresh one first; the bind goes out on a later check, and ICE
+                // sends plenty of those.
+                self.draw_nonce(socket).await;
+                return false;
+            }
             self.request_bind(socket, peer).await;
             false
         }
 
+        /// Ask for something without credentials, to be told what to sign with.
+        ///
+        /// Cloudflare spends a nonce on one signed request and then answers a
+        /// bare 401 — no realm, no nonce — so there is nothing in the refusal
+        /// to recover from. An unauthenticated request is challenged properly,
+        /// and the challenge carries both.
+        async fn draw_nonce(&mut self, socket: &UdpSocket) {
+            if let Some(at) = self.challenged {
+                if at.elapsed() < Duration::from_millis(500) {
+                    return;
+                }
+            }
+            let mut buf = [0u8; 512];
+            let Some(n) = crate::gather::allocate_request(TransId::new(), None, &mut buf) else {
+                return;
+            };
+            if socket.send_to(&buf[..n], self.server).await.is_ok() {
+                self.challenged = Some(Instant::now());
+                tracing::debug!(target: "rtc", "asking the relay for a fresh nonce");
+            }
+        }
+
+        /// The channel number this peer uses, reserving one if it has none.
+        ///
+        /// Reserved on first sight and kept, so two peers are never asked for
+        /// on the same number and a retry always asks for the same one.
+        fn channel_number(&mut self, peer: SocketAddr) -> Option<u16> {
+            if let Some(c) = self.reserved.get(&peer) {
+                return Some(*c);
+            }
+            let c = channel_for(self.next_index)?;
+            self.next_index += 1;
+            self.reserved.insert(peer, c);
+            Some(c)
+        }
+
         /// Start binding a channel for a peer, unless one is already in flight.
         async fn request_bind(&mut self, socket: &UdpSocket, peer: SocketAddr) {
+            // Nothing a public relay can forward to; see `relayable`.
+            if !relayable(&peer) {
+                return;
+            }
             // A connectivity check burst is many packets in a few milliseconds;
             // one request per packet would be a flood the server may well
             // rate-limit us for.
-            if let Some(at) = self.binding.get(&peer) {
+            if let Some(at) = self.asked.get(&peer) {
                 if at.elapsed() < Duration::from_secs(1) {
                     return;
                 }
             }
-            let Some(channel) = self
-                .channels
-                .get(&peer)
-                .map(|(c, _)| *c)
-                .or_else(|| channel_for(self.next_index))
-            else {
+            let Some(channel) = self.channel_number(peer) else {
                 tracing::warn!(target: "rtc", "no channel numbers left");
                 return;
             };
@@ -277,7 +443,20 @@ mod runtime {
                 return;
             };
             if socket.send_to(&buf[..n], self.server).await.is_ok() {
-                self.binding.insert(peer, Instant::now());
+                let now = Instant::now();
+                self.asked.insert(peer, now);
+                self.binding.insert(
+                    crate::gather::trans_id_bytes(trans_id),
+                    InFlight {
+                        peer,
+                        channel,
+                        at: now,
+                    },
+                );
+                // Requests that are never answered would otherwise accumulate
+                // one entry per connectivity check for the life of the call.
+                self.binding
+                    .retain(|_, f| f.at.elapsed() < Duration::from_secs(30));
                 tracing::debug!(target: "rtc", %peer, channel, "binding a relay channel");
             }
         }
@@ -287,36 +466,72 @@ mod runtime {
         /// Returns the peer whose channel became usable, so the caller can log
         /// it. A stale nonce is absorbed here and the bind retried on the next
         /// send, which is what keeps a long call from losing its relay.
-        pub fn on_reply(&mut self, reply: &[u8]) -> Option<SocketAddr> {
-            let ack = read_ack(reply, CHANNEL_BIND)?;
-            // The reply does not name the peer, so the one bind in flight is
-            // the one it answers. With at most one outstanding per peer and a
-            // single portal per session, that is unambiguous in practice.
-            let peer = *self.binding.keys().next()?;
+        pub async fn on_reply(&mut self, socket: &UdpSocket, reply: &[u8]) -> Option<SocketAddr> {
+            // A challenge, whatever asked for it. This is how a spent nonce is
+            // replaced, so it is read before anything else.
+            if let Some((realm, nonce)) = read_challenge(reply) {
+                tracing::debug!(target: "rtc", %realm, "took a fresh nonce from the relay");
+                self.creds.realm = realm;
+                self.creds.nonce = nonce;
+                self.needs_nonce = false;
+                // Every peer may ask again immediately; the old refusals were
+                // about the nonce and not about them.
+                self.asked.clear();
+                return None;
+            }
+            let Some((ack, tid)) = read_ack_for(reply, CHANNEL_BIND) else {
+                // Not ours, or an answer this code cannot read. The second is
+                // the dangerous one: it looks exactly like the first, and a
+                // relay that silently discards every answer retries the same
+                // dead request forever with nothing in the log to say so.
+                if let Some(m) = stun_wire::parse(reply) {
+                    if m.method == CHANNEL_BIND {
+                        tracing::debug!(
+                            target: "rtc",
+                            class = ?m.class,
+                            error = ?m.error,
+                            realm = ?m.realm,
+                            has_nonce = m.nonce.is_some(),
+                            "unreadable channel-bind answer"
+                        );
+                    }
+                }
+                return None;
+            };
+            // Matched by transaction. Guessing — taking whichever bind happened
+            // to be in the map — recorded a channel against a peer it was never
+            // bound to, and every datagram the relay then forwarded on it was
+            // handed to the wrong sender. ICE discards those, so the connection
+            // died at the DTLS handshake with nothing in the log to say why.
+            let Some(InFlight { peer, channel, .. }) = self.binding.remove(&tid) else {
+                tracing::debug!(target: "rtc", "a channel-bind answer for no request of ours");
+                return None;
+            };
             match ack {
                 Ack::Ok => {
-                    let channel = self
-                        .channels
-                        .get(&peer)
-                        .map(|(c, _)| *c)
-                        .or_else(|| channel_for(self.next_index))?;
-                    if !self.channels.contains_key(&peer) {
-                        self.next_index += 1;
-                    }
                     self.channels.insert(peer, (channel, Instant::now()));
-                    self.binding.remove(&peer);
                     tracing::info!(target: "rtc", %peer, channel, "relay channel bound");
                     Some(peer)
                 }
                 Ack::Stale { realm, nonce } => {
+                    tracing::debug!(target: "rtc", %peer, "relay rotated the nonce; retrying");
                     self.creds.realm = realm;
                     self.creds.nonce = nonce;
-                    self.binding.remove(&peer);
+                    // Retried on the next send, with the number still reserved.
+                    self.asked.remove(&peer);
                     None
                 }
                 Ack::Rejected { code } => {
-                    tracing::warn!(target: "rtc", %peer, code, "relay refused the channel");
-                    self.binding.remove(&peer);
+                    tracing::warn!(target: "rtc", %peer, channel, code, "relay refused the channel");
+                    None
+                }
+                Ack::Unauthorized => {
+                    // The nonce is spent. Nothing signed with it will be taken,
+                    // including this peer's retry, so stop signing until a
+                    // fresh one arrives.
+                    self.needs_nonce = true;
+                    self.asked.remove(&peer);
+                    self.draw_nonce(socket).await;
                     None
                 }
             }
@@ -440,22 +655,77 @@ mod tests {
         let parsed = stun_wire::parse(&buf[..n]).expect("parses");
         assert_eq!(parsed.method, CHANNEL_BIND);
         assert_eq!(parsed.class, Some(Class::Request));
-        // Unsigned it would be refused with a 401 and the relay would never
-        // carry anything.
-        let unsigned_len = {
-            let mut b = [0u8; 512];
-            StunMessageBuilder::new()
-                .channel_bind()
-                .request()
-                .channel_number(0x4000)
-                .xor_peer_address(peer)
-                .build(TransId::new())
-                .to_bytes(None, &mut b, crate::gather::hmac_sha1)
-                .unwrap()
-        };
-        assert!(
-            n > unsigned_len,
-            "no integrity attribute: {n} vs {unsigned_len}"
+
+        let got = attrs_of(&buf[..n]);
+        let types: Vec<u16> = got.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            types,
+            vec![
+                stun_wire::ATTR_CHANNEL_NUMBER,
+                stun_wire::ATTR_XOR_PEER_ADDRESS,
+                stun_wire::ATTR_USERNAME,
+                stun_wire::ATTR_REALM,
+                stun_wire::ATTR_NONCE,
+                // Unsigned, every server answers 401 and the relay never
+                // carries anything. It must also be last: it covers what
+                // precedes it and nothing else.
+                stun_wire::ATTR_MESSAGE_INTEGRITY,
+            ]
+        );
+
+        let channel = &got[0].1;
+        assert_eq!(
+            channel,
+            &vec![0x40, 0x00, 0, 0],
+            "channel number, then two reserved"
+        );
+
+        // Decoded independently of the encoder that wrote it: an encoder and a
+        // decoder that share a mistake agree with each other and with nobody
+        // else, and the server would relay to an address that is not the peer.
+        let v = &got[1].1;
+        assert_eq!(v[1], 0x01, "IPv4 family");
+        let port = u16::from_be_bytes([v[2], v[3]]) ^ 0x2112;
+        let ip = u32::from_be_bytes([v[4], v[5], v[6], v[7]]) ^ 0x2112_A442;
+        assert_eq!(SocketAddr::from((std::net::Ipv4Addr::from(ip), port)), peer);
+    }
+
+    /// The attributes a serialized request carries, in order.
+    fn attrs_of(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let end = 20 + u16::from_be_bytes([msg[2], msg[3]]) as usize;
+        let mut out = Vec::new();
+        let mut i = 20;
+        while i + 4 <= end.min(msg.len()) {
+            let typ = u16::from_be_bytes([msg[i], msg[i + 1]]);
+            let len = u16::from_be_bytes([msg[i + 2], msg[i + 3]]) as usize;
+            if i + 4 + len > msg.len() {
+                break;
+            }
+            out.push((typ, msg[i + 4..i + 4 + len].to_vec()));
+            i += 4 + len + ((4 - len % 4) % 4);
+        }
+        out
+    }
+
+    #[test]
+    fn an_ipv6_peer_survives_the_round_trip() {
+        // IPv6 masks with the transaction id as well as the cookie, so this is
+        // the case where an encoder can be wrong in a way IPv4 never shows.
+        let peer: SocketAddr = "[2001:db8::dead:beef]:9000".parse().unwrap();
+        let tid = [3u8; 12];
+        let v = stun_wire::xor_address_value(peer, &tid);
+        assert_eq!(v[1], 0x02, "IPv6 family");
+        let port = u16::from_be_bytes([v[2], v[3]]) ^ 0x2112;
+        let mut key = [0u8; 16];
+        key[0..4].copy_from_slice(&0x2112_A442u32.to_be_bytes());
+        key[4..16].copy_from_slice(&tid);
+        let mut octets = [0u8; 16];
+        for i in 0..16 {
+            octets[i] = v[4 + i] ^ key[i];
+        }
+        assert_eq!(
+            SocketAddr::from((std::net::Ipv6Addr::from(octets), port)),
+            peer
         );
     }
 
@@ -519,5 +789,49 @@ mod tests {
         // Allocate success on the same socket must not be read as a bind ack.
         let msg = reply(0x0103, &[]);
         assert_eq!(read_ack(&msg, CHANNEL_BIND), None);
+    }
+
+    #[test]
+    fn a_relay_is_only_asked_for_addresses_it_could_reach() {
+        // ICE offers every address a peer has, including the ones behind its
+        // own NAT. A phone on a mobile network really does offer 10.x and
+        // 100.64.x host candidates, and asking a public relay to forward there
+        // earns a 400 per retry — noise that buried the binds that mattered.
+        for reachable in ["203.0.113.4:9000", "8.8.8.8:3478", "[2001:db8::1]:9000"] {
+            let a: SocketAddr = reachable.parse().unwrap();
+            assert!(relayable(&a), "{reachable} should be worth relaying to");
+        }
+        for unreachable in [
+            "10.27.53.207:41916", // seen in the field, from a phone
+            "192.168.1.10:5000",
+            "172.16.0.1:5000",
+            "100.64.1.1:5000", // carrier-grade NAT
+            "127.0.0.1:5000",
+            "169.254.1.1:5000",
+            "0.0.0.0:5000",
+            "[::1]:5000",
+            "[fe80::1]:5000",
+            "[fc00::1]:5000",
+        ] {
+            let a: SocketAddr = unreachable.parse().unwrap();
+            assert!(
+                !relayable(&a),
+                "{unreachable} is not reachable from a relay"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_carries_the_transaction_that_asked() {
+        // The only thing tying a CHANNEL-BIND response to its request: it names
+        // neither the peer nor the channel. ICE checks every candidate pair at
+        // once, so several binds are genuinely in flight together.
+        let tid = [7u8; 12];
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x0109u16.to_be_bytes()); // channel-bind success
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        msg.extend_from_slice(&tid);
+        assert_eq!(read_ack_for(&msg, CHANNEL_BIND), Some((Ack::Ok, tid)));
     }
 }

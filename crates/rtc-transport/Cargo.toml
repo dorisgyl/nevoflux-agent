@@ -33,4 +33,7 @@ optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+# So the ignored live tests can show what the transport decided; a TURN
+# failure is a decision (wrong nonce, refused channel) and not a panic.
+tracing-subscriber = { workspace = true }
 
