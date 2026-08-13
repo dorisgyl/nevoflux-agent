@@ -221,6 +221,17 @@ fetch-asr-models:
     echo "ASR models are in $DEST"
     echo "Whisper is optional, only for --features asr-whisper: just whisper-model"
 
+# End-to-end ASR check against real models (needs a release build)
+verify-asr:
+    #!/usr/bin/env bash
+    # Unit tests cover the pipeline on synthetic input; this exercises the
+    # release binary on real speech, which is where preprocessing drift and
+    # engine wiring actually show up. Release because the debug build reads
+    # about a third of the throughput and is not what ships.
+    cargo build --release -q -p nevoflux-asr --example transcribe \
+        --features sensevoice,whisper,ort-load-dynamic
+    bash scripts/verify-asr.sh
+
 # Print an ASR model's ONNX I/O signature and metadata
 dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFILE="debug":
     #!/usr/bin/env bash
