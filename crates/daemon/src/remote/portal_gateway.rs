@@ -629,6 +629,13 @@ impl PortalGateway {
         if self.rtc.path() == super::rtc::Path::Peer {
             return;
         }
+        // Reported with the offer. A run showed two offers four seconds apart
+        // when the second owed ten, and one gateway cannot do that — so either
+        // the count is not what this code thinks, or a second gateway is on the
+        // same channel with a counter of its own. The id tells the two apart at
+        // a glance, which beats reasoning about it again.
+        let attempt;
+        let waited;
         {
             let mut sent = self.unanswered_offers.lock().await;
             if *sent >= MAX_UNANSWERED_OFFERS {
@@ -645,6 +652,8 @@ impl PortalGateway {
             }
             *last = Some(std::time::Instant::now());
             *sent += 1;
+            attempt = *sent;
+            waited = wait;
             if *sent >= MAX_UNANSWERED_OFFERS {
                 tracing::info!(
                     target: "remote",
@@ -685,7 +694,13 @@ impl PortalGateway {
         // lost, because the portal acts on it.
         let wire = self.session.lock().await.downlink_signal(value);
         self.sink.send(wire).await;
-        tracing::info!(target: "remote", "offered a peer connection to the portal");
+        tracing::info!(
+            target: "remote",
+            gateway = %self.id,
+            attempt,
+            waited_s = waited.as_secs(),
+            "offered a peer connection to the portal"
+        );
     }
 
     /// No-op without the feature, so the call site needs no `cfg`.
