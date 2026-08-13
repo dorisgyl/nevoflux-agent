@@ -11,6 +11,8 @@
 //! write also has to fold `wrote_to_files` into the response and therefore
 //! belongs with the caller.
 
+#[cfg(feature = "asr-sensevoice")]
+use crate::config::SenseVoiceConfig;
 use crate::config::TtsConfig;
 use crate::tts::error::TtsError;
 use nevoflux_asr::Engine;
@@ -247,10 +249,13 @@ fn decode_blocking(ffmpeg: &std::path::Path, input: &[u8]) -> Result<Vec<f32>, T
 /// failure further down the pipeline.
 fn ensure_available(engine: Engine) -> Result<(), TtsError> {
     match engine {
+        #[cfg(feature = "asr-sensevoice")]
+        Engine::Sensevoice => Ok(()),
+        #[cfg(not(feature = "asr-sensevoice"))]
         Engine::Sensevoice => Err(TtsError::EngineUnavailable(
-            "SenseVoice transcription is not implemented in this build yet. Request \
-             routing, audio decoding and length limits are in place; the ONNX \
-             inference is not."
+            "SenseVoice is not compiled into this build. It is in the default \
+             feature set, so a plain `cargo build` includes it; this binary was \
+             built with --no-default-features or without `asr-sensevoice`."
                 .into(),
         )),
         Engine::Whisper => Err(TtsError::EngineUnavailable(
@@ -262,7 +267,7 @@ fn ensure_available(engine: Engine) -> Result<(), TtsError> {
     }
 }
 
-/// Unreachable until the engine lands: `ensure_available` rejects first.
+#[cfg(not(feature = "asr-sensevoice"))]
 fn run_sensevoice(
     _cfg: &TtsConfig,
     _samples: &[f32],
@@ -271,6 +276,89 @@ fn run_sensevoice(
     Err(TtsError::Internal(
         "run_sensevoice reached without ensure_available rejecting it".into(),
     ))
+}
+
+/// Model filenames, as written by `just fetch-asr-models`.
+///
+/// Local convention, not upstream names -- see the recipe for why.
+#[cfg(feature = "asr-sensevoice")]
+const SENSEVOICE_MODEL: &str = "sensevoice-small.int8.onnx";
+#[cfg(feature = "asr-sensevoice")]
+const SENSEVOICE_TOKENS: &str = "sensevoice-tokens.txt";
+
+/// Config path if given, else the stock name in the default cache dir.
+///
+/// Same shape as `kokoro::resolve`, including the leading `~/` expansion:
+/// config files here are hand-edited and people write it.
+#[cfg(feature = "asr-sensevoice")]
+fn resolve(configured: Option<&str>, filename: &str) -> Option<std::path::PathBuf> {
+    if let Some(p) = configured.filter(|s| !s.is_empty()) {
+        let expanded = match p.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()
+                .map(|h| h.join(rest).display().to_string())
+                .unwrap_or_else(|| p.to_string()),
+            None => p.to_string(),
+        };
+        return Some(std::path::PathBuf::from(expanded));
+    }
+    dirs::cache_dir().map(|d| d.join("nevoflux").join("models").join(filename))
+}
+
+#[cfg(feature = "asr-sensevoice")]
+fn missing(what: &str, filename: &str) -> TtsError {
+    TtsError::ConfigMissing(format!(
+        "SenseVoice {what} not found ({filename}). Run `just fetch-asr-models` to \
+         download it into ~/.cache/nevoflux/models/, or set `[tts.sensevoice] \
+         model_path` / `tokens_path` in ~/.config/nevoflux/config.toml."
+    ))
+}
+
+/// The loaded model, kept for the life of the process.
+///
+/// 237 MB per request would dominate every response -- the load is roughly
+/// three times the inference for a short clip -- and the model is a
+/// process-level resource rather than a per-turn one. Editing `model_path`
+/// therefore needs a daemon restart, which is the same bargain Kokoro makes.
+#[cfg(feature = "asr-sensevoice")]
+fn sensevoice(
+    cfg: &SenseVoiceConfig,
+) -> Result<std::sync::Arc<nevoflux_asr::sensevoice::SenseVoice>, TtsError> {
+    use std::sync::{Arc, OnceLock};
+    static ENGINE: OnceLock<Arc<nevoflux_asr::sensevoice::SenseVoice>> = OnceLock::new();
+
+    if let Some(e) = ENGINE.get() {
+        return Ok(e.clone());
+    }
+    let model = resolve(cfg.model_path.as_deref(), SENSEVOICE_MODEL)
+        .ok_or_else(|| missing("model", SENSEVOICE_MODEL))?;
+    let tokens = resolve(cfg.tokens_path.as_deref(), SENSEVOICE_TOKENS)
+        .ok_or_else(|| missing("token table", SENSEVOICE_TOKENS))?;
+    if !model.exists() {
+        return Err(missing("model", SENSEVOICE_MODEL));
+    }
+    if !tokens.exists() {
+        return Err(missing("token table", SENSEVOICE_TOKENS));
+    }
+    let threads = cfg
+        .threads
+        .unwrap_or_else(nevoflux_asr::ort_env::default_threads);
+    let engine = nevoflux_asr::sensevoice::SenseVoice::new(&model, &tokens, threads)
+        .map_err(|e| TtsError::Internal(format!("load SenseVoice: {e}")))?;
+    // A racing thread may have won; either instance is equally good.
+    Ok(ENGINE.get_or_init(|| Arc::new(engine)).clone())
+}
+
+#[cfg(feature = "asr-sensevoice")]
+fn run_sensevoice(
+    cfg: &TtsConfig,
+    samples: &[f32],
+    language: Option<&str>,
+) -> Result<nevoflux_asr::Transcript, TtsError> {
+    use nevoflux_asr::Transcriber;
+    let engine = sensevoice(&cfg.sensevoice)?;
+    engine
+        .transcribe(samples, language)
+        .map_err(|e| TtsError::Internal(format!("SenseVoice: {e}")))
 }
 
 /// Unreachable until the engine lands: `ensure_available` rejects first.
@@ -364,13 +452,19 @@ mod tests {
 
     #[tokio::test]
     async fn engine_availability_is_reported_before_audio_problems() {
-        // "AAAA" is valid base64 but not decodable audio. If availability were
-        // checked after the decode, this would come back as an ffmpeg failure
-        // and send the caller off to inspect a file that was never the problem.
+        // "AAAA" is valid base64 but not decodable audio, and Whisper is not
+        // in this build. If availability were checked after the decode, this
+        // would come back as an ffmpeg failure and send the caller off to
+        // inspect a file that was never the problem.
+        //
+        // The engine has to be named explicitly now that SenseVoice ships in
+        // the default build: the ordering is unchanged, but the default route
+        // no longer reaches an unavailable engine and so no longer exercises
+        // it.
         let cfg = TtsConfig::default();
-        let err = transcribe(&cfg, &req_inline("AAAA"), None)
-            .await
-            .unwrap_err();
+        let mut r = req_inline("AAAA");
+        r.engine = Some("whisper".into());
+        let err = transcribe(&cfg, &r, None).await.unwrap_err();
         assert!(
             matches!(err, TtsError::EngineUnavailable(_)),
             "expected the engine to be blamed, got: {err}"
@@ -394,12 +488,27 @@ mod tests {
     }
 
     #[test]
-    fn both_engines_are_reported_as_a_build_problem() {
-        for engine in [Engine::Sensevoice, Engine::Whisper] {
-            let err = ensure_available(engine).unwrap_err();
-            assert_eq!(err.code(), 4007, "{engine:?}");
-            assert!(err.to_string().contains("build"), "{err}");
-        }
+    fn whisper_is_reported_as_a_build_problem_not_a_config_one() {
+        let err = ensure_available(Engine::Whisper).unwrap_err();
+        assert_eq!(err.code(), 4007);
+        assert!(err.to_string().contains("build"), "{err}");
+    }
+
+    #[cfg(feature = "asr-sensevoice")]
+    #[test]
+    fn sensevoice_is_available_in_a_default_build() {
+        // It is in the default feature set precisely so that `auto` -- which
+        // routes here whenever no language narrows it -- resolves to something
+        // that can actually run.
+        assert!(ensure_available(Engine::Sensevoice).is_ok());
+    }
+
+    #[cfg(not(feature = "asr-sensevoice"))]
+    #[test]
+    fn sensevoice_absence_is_reported_as_a_build_problem() {
+        let err = ensure_available(Engine::Sensevoice).unwrap_err();
+        assert_eq!(err.code(), 4007);
+        assert!(err.to_string().contains("asr-sensevoice"), "{err}");
     }
 
     #[test]

@@ -10,7 +10,11 @@
 
 pub mod audio;
 pub mod error;
+#[cfg(feature = "sensevoice")]
+pub mod ort_env;
 pub mod route;
+#[cfg(feature = "sensevoice")]
+pub mod sensevoice;
 pub mod stitch;
 
 pub use error::AsrError;

@@ -16,13 +16,17 @@ use crate::{Engine, SAMPLE_RATE};
 /// factor, so retuning both is a one-number change.
 pub const MAX_BLOCKING_MINUTES: u32 = 10;
 
-/// Provisional, pending the Task 10 benchmark.
+/// Measured, not assumed: 14x realtime.
+///
+/// Taken on CPU with the int8 export at four intra-op threads, over the four
+/// sherpa test clips (zh/en/ja/yue, 5-7 s each): 13.9, 14.3, 14.2, 14.1.
+/// Rounded down.
 ///
 /// The published SenseVoice figures -- 70 ms for 10 s of audio, 169x realtime
-/// -- are GPU measurements, and this runs on CPU. They are not evidence for
-/// anything here, so this is a deliberately conservative placeholder rather
-/// than a derived number.
-pub const SENSEVOICE_ASSUMED_RTF: u32 = 24;
+/// -- are GPU numbers and were never evidence for a CPU ceiling. Re-measure
+/// with `cargo run -p nevoflux-asr --example transcribe` if the export or the
+/// thread count changes.
+pub const SENSEVOICE_ASSUMED_RTF: u32 = 14;
 
 /// Provisional, pending the Task 12 benchmark: Whisper assumed to run at one
 /// third of realtime. Expressed as a divisor to keep the arithmetic integral.

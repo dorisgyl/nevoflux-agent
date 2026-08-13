@@ -10,16 +10,17 @@ repository.workspace = true
 description = "Core daemon for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
 tts-local = ["dep:nevoflux-tts"]
-# NOTE: `asr-sensevoice` / `asr-whisper` are added by the tasks that implement
-# those engines. A feature flag with no implementation behind it is a build
-# that fails for whoever turns it on, so the flag follows the engine rather
-# than announcing it. Routing, stitching and length checks are feature-free
-# and always compiled.
+# SenseVoice transcription. On by default: it is the engine `auto` routes to,
+# and without it `tts_transcribe` can only report that it is absent.
+asr-sensevoice = ["nevoflux-asr/sensevoice"]
+# `asr-whisper` arrives with the Whisper engine. A feature flag with no
+# implementation behind it is a build that fails for whoever turns it on, so
+# the flag follows the engine rather than announcing it.
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:
 #   * ort-load-dynamic (default): load `libonnxruntime` at startup via
 #     ORT_DYLIB_PATH or bundled next to the exe. Runs on glibc >= 2.27; ship a
@@ -31,11 +32,13 @@ ort-download-binaries = [
     "nevoflux-llm/ort-download-binaries",
     "nevoflux-llm-gateway/ort-download-binaries",
     "nevoflux-tts?/ort-download-binaries",
+    "nevoflux-asr/ort-download-binaries",
 ]
 ort-load-dynamic = [
     "nevoflux-llm/ort-load-dynamic",
     "nevoflux-llm-gateway/ort-load-dynamic",
     "nevoflux-tts?/ort-load-dynamic",
+    "nevoflux-asr/ort-load-dynamic",
 ]
 
 [dependencies]

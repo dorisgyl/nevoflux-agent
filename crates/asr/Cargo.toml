@@ -37,3 +37,9 @@ tempfile = "3"
 [[example]]
 name = "dump_model"
 required-features = ["sensevoice", "ort-load-dynamic"]
+
+# Dev tool: transcribe a 16 kHz mono WAV. Doubles as the smoke test against
+# real weights, which unit tests on synthetic audio cannot be.
+[[example]]
+name = "transcribe"
+required-features = ["sensevoice", "ort-load-dynamic"]

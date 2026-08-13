@@ -189,9 +189,9 @@ pub struct WhisperConfig {
 /// `[tts.sensevoice]` in `~/.config/nevoflux/config.toml`:
 /// ```toml
 /// [tts.sensevoice]
-/// model_path = "~/.cache/nevoflux/models/sensevoice-small.int8.onnx"
-/// vad_path   = "~/.cache/nevoflux/models/fsmn-vad.onnx"
-/// threads    = 4
+/// model_path  = "~/.cache/nevoflux/models/sensevoice-small.int8.onnx"
+/// tokens_path = "~/.cache/nevoflux/models/sensevoice-tokens.txt"
+/// threads     = 4
 /// ```
 ///
 /// Both paths are optional: unset means look in `~/.cache/nevoflux/models/`
@@ -201,6 +201,11 @@ pub struct WhisperConfig {
 pub struct SenseVoiceConfig {
     #[serde(default)]
     pub model_path: Option<String>,
+    /// Token table. Must be the one shipped beside the weights: the model
+    /// states its vocab size in metadata, and a table of a different length
+    /// silently decodes the tail of the vocabulary to nothing.
+    #[serde(default)]
+    pub tokens_path: Option<String>,
     /// fsmn-vad weights. Only consulted for audio longer than 30 s, which is
     /// the most SenseVoice can take in one pass.
     #[serde(default)]
