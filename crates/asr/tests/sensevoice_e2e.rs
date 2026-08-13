@@ -194,3 +194,194 @@ fn timestamps_account_for_the_prepended_tag_frames() {
         last.end_ms
     );
 }
+
+// ---------------------------------------------------------------------------
+// Segmentation. These need the VAD model as well.
+// ---------------------------------------------------------------------------
+
+fn vad() -> Option<nevoflux_asr::vad::Vad> {
+    let dir = nevoflux_asr::ort_env::default_model_dir()?;
+    let p = dir.join("silero-vad.onnx");
+    p.exists()
+        .then(|| nevoflux_asr::vad::Vad::new(&p).expect("load VAD"))
+}
+
+/// Concatenate clips with `gap_ms` of silence between them.
+fn joined(names: &[&str], gap_ms: usize) -> Vec<f32> {
+    let gap = vec![0.0f32; 16 * gap_ms];
+    let mut out = Vec::new();
+    for n in names {
+        out.extend(fixture(n));
+        out.extend_from_slice(&gap);
+    }
+    out
+}
+
+#[test]
+fn vad_finds_one_span_per_utterance() {
+    let (Some(v), Some(_)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav", "en.wav", "yue.wav"], 1000);
+    let spans = v
+        .detect(&audio, &nevoflux_asr::vad::VadOptions::default())
+        .unwrap();
+    // Each clip is one or two sentences, so a handful of spans -- but nothing
+    // like one per window, and nothing like a single span for all three.
+    assert!(
+        (3..=8).contains(&spans.len()),
+        "{} spans: {spans:?}",
+        spans.len()
+    );
+    for w in spans.windows(2) {
+        assert!(w[0].end_ms <= w[1].start_ms, "spans overlap: {w:?}");
+    }
+}
+
+#[test]
+fn segmenting_recovers_languages_a_single_pass_loses() {
+    // This is the case that motivates segmentation. SenseVoice classifies
+    // language once per call, so all four clips in one pass come back as
+    // whichever language wins -- the other three vanish entirely.
+    let (Some(v), Some(sv)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav", "en.wav", "yue.wav", "ja.wav"], 1000);
+
+    let one_pass = sv.transcribe(&audio, None).unwrap();
+    let segmented = nevoflux_asr::segmented::transcribe_segmented(
+        &v,
+        &sv,
+        &audio,
+        None,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .unwrap();
+
+    // The Chinese clip's content survives segmenting and does not survive one
+    // pass over mixed-language audio.
+    // Assert on the stable part of the Chinese clip: the homophone in the
+    // first word shifts with span context, the rest does not.
+    assert!(
+        segmented.text.contains("时间早上9点"),
+        "segmented lost the Chinese: {}",
+        segmented.text
+    );
+    assert!(
+        segmented.text.contains("tribal chieftain"),
+        "segmented lost the English: {}",
+        segmented.text
+    );
+    assert!(
+        !one_pass.text.contains("时间早上9点") || !one_pass.text.contains("tribal chieftain"),
+        "a single pass unexpectedly kept both languages; if the model changed, \
+         this test's premise needs revisiting: {}",
+        one_pass.text
+    );
+}
+
+#[test]
+fn padding_keeps_the_onset_of_a_span_intact() {
+    // A span starting exactly where the detector heard speech clips the quiet
+    // onset, and the encoder then mis-reads the first syllable: at silero's
+    // default 30 ms of padding this clip began 菜 rather than 开 -- a
+    // different initial consonant, not a near miss.
+    //
+    // The assertion is on the onset only. Which homophone follows a correct
+    // onset (开饭 or 开放, both kāifàn(g)) moves with how much context the
+    // span carries, and is not what padding controls.
+    let (Some(v), Some(sv)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav", "en.wav"], 1000);
+    let t = nevoflux_asr::segmented::transcribe_segmented(
+        &v,
+        &sv,
+        &audio,
+        None,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        t.text.starts_with('开'),
+        "onset was clipped -- expected the transcript to open on 开: {}",
+        t.text
+    );
+    assert!(t.text.contains("时间早上9点"), "{}", t.text);
+}
+
+#[test]
+fn segment_timestamps_stay_inside_the_recording() {
+    let (Some(v), Some(sv)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav", "en.wav", "yue.wav"], 800);
+    let duration_ms = (audio.len() as f32 / 16.0) as u32;
+    let t = nevoflux_asr::segmented::transcribe_segmented(
+        &v,
+        &sv,
+        &audio,
+        None,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .unwrap();
+    assert!(!t.segments.is_empty());
+    for s in &t.segments {
+        assert!(s.start_ms < s.end_ms, "inverted: {s:?}");
+        assert!(s.end_ms <= duration_ms, "{s:?} past {duration_ms} ms");
+    }
+    for w in t.segments.windows(2) {
+        assert!(w[0].start_ms <= w[1].start_ms, "out of order: {w:?}");
+    }
+}
+
+#[test]
+fn a_later_utterance_is_timed_from_the_recording_not_its_span() {
+    // The rebasing that `stitch` exists for: the third clip starts around
+    // 14 s into the concatenation and its segments must say so.
+    let (Some(v), Some(sv)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav", "en.wav", "yue.wav"], 1000);
+    let t = nevoflux_asr::segmented::transcribe_segmented(
+        &v,
+        &sv,
+        &audio,
+        None,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .unwrap();
+    let cantonese = t
+        .segments
+        .iter()
+        .find(|s| s.text.contains("表达唔到"))
+        .expect("the Cantonese clip");
+    assert!(
+        cantonese.start_ms > 12_000,
+        "Cantonese segment starts at {} ms; it is third in the recording",
+        cantonese.start_ms
+    );
+}
+
+#[test]
+fn silence_between_utterances_produces_no_segments() {
+    let (Some(v), Some(sv)) = (vad(), engine()) else {
+        return;
+    };
+    let audio = joined(&["zh.wav"], 3000);
+    let t = nevoflux_asr::segmented::transcribe_segmented(
+        &v,
+        &sv,
+        &audio,
+        None,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .unwrap();
+    // The three seconds of trailing silence must not become a segment.
+    let speech_end = t.segments.last().map(|s| s.end_ms).unwrap_or(0);
+    assert!(
+        speech_end < 7000,
+        "a segment ran into the trailing silence: {:?}",
+        t.segments
+    );
+}

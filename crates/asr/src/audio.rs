@@ -48,11 +48,33 @@ pub const SENSEVOICE_SHORT_CLIP_RTF: u32 = 14;
 pub const WHISPER_ASSUMED_RTF_DIVISOR: u32 = 3;
 const WHISPER_MAX_BLOCKING_MINUTES: u32 = 10;
 
-/// The longest audio, in seconds, an engine accepts in one call.
+/// How long a segmented call may block, in minutes.
 ///
-/// These are single-pass limits. Segmenting long audio at speech pauses keeps
-/// every pass short, and therefore every pass cheap, which is what lifts them
-/// -- and that is not implemented yet.
+/// Segmenting makes memory flat -- every pass is one span, so peak RSS stops
+/// tracking the length of the recording -- which puts the binding constraint
+/// back on time, where the first version of this file wrongly assumed it
+/// already was. Measured on the segmented path: 305 s of audio at 14.6x
+/// realtime and 528 MB, against 5.9x and 2011 MB for the same audio in one
+/// pass.
+const SEGMENTED_MAX_BLOCKING_MINUTES: u32 = 10;
+
+/// The longest audio, in seconds, an engine accepts when it is cut at pauses
+/// first.
+///
+/// Roughly 2.5 hours for SenseVoice. Whisper keeps its single-pass figure
+/// until someone measures the segmented path for it.
+pub fn max_seconds_segmented(engine: Engine) -> u32 {
+    match engine {
+        Engine::Sensevoice => SEGMENTED_MAX_BLOCKING_MINUTES * 60 * SENSEVOICE_SHORT_CLIP_RTF,
+        Engine::Whisper => max_seconds(engine),
+    }
+}
+
+/// The longest audio, in seconds, an engine accepts in a single pass.
+///
+/// Bounded by memory rather than time: activations grow with the length of the
+/// audio. [`max_seconds_segmented`] is the limit that applies once the audio
+/// is cut at pauses, and it is much higher because each pass is then short.
 pub fn max_seconds(engine: Engine) -> u32 {
     match engine {
         Engine::Sensevoice => MAX_INFERENCE_MEMORY_MB / SENSEVOICE_MB_PER_SECOND,
@@ -64,7 +86,30 @@ pub fn duration_ms(samples: &[f32]) -> u32 {
     ((samples.len() as u64 * 1000) / SAMPLE_RATE as u64) as u32
 }
 
-/// Reject audio that would hold a worker thread past the ceiling.
+/// Reject audio too long for the path that will actually run it.
+///
+/// `segmented` says whether the caller will cut at pauses first, which is what
+/// decides whether memory or time is the binding constraint.
+pub fn check_length_for(samples: &[f32], engine: Engine, segmented: bool) -> Result<(), AsrError> {
+    if samples.is_empty() {
+        return Err(AsrError::InvalidAudio("audio is empty".into()));
+    }
+    let secs = duration_ms(samples) / 1000;
+    let cap = if segmented {
+        max_seconds_segmented(engine)
+    } else {
+        max_seconds(engine)
+    };
+    if secs <= cap {
+        return Ok(());
+    }
+    Err(AsrError::InvalidAudio(format!(
+        "audio is {secs}s, past the {cap}s ceiling for {}; split it into shorter clips",
+        engine.as_str()
+    )))
+}
+
+/// Reject audio that would hold a worker thread past the single-pass ceiling.
 pub fn check_length(samples: &[f32], engine: Engine) -> Result<(), AsrError> {
     if samples.is_empty() {
         return Err(AsrError::InvalidAudio("audio is empty".into()));
@@ -135,7 +180,26 @@ mod tests {
     }
 
     #[test]
-    fn no_ceiling_is_anywhere_near_the_old_time_derived_one() {
+    fn segmenting_raises_the_ceiling_by_an_order_of_magnitude() {
+        // The whole point: cutting at pauses makes memory flat, so the limit
+        // stops being about how much audio fits in RAM at once.
+        assert!(
+            max_seconds_segmented(Engine::Sensevoice) > 10 * max_seconds(Engine::Sensevoice),
+            "{} vs {}",
+            max_seconds_segmented(Engine::Sensevoice),
+            max_seconds(Engine::Sensevoice)
+        );
+    }
+
+    #[test]
+    fn an_hour_is_accepted_segmented_and_refused_in_one_pass() {
+        let hour = vec![0.0f32; SAMPLE_RATE as usize * 3600];
+        assert!(check_length_for(&hour, Engine::Sensevoice, true).is_ok());
+        assert!(check_length_for(&hour, Engine::Sensevoice, false).is_err());
+    }
+
+    #[test]
+    fn no_single_pass_ceiling_is_near_the_old_time_derived_one() {
         // 8400 s came from a blocking budget that ignored memory; it would
         // have asked for roughly 50 GB. Guard against that order returning.
         for engine in [Engine::Sensevoice, Engine::Whisper] {

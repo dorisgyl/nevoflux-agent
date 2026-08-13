@@ -84,8 +84,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let load_ms = load.elapsed().as_millis();
 
+    // Past the single-pass ceiling, cut at pauses first. Below it, one pass
+    // is both faster and better -- VAD costs a second model and can only lose
+    // information by cutting.
+    let vad_path = dir.join("silero-vad.onnx");
+    let long = samples.len()
+        > nevoflux_asr::audio::max_seconds(nevoflux_asr::Engine::Sensevoice) as usize
+            * nevoflux_asr::SAMPLE_RATE as usize
+        || std::env::var_os("FORCE_VAD").is_some();
+
     let run = std::time::Instant::now();
-    let t = sv.transcribe(&samples, language.as_deref())?;
+    let t = if long && vad_path.exists() {
+        let vad = nevoflux_asr::vad::Vad::new(&vad_path)?;
+        let opts = nevoflux_asr::vad::VadOptions::default();
+        let spans = vad.detect(&samples, &opts)?;
+        println!("vad       {} span(s)", spans.len());
+        nevoflux_asr::segmented::transcribe_segmented(
+            &vad,
+            &sv,
+            &samples,
+            language.as_deref(),
+            &opts,
+        )?
+    } else {
+        sv.transcribe(&samples, language.as_deref())?
+    };
     let run_s = run.elapsed().as_secs_f32();
 
     println!("audio     {seconds:.2}s");

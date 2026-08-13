@@ -52,11 +52,18 @@ pub async fn transcribe(
 
     let audio_b64 = resolve_audio_source(req, database)?;
     let samples = decode_to_pcm(&audio_b64).await?;
-    nevoflux_asr::audio::check_length(&samples, engine)
+
+    // Past the single-pass ceiling, cut at pauses first. That keeps every pass
+    // short, which is what stops peak memory tracking the length of the
+    // recording -- and it is why the two ceilings differ by an order of
+    // magnitude. Below the ceiling one pass is both faster and better: cutting
+    // can only lose information, never add it.
+    let segmented = segmenting_needed(engine, samples.len());
+    nevoflux_asr::audio::check_length_for(&samples, engine, segmented)
         .map_err(|e| TtsError::InvalidRequest(format!("tts_transcribe: {e}")))?;
 
     let transcript = match engine {
-        Engine::Sensevoice => run_sensevoice(cfg, &samples, req.language.as_deref())?,
+        Engine::Sensevoice => run_sensevoice(cfg, &samples, req.language.as_deref(), segmented)?,
         Engine::Whisper => run_whisper(cfg, &samples, req.language.as_deref())?,
     };
 
@@ -75,6 +82,19 @@ pub async fn transcribe(
         language: transcript.language,
         note,
     })
+}
+
+/// Whether this audio has to be cut at pauses before it can be transcribed.
+///
+/// Only SenseVoice can be segmented today; Whisper has no VAD path wired, so
+/// it stays on its single-pass ceiling and reports over-length audio as such.
+fn segmenting_needed(engine: Engine, samples: usize) -> bool {
+    if engine != Engine::Sensevoice {
+        return false;
+    }
+    let ceiling_samples = nevoflux_asr::audio::max_seconds(engine) as usize
+        * nevoflux_asr::SAMPLE_RATE as usize;
+    samples > ceiling_samples
 }
 
 /// Exactly one audio source, named.
@@ -272,6 +292,7 @@ fn run_sensevoice(
     _cfg: &TtsConfig,
     _samples: &[f32],
     _language: Option<&str>,
+    _segmented: bool,
 ) -> Result<nevoflux_asr::Transcript, TtsError> {
     Err(TtsError::Internal(
         "run_sensevoice reached without ensure_available rejecting it".into(),
@@ -285,6 +306,8 @@ fn run_sensevoice(
 const SENSEVOICE_MODEL: &str = "sensevoice-small.int8.onnx";
 #[cfg(feature = "asr-sensevoice")]
 const SENSEVOICE_TOKENS: &str = "sensevoice-tokens.txt";
+#[cfg(feature = "asr-sensevoice")]
+const SILERO_VAD: &str = "silero-vad.onnx";
 
 /// Config path if given, else the stock name in the default cache dir.
 ///
@@ -348,17 +371,56 @@ fn sensevoice(
     Ok(ENGINE.get_or_init(|| Arc::new(engine)).clone())
 }
 
+/// The VAD, kept for the life of the process like the recognizer.
+///
+/// 2 MB, so residency is not about the load cost; it is about not paying an
+/// ONNX session setup on every long recording.
+#[cfg(feature = "asr-sensevoice")]
+fn vad(cfg: &SenseVoiceConfig) -> Result<std::sync::Arc<nevoflux_asr::vad::Vad>, TtsError> {
+    use std::sync::{Arc, OnceLock};
+    static VAD: OnceLock<Arc<nevoflux_asr::vad::Vad>> = OnceLock::new();
+
+    if let Some(v) = VAD.get() {
+        return Ok(v.clone());
+    }
+    let path = resolve(cfg.vad_path.as_deref(), SILERO_VAD)
+        .ok_or_else(|| missing("VAD model", SILERO_VAD))?;
+    if !path.exists() {
+        return Err(TtsError::ConfigMissing(format!(
+            "This audio is longer than {}s, which has to be cut at speech pauses \
+             first, and the VAD model ({SILERO_VAD}) is not present. Run \
+             `just fetch-asr-models`, or send shorter clips.",
+            nevoflux_asr::audio::max_seconds(Engine::Sensevoice)
+        )));
+    }
+    let v = nevoflux_asr::vad::Vad::new(&path)
+        .map_err(|e| TtsError::Internal(format!("load VAD: {e}")))?;
+    Ok(VAD.get_or_init(|| Arc::new(v)).clone())
+}
+
 #[cfg(feature = "asr-sensevoice")]
 fn run_sensevoice(
     cfg: &TtsConfig,
     samples: &[f32],
     language: Option<&str>,
+    segmented: bool,
 ) -> Result<nevoflux_asr::Transcript, TtsError> {
     use nevoflux_asr::Transcriber;
-    let engine = sensevoice(&cfg.sensevoice)?;
-    engine
-        .transcribe(samples, language)
-        .map_err(|e| TtsError::Internal(format!("SenseVoice: {e}")))
+    let recognizer = sensevoice(&cfg.sensevoice)?;
+    if !segmented {
+        return recognizer
+            .transcribe(samples, language)
+            .map_err(|e| TtsError::Internal(format!("SenseVoice: {e}")));
+    }
+    let vad = vad(&cfg.sensevoice)?;
+    nevoflux_asr::segmented::transcribe_segmented(
+        &vad,
+        recognizer.as_ref(),
+        samples,
+        language,
+        &nevoflux_asr::vad::VadOptions::default(),
+    )
+    .map_err(|e| TtsError::Internal(format!("SenseVoice (segmented): {e}")))
 }
 
 /// Unreachable until the engine lands: `ensure_available` rejects first.

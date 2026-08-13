@@ -161,7 +161,7 @@ download-model:
     print(f'Model downloaded to {cache_dir}')
     "
 
-# Fetch SenseVoice weights for local transcription
+# Fetch SenseVoice + Silero VAD weights for local transcription
 fetch-asr-models:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -188,29 +188,36 @@ fetch-asr-models:
     # (crates/daemon/src/tts/asr.rs, following kokoro.rs) depends on them
     # staying put -- rename here, rename there.
     #
-    # No VAD yet: it is only needed past the 30 s single-pass limit, and that
-    # path lands with the segmentation work.
-    #
     # The daemon fetches nothing itself. Network behaviour in a native-
     # messaging host expected to start in under a second is a bad trade, and
     # pulling hundreds of megabytes at a moment nobody chose is a worse one.
     DEST="${HOME}/.cache/nevoflux/models"
     REPO="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
     mkdir -p "$DEST"
-    fetch() {
-        local remote="$1" local_name="$2"
+    fetch_url() {
+        local url="$1" local_name="$2"
         if [ -s "$DEST/$local_name" ]; then
             echo "  $local_name (already present)"
             return
         fi
         echo "  $local_name ..."
-        curl -fL --retry 3 --progress-bar \
-            "https://huggingface.co/$REPO/resolve/main/$remote" \
-            -o "$DEST/$local_name.part"
+        curl -fL --retry 3 --progress-bar "$url" -o "$DEST/$local_name.part"
         mv "$DEST/$local_name.part" "$DEST/$local_name"
     }
-    fetch "model.int8.onnx" "sensevoice-small.int8.onnx"
-    fetch "tokens.txt"      "sensevoice-tokens.txt"
+    fetch() {
+        local repo="$1" remote="$2" local_name="$3"
+        fetch_url "https://huggingface.co/$repo/resolve/main/$remote" "$local_name"
+    }
+    fetch "$REPO" "model.int8.onnx" "sensevoice-small.int8.onnx"
+    fetch "$REPO" "tokens.txt"      "sensevoice-tokens.txt"
+    # Silero VAD v6.2.1, for audio past the single-pass ceiling. Taken from the
+    # upstream release rather than a HuggingFace mirror: onnx-community's copy
+    # is v5, last touched 2024-12, and the two are a year and a major version
+    # apart. The v6 graph takes the same inputs, so only the weights differ --
+    # which is exactly the kind of silent substitution worth pinning against.
+    fetch_url \
+        "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/src/silero_vad/data/silero_vad.onnx" \
+        "silero-vad.onnx"
     echo "ASR models are in $DEST"
     echo "Whisper is optional, only for --features asr-whisper: just fetch-whisper-model"
 

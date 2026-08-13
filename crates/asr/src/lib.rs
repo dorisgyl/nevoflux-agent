@@ -14,8 +14,12 @@ pub mod error;
 pub mod ort_env;
 pub mod route;
 #[cfg(feature = "sensevoice")]
+pub mod segmented;
+#[cfg(feature = "sensevoice")]
 pub mod sensevoice;
 pub mod stitch;
+#[cfg(feature = "sensevoice")]
+pub mod vad;
 
 pub use error::AsrError;
 pub use route::route;
