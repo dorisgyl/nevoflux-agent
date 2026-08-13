@@ -20,9 +20,20 @@ pub mod sensevoice;
 pub mod stitch;
 #[cfg(feature = "sensevoice")]
 pub mod vad;
+#[cfg(feature = "whisper")]
+pub mod whisper;
 
 pub use error::AsrError;
 pub use route::route;
+
+/// Where model files live when config does not say.
+///
+/// At the crate root rather than beside either engine: it is a cache
+/// directory, not an ONNX detail, and gating it behind one engine's feature
+/// made the other engine's tests unable to find their own weights.
+pub fn default_model_dir() -> Option<std::path::PathBuf> {
+    dirs::cache_dir().map(|d| d.join("nevoflux").join("models"))
+}
 
 /// Every engine here consumes 16 kHz mono. Resampling happens before the
 /// crate boundary, where ffmpeg already is.

@@ -104,6 +104,8 @@ embedding = ["nevoflux-daemon/embedding"]
 tts-local = ["nevoflux-daemon/tts-local"]
 # Local SenseVoice transcription, forwarded to nevoflux-daemon.
 asr-sensevoice = ["nevoflux-daemon/asr-sensevoice"]
+# Whisper via Candle, forwarded to nevoflux-daemon. Off by default.
+asr-whisper = ["nevoflux-daemon/asr-whisper"]
 # ONNX Runtime linking strategy, forwarded to nevoflux-daemon. Pick one:
 #   * ort-load-dynamic (default): load libonnxruntime at startup via
 #     ORT_DYLIB_PATH or bundled next to the exe (runs on glibc >= 2.27).

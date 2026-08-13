@@ -164,7 +164,7 @@ mod tests {
     fn the_real_vocabulary_loads_with_the_size_the_model_states() {
         // vocab_size in the ONNX metadata is 25055; tokens.txt must agree, or
         // every id past the shorter of the two decodes to nothing.
-        let Some(p) = crate::ort_env::default_model_dir() else {
+        let Some(p) = crate::default_model_dir() else {
             return;
         };
         let p = p.join("sensevoice-tokens.txt");

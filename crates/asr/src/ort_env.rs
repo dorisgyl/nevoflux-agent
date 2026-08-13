@@ -18,7 +18,9 @@
 
 use crate::error::AsrError;
 use ort::session::Session;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "ort-load-dynamic")]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// ONNX Runtime version the `ort` crate in this build links against.
@@ -185,11 +187,6 @@ pub fn default_threads() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 4)
-}
-
-/// Where model files live when config does not say.
-pub fn default_model_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("nevoflux").join("models"))
 }
 
 #[cfg(test)]

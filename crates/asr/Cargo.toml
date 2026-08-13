@@ -13,10 +13,10 @@ description = "Local speech recognition (SenseVoice + Whisper) for NevoFlux Agen
 default = []
 # SenseVoice: ONNX via `ort`, the default engine. Chinese and low latency.
 sensevoice = ["dep:ort", "dep:ndarray"]
-# Whisper (Candle) arrives with the engine itself; the dependencies are not
-# declared until then. Candle is a second ML runtime and a large one, and
-# carrying it in the manifest before anything calls it would put every build
-# -- and every lockfile update -- behind a bet that has not been placed yet.
+# Whisper via Candle. OFF by default: Candle is a second ML runtime and a
+# large one, while `auto` routes to SenseVoice for every language SenseVoice
+# knows. Turn it on for builds that need the other 94 languages.
+whisper = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 # ONNX Runtime linking strategy, forwarded to `ort`. Mirrors nevoflux-tts;
 # see the workspace CLAUDE.md for why load-dynamic is the default there.
 ort-download-binaries = ["ort?/download-binaries"]
@@ -25,6 +25,11 @@ ort-load-dynamic = ["ort?/load-dynamic"]
 [dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "api-24"], optional = true }
 ndarray = { version = "0.17", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 dirs = "5.0"
 

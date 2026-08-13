@@ -219,7 +219,7 @@ fetch-asr-models:
         "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/src/silero_vad/data/silero_vad.onnx" \
         "silero-vad.onnx"
     echo "ASR models are in $DEST"
-    echo "Whisper is optional, only for --features asr-whisper: just fetch-whisper-model"
+    echo "Whisper is optional, only for --features asr-whisper: just whisper-model"
 
 # Print an ASR model's ONNX I/O signature and metadata
 dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFILE="debug":
@@ -234,21 +234,31 @@ dump-asr-model MODEL="~/.cache/nevoflux/models/sensevoice-small.int8.onnx" PROFI
         --features sensevoice,ort-load-dynamic -- "$(eval echo {{MODEL}})"
 
 # Fetch Whisper weights (only needed for --features asr-whisper)
-fetch-whisper-model SIZE="large-v3-turbo":
+whisper-model MODEL="large-v3-turbo":
     #!/usr/bin/env bash
     set -euo pipefail
+    # Candle loads config.json + tokenizer.json + model.safetensors. It does
+    # NOT read whisper.cpp's ggml-*.bin, which is the obvious thing to reach
+    # for and is a different format entirely.
+    #
     # Separate from fetch-asr-models on purpose: the default build has no
-    # Whisper engine, so most people never need this and should not be made to
-    # download a gigabyte to find that out.
-    DEST="${HOME}/.cache/nevoflux/models"
+    # Whisper engine, so most people never need these and should not have to
+    # download 1.6 GB to find that out. `just whisper-model tiny` is the small
+    # one to develop against.
+    DEST="${HOME}/.cache/nevoflux/models/whisper-{{MODEL}}"
+    REPO="openai/whisper-{{MODEL}}"
     mkdir -p "$DEST"
-    TARGET="$DEST/whisper-{{SIZE}}.ggml.bin"
-    if [ -s "$TARGET" ]; then echo "  already present: $TARGET"; exit 0; fi
-    curl -fL --retry 3 --progress-bar \
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{{SIZE}}.bin" \
-        -o "$TARGET.part"
-    mv "$TARGET.part" "$TARGET"
-    echo "  $TARGET"
+    for f in config.json tokenizer.json model.safetensors; do
+        if [ -s "$DEST/$f" ]; then
+            echo "  $f (already present)"
+            continue
+        fi
+        echo "  $f ..."
+        curl -fL --retry 3 --progress-bar \
+            "https://huggingface.co/$REPO/resolve/main/$f" -o "$DEST/$f.part"
+        mv "$DEST/$f.part" "$DEST/$f"
+    done
+    echo "Whisper {{MODEL}} is in $DEST"
 
 # ONNX Runtime version for load-dynamic builds. Keep in lockstep with
 # EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 5 -> ORT 1.24.x).

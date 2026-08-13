@@ -175,11 +175,17 @@ pub struct KokoroConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WhisperConfig {
-    /// Filesystem path to the Whisper ONNX model. None → tool returns
-    /// ConfigMissing.
+    /// Directory holding `config.json`, `tokenizer.json` and
+    /// `model.safetensors` -- the HuggingFace layout Candle reads. None → look
+    /// for `whisper-<default_size>` under `~/.cache/nevoflux/models/`.
+    ///
+    /// Not whisper.cpp's `ggml-*.bin`: that is the file most people reach for
+    /// and Candle cannot read it. `just whisper-model` fetches the right one.
     #[serde(default)]
     pub model_path: Option<String>,
-    /// Default model size (`tiny` / `base` / `small` / `medium`).
+    /// Which size to look for (`tiny` / `base` / `small` / `medium` /
+    /// `large-v3-turbo`). Defaults to `large-v3-turbo`, which is the smallest
+    /// that transcribes well -- at a cost of roughly 4.8 GB resident.
     #[serde(default)]
     pub default_size: Option<String>,
 }

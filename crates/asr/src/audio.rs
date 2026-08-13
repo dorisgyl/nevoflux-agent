@@ -26,25 +26,45 @@ pub const MAX_INFERENCE_MEMORY_MB: u32 = 1500;
 
 /// Measured activation growth: about 6 MB per second of audio.
 ///
-/// CPU, int8 export, four intra-op threads; peak RSS minus the loaded model:
-/// 30.5 s → 223 MB, 60.9 s → 454 MB, 121.8 s → 738 MB, 304.6 s → 1771 MB.
-/// Close enough to linear over that range to divide by.
+/// Release build, CPU, int8 export, four intra-op threads; peak RSS minus the
+/// short-clip baseline: 30.5 s → +122 MB, 60.9 s → +321 MB, 121.8 s → +637 MB.
+/// Close enough to linear over that range to divide by, and unchanged between
+/// debug and release -- allocation does not care how the code was compiled.
 pub const SENSEVOICE_MB_PER_SECOND: u32 = 6;
 
-/// Measured throughput on short clips: 14x realtime.
+/// Measured throughput at the length a segmented pass actually runs: 30x.
 ///
-/// CPU, int8 export, four threads, over the four sherpa test clips
-/// (zh/en/ja/yue, 5-7 s each): 13.9, 14.3, 14.2, 14.1. It decays with length
-/// -- 12.9x at 30 s, 9.1x at 122 s, 5.9x at 305 s -- so this describes the
-/// short-clip path and is not what the ceiling rests on.
+/// **Release build.** That qualifier is the point: the same measurement in a
+/// debug build reads 12.9x, because the feature extraction is Rust and ONNX
+/// Runtime is not. The daemon ships release, so release is the number that
+/// belongs in a ceiling -- an earlier version of this constant was a debug
+/// figure and understated throughput by more than half.
+///
+/// CPU, int8 export, four threads: 39.0x on a 5.6 s clip, 30.7x at 30 s,
+/// 23.0x at 61 s, 15.6x at 122 s. Segmented passes are capped at 30 s, so the
+/// 30 s figure is the one that governs, and it is the conservative end of what
+/// short spans see. A 305 s recording through the segmented path measured
+/// 37.2x overall.
 ///
 /// The published 169x is a GPU number and was never evidence for any of this.
-/// Re-measure with `cargo run -p nevoflux-asr --example transcribe` when the
-/// export or the thread count changes.
-pub const SENSEVOICE_SHORT_CLIP_RTF: u32 = 14;
+/// Re-measure with `cargo run --release -p nevoflux-asr --example transcribe`
+/// when the export or the thread count changes.
+pub const SENSEVOICE_SHORT_CLIP_RTF: u32 = 30;
 
-/// Whisper: unmeasured, and deliberately pessimistic until it is. Assumed to
-/// run at a third of realtime. Revisit when the engine lands.
+/// Whisper large-v3-turbo runs at 0.3x realtime -- three times slower than
+/// the audio it is reading.
+///
+/// Release build, CPU: 24.7 s of inference for a 7.15 s clip. whisper-tiny
+/// managed 4.8x on the same clip, so the size chosen matters far more here
+/// than it does for SenseVoice, which has one.
+///
+/// Unlike SenseVoice, Whisper's memory does not grow with the recording: it
+/// decodes fixed 30 s windows, so activations are bounded and the footprint is
+/// essentially the weights. That footprint is the thing to know before turning
+/// this engine on -- **large-v3-turbo peaks at 4.8 GB**, because Candle loads
+/// f32 and 809M parameters is 3.2 GB before any activation. A ceiling derived
+/// from blocking time is therefore the right shape for Whisper even though it
+/// was the wrong shape for SenseVoice.
 pub const WHISPER_ASSUMED_RTF_DIVISOR: u32 = 3;
 const WHISPER_MAX_BLOCKING_MINUTES: u32 = 10;
 
@@ -61,8 +81,9 @@ const SEGMENTED_MAX_BLOCKING_MINUTES: u32 = 10;
 /// The longest audio, in seconds, an engine accepts when it is cut at pauses
 /// first.
 ///
-/// Roughly 2.5 hours for SenseVoice. Whisper keeps its single-pass figure
-/// until someone measures the segmented path for it.
+/// Five hours for SenseVoice. Whisper keeps its single-pass figure: its limit
+/// is decode time rather than memory, and segmenting does not make a decoder
+/// faster.
 pub fn max_seconds_segmented(engine: Engine) -> u32 {
     match engine {
         Engine::Sensevoice => SEGMENTED_MAX_BLOCKING_MINUTES * 60 * SENSEVOICE_SHORT_CLIP_RTF,

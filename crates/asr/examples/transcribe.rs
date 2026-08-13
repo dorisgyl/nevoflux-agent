@@ -59,7 +59,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: transcribe <audio.wav> [language]")?;
     let language = args.next();
 
-    let dir = nevoflux_asr::ort_env::default_model_dir().ok_or("no cache dir")?;
+    let dir = nevoflux_asr::default_model_dir().ok_or("no cache dir")?;
+
+    // WHISPER=<size> routes to the Candle engine instead, for comparing the
+    // two on the same clip.
+    #[cfg(feature = "whisper")]
+    if let Some(size) = std::env::var_os("WHISPER") {
+        use nevoflux_asr::Transcriber;
+        let model_dir = dir.join(format!("whisper-{}", size.to_string_lossy()));
+        let (samples, rate) = read_wav(&wav)?;
+        if rate != nevoflux_asr::SAMPLE_RATE {
+            return Err(format!("expected {} Hz, got {rate}", nevoflux_asr::SAMPLE_RATE).into());
+        }
+        let seconds = samples.len() as f32 / rate as f32;
+        let load = std::time::Instant::now();
+        let w = nevoflux_asr::whisper::WhisperEngine::new(&model_dir)?;
+        let load_ms = load.elapsed().as_millis();
+        let run = std::time::Instant::now();
+        let t = w.transcribe(&samples, language.as_deref())?;
+        let run_s = run.elapsed().as_secs_f32();
+        println!("engine    whisper-{}", size.to_string_lossy());
+        println!("audio     {seconds:.2}s");
+        println!("load      {load_ms} ms");
+        println!(
+            "inference {:.0} ms  ({:.1}x realtime)",
+            run_s * 1000.0,
+            seconds / run_s
+        );
+        println!("language  {}", t.language);
+        println!("text      {}", t.text);
+        for s in &t.segments {
+            println!("  [{:>6}..{:>6} ms] {}", s.start_ms, s.end_ms, s.text);
+        }
+        return Ok(());
+    }
     let model = dir.join("sensevoice-small.int8.onnx");
     let tokens = dir.join("sensevoice-tokens.txt");
     if !model.exists() {

@@ -16,7 +16,7 @@ use nevoflux_asr::Transcriber;
 use std::path::{Path, PathBuf};
 
 fn models() -> Option<(PathBuf, PathBuf)> {
-    let dir = nevoflux_asr::ort_env::default_model_dir()?;
+    let dir = nevoflux_asr::default_model_dir()?;
     let model = dir.join("sensevoice-small.int8.onnx");
     let tokens = dir.join("sensevoice-tokens.txt");
     (model.exists() && tokens.exists()).then_some((model, tokens))
@@ -200,7 +200,7 @@ fn timestamps_account_for_the_prepended_tag_frames() {
 // ---------------------------------------------------------------------------
 
 fn vad() -> Option<nevoflux_asr::vad::Vad> {
-    let dir = nevoflux_asr::ort_env::default_model_dir()?;
+    let dir = nevoflux_asr::default_model_dir()?;
     let p = dir.join("silero-vad.onnx");
     p.exists()
         .then(|| nevoflux_asr::vad::Vad::new(&p).expect("load VAD"))

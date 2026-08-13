@@ -14,6 +14,8 @@
 #[cfg(feature = "asr-sensevoice")]
 use crate::config::SenseVoiceConfig;
 use crate::config::TtsConfig;
+#[cfg(feature = "asr-whisper")]
+use crate::config::WhisperConfig;
 use crate::tts::error::TtsError;
 use nevoflux_asr::Engine;
 use nevoflux_protocol::tts::{TranscribeRequest, TranscribeResponse, TranscribeSegment};
@@ -92,8 +94,8 @@ fn segmenting_needed(engine: Engine, samples: usize) -> bool {
     if engine != Engine::Sensevoice {
         return false;
     }
-    let ceiling_samples = nevoflux_asr::audio::max_seconds(engine) as usize
-        * nevoflux_asr::SAMPLE_RATE as usize;
+    let ceiling_samples =
+        nevoflux_asr::audio::max_seconds(engine) as usize * nevoflux_asr::SAMPLE_RATE as usize;
     samples > ceiling_samples
 }
 
@@ -278,10 +280,15 @@ fn ensure_available(engine: Engine) -> Result<(), TtsError> {
              built with --no-default-features or without `asr-sensevoice`."
                 .into(),
         )),
+        #[cfg(feature = "asr-whisper")]
+        Engine::Whisper => Ok(()),
+        #[cfg(not(feature = "asr-whisper"))]
         Engine::Whisper => Err(TtsError::EngineUnavailable(
-            "Whisper transcription is not implemented in this build yet. It will sit \
-             behind an `asr-whisper` feature that is off by default, because Candle \
-             is a second ML runtime and a large one."
+            "Whisper is not compiled into this build. `asr-whisper` is off by \
+             default because Candle is a second ML runtime and large-v3-turbo \
+             needs about 4.8 GB resident. Either rebuild with \
+             --features asr-whisper, or pass engine=\"sensevoice\" -- note it \
+             only handles zh/yue/en/ja/ko."
                 .into(),
         )),
     }
@@ -313,7 +320,7 @@ const SILERO_VAD: &str = "silero-vad.onnx";
 ///
 /// Same shape as `kokoro::resolve`, including the leading `~/` expansion:
 /// config files here are hand-edited and people write it.
-#[cfg(feature = "asr-sensevoice")]
+#[cfg(any(feature = "asr-sensevoice", feature = "asr-whisper"))]
 fn resolve(configured: Option<&str>, filename: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = configured.filter(|s| !s.is_empty()) {
         let expanded = match p.strip_prefix("~/") {
@@ -327,7 +334,7 @@ fn resolve(configured: Option<&str>, filename: &str) -> Option<std::path::PathBu
     dirs::cache_dir().map(|d| d.join("nevoflux").join("models").join(filename))
 }
 
-#[cfg(feature = "asr-sensevoice")]
+#[cfg(any(feature = "asr-sensevoice", feature = "asr-whisper"))]
 fn missing(what: &str, filename: &str) -> TtsError {
     TtsError::ConfigMissing(format!(
         "SenseVoice {what} not found ({filename}). Run `just fetch-asr-models` to \
@@ -423,7 +430,7 @@ fn run_sensevoice(
     .map_err(|e| TtsError::Internal(format!("SenseVoice (segmented): {e}")))
 }
 
-/// Unreachable until the engine lands: `ensure_available` rejects first.
+#[cfg(not(feature = "asr-whisper"))]
 fn run_whisper(
     _cfg: &TtsConfig,
     _samples: &[f32],
@@ -432,6 +439,64 @@ fn run_whisper(
     Err(TtsError::Internal(
         "run_whisper reached without ensure_available rejecting it".into(),
     ))
+}
+
+/// Whisper's default size. The smallest that transcribes well, at roughly
+/// 4.8 GB resident.
+#[cfg(feature = "asr-whisper")]
+const WHISPER_DEFAULT_SIZE: &str = "large-v3-turbo";
+
+/// The loaded Whisper, kept for the life of the process.
+///
+/// Residency matters more here than anywhere else in this file: the weights
+/// are gigabytes and loading them takes seconds. It also means a build with
+/// `asr-whisper` holds that memory from the first Whisper request until the
+/// daemon exits -- which is the trade the feature flag exists to let people
+/// decline.
+#[cfg(feature = "asr-whisper")]
+fn whisper(
+    cfg: &WhisperConfig,
+) -> Result<std::sync::Arc<nevoflux_asr::whisper::WhisperEngine>, TtsError> {
+    use std::sync::{Arc, OnceLock};
+    static ENGINE: OnceLock<Arc<nevoflux_asr::whisper::WhisperEngine>> = OnceLock::new();
+
+    if let Some(e) = ENGINE.get() {
+        return Ok(e.clone());
+    }
+    let size = cfg.default_size.as_deref().unwrap_or(WHISPER_DEFAULT_SIZE);
+    let dir = match cfg.model_path.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => resolve(Some(p), "").ok_or_else(|| missing("model directory", p))?,
+        None => dirs::cache_dir()
+            .map(|d| {
+                d.join("nevoflux")
+                    .join("models")
+                    .join(format!("whisper-{size}"))
+            })
+            .ok_or_else(|| missing("model directory", size))?,
+    };
+    if !dir.join("model.safetensors").exists() {
+        return Err(TtsError::ConfigMissing(format!(
+            "Whisper weights not found in {}. Run `just whisper-model {size}`. \
+             Note this is the HuggingFace layout (config.json, tokenizer.json, \
+             model.safetensors) -- whisper.cpp's ggml-*.bin will not load.",
+            dir.display()
+        )));
+    }
+    let e = nevoflux_asr::whisper::WhisperEngine::new(&dir)
+        .map_err(|e| TtsError::Internal(format!("load Whisper: {e}")))?;
+    Ok(ENGINE.get_or_init(|| Arc::new(e)).clone())
+}
+
+#[cfg(feature = "asr-whisper")]
+fn run_whisper(
+    cfg: &TtsConfig,
+    samples: &[f32],
+    language: Option<&str>,
+) -> Result<nevoflux_asr::Transcript, TtsError> {
+    use nevoflux_asr::Transcriber;
+    whisper(&cfg.whisper)?
+        .transcribe(samples, language)
+        .map_err(|e| TtsError::Internal(format!("Whisper: {e}")))
 }
 
 #[cfg(test)]
@@ -549,8 +614,9 @@ mod tests {
         assert!(matches!(err, TtsError::InvalidRequest(_)), "{err}");
     }
 
+    #[cfg(not(feature = "asr-whisper"))]
     #[test]
-    fn whisper_is_reported_as_a_build_problem_not_a_config_one() {
+    fn whisper_absence_is_a_build_problem_not_a_config_one() {
         let err = ensure_available(Engine::Whisper).unwrap_err();
         assert_eq!(err.code(), 4007);
         assert!(err.to_string().contains("build"), "{err}");
@@ -563,6 +629,12 @@ mod tests {
         // routes here whenever no language narrows it -- resolves to something
         // that can actually run.
         assert!(ensure_available(Engine::Sensevoice).is_ok());
+    }
+
+    #[cfg(feature = "asr-whisper")]
+    #[test]
+    fn whisper_is_available_when_its_feature_is_on() {
+        assert!(ensure_available(Engine::Whisper).is_ok());
     }
 
     #[cfg(not(feature = "asr-sensevoice"))]
