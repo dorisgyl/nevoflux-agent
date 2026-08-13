@@ -147,21 +147,30 @@ pub async fn begin(
         return None;
     }
 
-    // Port 0: the OS picks. A fixed port would collide between two sessions on
-    // one machine, which is the ordinary case for a head serving more than one
-    // portal.
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Bound to the one interface this machine routes out of, not to `0.0.0.0`,
+    // and port 0 so the OS picks — a fixed port would collide between two
+    // sessions on one machine, which is ordinary for a head serving more than
+    // one portal.
+    //
+    // The interface matters more than it looks. ICE keys everything on the
+    // local address a packet arrived on, and the candidate advertised has to be
+    // a real one, so a wildcard bind leaves those two disagreeing: the offer
+    // says `172.18.0.1:57139` and every inbound packet is presented as having
+    // arrived on `0.0.0.0:57139`, which matches no candidate. str0m then
+    // discards each one — `Discarding STUN request on unknown interface` — and
+    // the connection reaches ICE-connected on the checks *this* end sent, then
+    // dies at the DTLS handshake because nothing the far end sent was ever
+    // taken. Binding here makes `local_addr()` the same address that is
+    // offered, and there is nothing left to disagree.
+    let ip = outbound_ip().await?;
+    let socket = match UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::debug!(target: "rtc", "no UDP socket for a peer connection: {e}");
             return None;
         }
     };
-    let port = socket.local_addr().ok()?.port();
-    // Bound to every interface, but advertised as one real address: `0.0.0.0`
-    // is not a candidate anyone can send to, and offering it means the far end
-    // has nowhere to try.
-    let addr = std::net::SocketAddr::new(outbound_ip().await?, port);
+    let addr = socket.local_addr().ok()?;
 
     let mut endpoint = RtcEndpoint::new(sealed, std::time::Instant::now());
     // Negotiated up front rather than when someone asks for it. Adding a track
@@ -615,6 +624,34 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(500),
             "the unsealed refusal waited on a server: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_socket_listens_on_the_address_the_offer_advertises() {
+        // The two have to be the same address. ICE matches an arriving packet
+        // against the candidates by the local address it came in on, so a
+        // socket bound to `0.0.0.0` while the offer names a real interface
+        // means every inbound packet matches nothing — and because the checks
+        // this end sends still succeed, the connection reaches ICE-connected
+        // before dying at the DTLS handshake. In the field that read as
+        // "timeout: handshake" and nothing else.
+        let mut slot = PeerSlot::Idle;
+        let SignalFrame::RtcOffer { sdp } = begin(true, &[], &mut slot).await.unwrap() else {
+            panic!("expected an offer");
+        };
+        let PeerSlot::Offered { socket, .. } = &slot else {
+            panic!("should be offered");
+        };
+        let bound = socket.local_addr().expect("bound");
+        assert!(
+            !bound.ip().is_unspecified(),
+            "bound to every interface, so nothing inbound can match a candidate"
+        );
+        assert!(
+            sdp.contains(&bound.ip().to_string()),
+            "the offer advertises something other than what the socket listens on:\n\
+             bound {bound}\n{sdp}"
         );
     }
 }

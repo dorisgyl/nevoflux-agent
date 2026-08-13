@@ -249,6 +249,43 @@ async fn dropping_the_sender_ends_the_driver() {
     assert!(closed.is_ok(), "the driver never stopped");
 }
 
+#[tokio::test]
+async fn a_wildcard_bound_socket_is_refused_rather_than_looking_healthy() {
+    // ICE hands every packet to the agent tagged with the local address it
+    // arrived on, and matches that against the candidates advertised. A socket
+    // bound to `0.0.0.0` reports that as the arrival address, which matches no
+    // candidate, so every inbound packet is discarded — while the checks this
+    // end sends still get answered. The connection therefore reaches
+    // ICE-connected, looks fine for thirty seconds, and dies at the DTLS
+    // handshake. That is what happened in the field, and the log said only
+    // "timeout: handshake".
+    use nevoflux_rtc_transport::connection::RtcEndpoint;
+
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    let mut endpoint = RtcEndpoint::new(true, Instant::now());
+    let channel = endpoint.offer().ok().and_then(|_| endpoint.channel_id());
+    let Some(channel) = channel else {
+        panic!("an offer should allocate a channel");
+    };
+
+    let (_out_tx, out_rx) = mpsc::channel(1);
+    let (ev_tx, mut ev_rx) = mpsc::channel(4);
+    let (_sig_tx, sig_rx) = mpsc::channel(1);
+
+    tokio::spawn(driver::run(
+        endpoint, socket, channel, out_rx, ev_tx, sig_rx, None, None,
+    ));
+
+    let ev = tokio::time::timeout(DEADLINE, ev_rx.recv())
+        .await
+        .expect("the driver must not sit on a socket it can never receive on");
+    assert_eq!(
+        ev,
+        Some(DriverEvent::Closed),
+        "a driver that cannot match its own candidates must say so at once"
+    );
+}
+
 /// A sending peer with both of its outbound queues.
 ///
 /// The data-channel sender is held rather than dropped: the driver treats a

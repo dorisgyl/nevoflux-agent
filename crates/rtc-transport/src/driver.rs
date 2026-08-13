@@ -212,6 +212,23 @@ mod tokio_driver {
                 return;
             }
         };
+        // Every packet is handed to ICE as having arrived on this address, and
+        // ICE matches it against the candidates that were advertised. A
+        // wildcard bind matches none of them, so every inbound packet is
+        // discarded — while the checks this end sends still succeed, which
+        // makes the connection reach ICE-connected and then die at the DTLS
+        // handshake with nothing obviously wrong. Refuse rather than spend
+        // thirty seconds looking healthy.
+        if local.ip().is_unspecified() {
+            tracing::warn!(
+                target: "rtc",
+                %local,
+                "the socket is bound to every interface, so no inbound packet \
+                 will match a candidate; bind it to the address being offered"
+            );
+            let _ = events.send(DriverEvent::Closed).await;
+            return;
+        }
         let mut buf = vec![0u8; RECV_BUF];
         let mut refresh_due = Instant::now();
         let (video_mid, mut video_rx) = match video {
