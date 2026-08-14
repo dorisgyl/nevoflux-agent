@@ -195,6 +195,25 @@ impl PortalSession {
         local_files: &[nevoflux_protocol::FileInfo],
     ) -> Inbound {
         match msg {
+            // A `seq` means this frame was sent *by a head*, not by a portal:
+            // the sequencer stamps downlink frames and uplink ones carry none.
+            // Arriving inbound, it can only have come from another head on the
+            // same channel — the relay fans a message to every other socket,
+            // having been built for exactly two.
+            //
+            // Acting on it is how two heads eat each other's output as input
+            // and drive the channel at machine speed with nobody touching
+            // anything: 9.5 million relayed messages in an afternoon, against a
+            // daily allowance of a hundred thousand, and a bill that would have
+            // arrived instead had the account been a paid one.
+            WireMessage::Frame { seq: Some(n), .. } => {
+                tracing::warn!(
+                    target: "remote",
+                    seq = n,
+                    "another head is on this channel; ignoring what it sent"
+                );
+                Inbound::Ignore
+            }
             WireMessage::Frame { frame, .. } => match frame.get("kind").and_then(Value::as_str) {
                 Some("upload_begin" | "upload_chunk" | "upload_end") => Inbound::Upload(frame),
                 Some("asset_pull") => Inbound::AssetPull(frame),
@@ -693,5 +712,40 @@ mod tests {
             }
             other => panic!("expected a seq-tagged error frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_frame_from_another_head_is_ignored_rather_than_answered() {
+        // The relay fans a message to every other socket, having been built for
+        // exactly two. Two heads on one channel therefore each receive the
+        // other's output — and, routing it by kind alone, each fed it back in
+        // as though a person had typed it. Nobody touched anything and the
+        // channel ran at machine speed for hours.
+        //
+        // A downlink frame is recognisable: the sequencer stamps it, and
+        // nothing a portal sends carries a seq.
+        let s = PortalSession::new(None, None, None);
+        let from_a_head = WireMessage::Frame {
+            seq: Some(7),
+            frame: json!({ "kind": "user_message", "text": "not from a person" }),
+        };
+        assert_eq!(
+            s.route(from_a_head, "sess", "m1", &[]),
+            Inbound::Ignore,
+            "a head answered another head"
+        );
+
+        // The same frame without a seq is what a portal sends, and still works.
+        let from_the_portal = WireMessage::Frame {
+            seq: None,
+            frame: json!({ "kind": "user_message", "text": "hi" }),
+        };
+        assert!(
+            matches!(
+                s.route(from_the_portal, "sess", "m1", &[]),
+                Inbound::Uplink(_)
+            ),
+            "a real message from the phone was dropped"
+        );
     }
 }
