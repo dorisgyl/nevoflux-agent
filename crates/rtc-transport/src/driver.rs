@@ -175,6 +175,36 @@ mod tokio_driver {
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
+    /// Whether a read error means the socket is finished, or only that one
+    /// datagram was.
+    ///
+    /// A UDP socket has no connection to lose, so most errors it reports are
+    /// about a single packet. Windows makes that easy to get wrong: when an
+    /// earlier send draws an ICMP port-unreachable, the *next* `recv` fails
+    /// with `ConnectionReset` — 10054, "the remote host forcibly closed an
+    /// existing connection", about a protocol that has none.
+    ///
+    /// ICE spends its whole life sending to addresses that may not answer, so
+    /// that ICMP is routine rather than exceptional. Treating it as fatal ended
+    /// the driver, and a peer connection died six tenths of a second after its
+    /// relay channel was bound, reporting a closed connection that had never
+    /// been open.
+    ///
+    /// Only the errors that say the socket itself is gone end the loop.
+    pub(crate) fn fatal_read(e: &std::io::Error) -> bool {
+        !matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+        )
+    }
+
     /// How long to wait when the connection asks for a deadline already past.
     ///
     /// `str0m` can return a timeout in the past when it is behind; sleeping
@@ -322,9 +352,14 @@ mod tokio_driver {
                             break;
                         }
                     }
-                    Err(e) => {
+                    Err(e) if fatal_read(&e) => {
                         tracing::warn!(target: "rtc", "socket read failed: {e}");
                         break;
+                    }
+                    // Not fatal, and on Windows not even unusual — see
+                    // `fatal_read`. Reading again is the whole response.
+                    Err(e) => {
+                        tracing::trace!(target: "rtc", "socket read hiccup: {e}");
                     }
                 },
                 _ = tokio::time::sleep(sleep) => {
@@ -519,6 +554,39 @@ pub fn send_video(
 
 #[cfg(test)]
 mod video_tests {
+    #[test]
+    fn one_unreachable_datagram_does_not_end_the_connection() {
+        use crate::driver::tokio_driver::fatal_read;
+        use std::io::{Error, ErrorKind};
+
+        // Windows reports an earlier send's ICMP port-unreachable as a
+        // ConnectionReset on the *next* recv -- 10054, about a protocol with no
+        // connection. ICE sends to addresses that may not answer for its whole
+        // life, so this is routine. Treated as fatal, it ended the driver six
+        // tenths of a second after the relay channel was bound, reporting a
+        // closed connection that had never been open.
+        for transient in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !fatal_read(&Error::new(transient, "one datagram")),
+                "{transient:?} ended the whole connection"
+            );
+        }
+
+        // The socket itself being gone still does.
+        for fatal in [ErrorKind::NotConnected, ErrorKind::PermissionDenied] {
+            assert!(fatal_read(&Error::new(fatal, "the socket")), "{fatal:?}");
+        }
+    }
+
     #[test]
     fn ice_matches_a_relayed_candidate_by_its_relayed_address() {
         use str0m::CandidateKind;

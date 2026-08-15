@@ -226,7 +226,7 @@ async fn dropping_the_sender_ends_the_driver() {
     // The daemon closes a session by dropping its handle. If that left the
     // driver spinning on a socket, every ended session would leak a task and a
     // port for as long as the process lived.
-    let (head, mut portal) = connect().await;
+    let (mut head, mut portal) = connect().await;
 
     expect_event(&mut portal, "portal connected", |e| {
         *e == DriverEvent::Connected
@@ -234,19 +234,23 @@ async fn dropping_the_sender_ends_the_driver() {
     .await;
 
     drop(head.outbound);
-    // The head's driver returns, which drops its socket; the portal sees the
-    // connection go rather than hanging on it.
-    let closed = tokio::time::timeout(DEADLINE, async {
-        while let Some(ev) = portal.events.recv().await {
-            if ev == DriverEvent::Closed {
-                return true;
-            }
-        }
-        // The channel closing is also the driver having stopped.
-        true
+    // The head's driver returns and drops its event sender with it, which is
+    // the property this is named for.
+    let ended = tokio::time::timeout(DEADLINE, async {
+        while head.events.recv().await.is_some() {}
     })
     .await;
-    assert!(closed.is_ok(), "the driver never stopped");
+    assert!(ended.is_ok(), "the driver never stopped");
+
+    // The portal is deliberately *not* asserted to notice within this deadline.
+    // It used to, by treating a read error as the end of the connection — and
+    // that is what a vanished peer looks like on loopback, where sending to a
+    // closed socket draws an ICMP unreachable. On a real network ICE sends to
+    // candidates that may not answer for its whole life, so the same error
+    // arrives constantly and means nothing; acting on it killed a connection
+    // that had just been nominated and was carrying traffic. The end of a
+    // connection is ICE's to declare, on its own timers, and those are longer
+    // than a unit test should sit through.
 }
 
 #[tokio::test]
