@@ -368,6 +368,19 @@ impl PortalGateway {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Prefer the peer connection. It is the whole reason there is one: a
+        // range is the only thing here big enough for the relay's per-message
+        // accounting to matter, and on the data channel those bytes never reach
+        // it at all. Chat is small and stays where it is.
+        //
+        // Decided before the read because it changes how much to read.
+        let via_peer = binary && self.peer_carries_bytes().await;
+        let length = length.min(if via_peer {
+            PEER_CHUNK_BYTES
+        } else {
+            super::asset::CHUNK_BYTES
+        });
+
         // Scoped so the guard cannot outlive the block: held across the await
         // below it would make this future non-Send.
         let served = {
@@ -410,18 +423,27 @@ impl PortalGateway {
 
         let mut session = self.session.lock().await;
         // Destination is decided with the frame, not from the request. They
-        // differ exactly when the read failed: the range was headed for the
-        // media socket, the error that replaced it is not.
-        let (wire, on_media) = match served {
-            // On its own socket a range is unsequenced: the chat tracker must
-            // not be left waiting on a seq that will never arrive there.
-            Ok((bytes, eof)) if via_media => {
-                (session.media_socket_frame(id, offset, &bytes, eof), true)
+        // differ exactly when the read failed: the range was headed off the chat
+        // socket, the error that replaced it is not.
+        let (wire, route) = match served {
+            // Off the chat socket a range is unsequenced, on either path: the
+            // chat tracker must not be left waiting on a seq that will never
+            // arrive there. The frame is identical, which is what lets the far
+            // end put both through one decoder.
+            Ok((bytes, eof)) if via_peer => (
+                session.media_socket_frame(id, offset, &bytes, eof),
+                Route::Peer,
+            ),
+            Ok((bytes, eof)) if via_media => (
+                session.media_socket_frame(id, offset, &bytes, eof),
+                Route::Media,
+            ),
+            Ok((bytes, eof)) if binary => {
+                (session.downlink_media(id, offset, &bytes, eof), Route::Chat)
             }
-            Ok((bytes, eof)) if binary => (session.downlink_media(id, offset, &bytes, eof), false),
             Ok((bytes, eof)) => (
                 session.downlink_frame(super::asset::data_frame(id, offset, &bytes, eof)),
-                false,
+                Route::Chat,
             ),
             // An error is small and structured, so it stays JSON in both modes —
             // the portal reads it off the same reducer either way. It also stays
@@ -430,15 +452,65 @@ impl PortalGateway {
                 session.downlink_frame(
                     serde_json::json!({ "kind": "asset_error", "id": id, "reason": reason }),
                 ),
-                false,
+                Route::Chat,
             ),
         };
         drop(session);
 
-        match (on_media, &self.media_sink) {
-            (true, Some(media)) => media.send(wire).await,
-            _ => self.sink.send(wire).await,
+        let sent = match route {
+            Route::Peer => {
+                let bytes = match &wire {
+                    Wire::Binary(b) => b.clone(),
+                    Wire::Text(t) => t.as_bytes().to_vec(),
+                };
+                let ok = self.peer_try_send(bytes).await;
+                if !ok {
+                    // Full, or gone between the check and here. Falling back
+                    // rather than dropping: a range that never arrives stalls
+                    // the player on a timeout, and the relay still works.
+                    tracing::debug!(
+                        target: "remote", id, offset,
+                        "the data channel would not take this range; using the relay"
+                    );
+                }
+                ok
+            }
+            _ => false,
+        };
+        if !sent {
+            match (route, &self.media_sink) {
+                (Route::Chat, _) => self.sink.send(wire).await,
+                (_, Some(media)) => media.send(wire).await,
+                (_, None) => self.sink.send(wire).await,
+            }
         }
+    }
+
+    /// Whether a peer connection is up and could take a range.
+    ///
+    /// Both of these keep the `webrtc` cfg out of the routing itself: without
+    /// the feature there is no peer connection, so the answer is simply no and
+    /// every range goes the way it always did.
+    #[cfg(feature = "webrtc")]
+    async fn peer_carries_bytes(&self) -> bool {
+        self.peer.lock().await.is_running()
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    async fn peer_carries_bytes(&self) -> bool {
+        false
+    }
+
+    /// Hand bytes to the data channel. False means it would not take them, and
+    /// the caller has to put them somewhere else.
+    #[cfg(feature = "webrtc")]
+    async fn peer_try_send(&self, bytes: Vec<u8>) -> bool {
+        self.peer.lock().await.try_send(bytes)
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    async fn peer_try_send(&self, _bytes: Vec<u8>) -> bool {
+        false
     }
 
     /// Point the staging area at a temporary directory (tests only).
@@ -840,6 +912,31 @@ impl PortalGateway {
 /// on purpose: the same delivery carries loop progress and schedule ticks,
 /// and relaxing the filter to all EventBus traffic would hand a portal every
 /// internal event the daemon publishes.
+/// How much of a range to read when it is going over the data channel.
+///
+/// SCTP will not carry a message of any size. Browsers negotiate
+/// `a=max-message-size` and settle around 256 KiB, which is exactly
+/// [`super::asset::CHUNK_BYTES`] — before the frame header and the AEAD tag are
+/// added, which put it over. Anything over the limit is not truncated, it is
+/// refused, so the ceiling has to be under it with room to spare rather than
+/// near it. Four chunks where the relay sent one, and none of the four is a
+/// billed message.
+const PEER_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Where a served range is written.
+///
+/// The frame differs between the first two and the last: unsequenced off the
+/// chat socket, sequenced on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// The peer connection's data channel; these bytes never reach the relay.
+    Peer,
+    /// The relay's second socket, when there is no peer connection.
+    Media,
+    /// The chat socket, which is the one guaranteed to be up.
+    Chat,
+}
+
 fn is_user_notification(env: &nevoflux_protocol::DaemonEnvelope) -> bool {
     if env.payload.get("type").and_then(|v| v.as_str()) != Some("events_delivery") {
         return false;
@@ -1235,6 +1332,99 @@ mod tests {
             "a range on its own socket must not claim a seq the chat tracker \
              would then wait for"
         );
+    }
+
+    /// Put a live data channel on the gateway and hand back its receiving end.
+    #[cfg(feature = "webrtc")]
+    async fn with_peer(gw: &PortalGateway, depth: usize) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let (data, rx) = tokio::sync::mpsc::channel(depth);
+        let (signals, _sig) = tokio::sync::mpsc::channel(4);
+        *gw.peer.lock().await = super::super::rtc_peer::PeerSlot::Running { data, signals };
+        rx
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_range_takes_the_data_channel_over_either_socket() {
+        // The reason the peer connection exists. Chat and media both go through
+        // the relay, which bills per message; these bytes never reach it.
+        let media = Arc::new(CollectSink::default());
+        let (gw, chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+        let mut rx = with_peer(&gw, 4).await;
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        let raw = rx
+            .try_recv()
+            .expect("the range belongs on the data channel");
+        let frame = super::super::media_frame::decode(&raw).unwrap();
+        assert_eq!(frame.data, vec![7u8; 4096]);
+        assert_eq!(
+            frame.seq, None,
+            "off the chat socket a range carries no seq, on either path"
+        );
+        assert!(chat.sent.lock().await.is_empty());
+        assert!(
+            media.sent.lock().await.is_empty(),
+            "the relay must not also be paid for this"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_refused_data_channel_falls_back_rather_than_dropping() {
+        // A dropped range is not a slow range: the player waits out a timeout
+        // and shows nothing. The relay is still there and still works.
+        let media = Arc::new(CollectSink::default());
+        let (gw, _chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+        let mut rx = with_peer(&gw, 1).await;
+        // Fill it, and keep the receiver alive so the channel is full, not shut.
+        {
+            let slot = gw.peer.lock().await;
+            assert!(slot.try_send(vec![0u8; 8]), "the first one fits");
+            assert!(!slot.try_send(vec![0u8; 8]), "the second must not");
+        }
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        assert_eq!(
+            media.sent.lock().await.len(),
+            1,
+            "what the data channel would not take has to go somewhere"
+        );
+        let _ = rx.try_recv();
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_range_on_the_data_channel_stays_under_the_sctp_limit() {
+        // SCTP refuses an oversized message rather than truncating it, so a
+        // full CHUNK_BYTES range plus header and AEAD tag would simply not
+        // arrive. Reading less is what keeps it deliverable.
+        let dir = tempfile::tempdir().unwrap();
+        let chat = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, chat, "sess-big", None, None, "chan-big")
+            .with_asset_root(dir.path().to_path_buf());
+        let id = {
+            let mut store = gw.assets.lock().expect("asset store");
+            let big = vec![3u8; super::super::asset::CHUNK_BYTES];
+            store.put(&big, "big.mp4", "video/mp4").unwrap().id
+        };
+        let mut rx = with_peer(&gw, 4).await;
+
+        let mut ask = pull(&id, true, true);
+        ask["length"] = serde_json::json!(super::super::asset::CHUNK_BYTES);
+        gw.apply_asset_pull(&ask).await;
+
+        let raw = rx.try_recv().expect("a range was expected");
+        assert!(
+            raw.len() <= PEER_CHUNK_BYTES + 4096,
+            "the whole frame, header and tag included, has to clear the limit;              got {}",
+            raw.len()
+        );
+        let frame = super::super::media_frame::decode(&raw).unwrap();
+        assert_eq!(frame.data.len(), PEER_CHUNK_BYTES);
+        assert!(!frame.eof, "there is more of this file to come");
     }
 
     #[tokio::test]
