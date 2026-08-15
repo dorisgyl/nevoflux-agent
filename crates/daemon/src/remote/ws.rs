@@ -146,6 +146,18 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Consecutive failures before the gateway is taken out of the registry.
 const UNREGISTER_AFTER: u32 = 8;
 
+/// How long a socket must last before reconnecting counts as starting over.
+///
+/// Connecting is not succeeding. A relay that accepts the upgrade and drops the
+/// socket at once satisfies every check this loop used to make, so the failure
+/// count went back to zero on every attempt and the wait never grew past its
+/// first step. Two sockets redialling every four seconds, for as long as the
+/// process lived: forty-three thousand connections a day against a daily
+/// allowance of a hundred thousand, with the machine otherwise idle. Found by
+/// tailing the relay after every client had supposedly been shut down and
+/// watching the pairs arrive on a metronome.
+const STABLE_CONNECTION: Duration = Duration::from_secs(5);
+
 /// What to do after one failed attempt.
 #[derive(Debug, PartialEq, Eq)]
 struct Step {
@@ -195,9 +207,21 @@ impl ReconnectPolicy {
 
     /// Account for a connection that came up. Returns whether the gateway has
     /// to be put back into the registry.
+    ///
+    /// Deliberately leaves the failure count alone: coming up is not the same
+    /// as working, and clearing it here is what let a flap run at full speed
+    /// forever. [`Self::on_stable`] is what a connection has to earn.
+    ///
+    /// Re-registering still belongs here — a socket that is up should carry
+    /// frames immediately, and a channel that turns out to be flapping detaches
+    /// again on its own.
     fn on_connected(&mut self) -> bool {
-        self.failures = 0;
         std::mem::take(&mut self.detached)
+    }
+
+    /// Account for a connection that lasted; see [`STABLE_CONNECTION`].
+    fn on_stable(&mut self) {
+        self.failures = 0;
     }
 }
 
@@ -266,10 +290,22 @@ pub async fn run_gateway(
                 // already been thrown away. The relay tells this end when a
                 // portal is there, on joining and on arrival; that is what
                 // triggers the offer, in `on_wire_in`.
+                let up = Instant::now();
                 serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
                 sink.clear().await;
-                // A dropped socket is not a failed attempt; reconnect promptly.
-                tokio::time::sleep(BASE_BACKOFF).await;
+                let lasted = up.elapsed();
+                if lasted >= STABLE_CONNECTION {
+                    // It did its job; a drop now is not the last one's fault.
+                    policy.on_stable();
+                    tokio::time::sleep(BASE_BACKOFF).await;
+                } else {
+                    tracing::warn!(
+                        target: "remote",
+                        lasted_ms = lasted.as_millis() as u64,
+                        "the relay took this socket and dropped it; backing off"
+                    );
+                    back_off(&mut policy, &registry, &gateway_id).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(target: "remote", "relay connect failed: {e}");
@@ -386,12 +422,24 @@ pub async fn run_media_socket(
                 policy.on_connected();
                 let (write, read) = ws.split();
                 sink.set(write).await;
+                let up = Instant::now();
                 serve_media(read, &sink).await;
                 // Clearing the write half is what makes `is_connected` false, so
                 // the next range falls back to the chat socket rather than being
                 // written into a socket that leads nowhere.
                 sink.clear().await;
-                tokio::time::sleep(BASE_BACKOFF).await;
+                let lasted = up.elapsed();
+                if lasted >= STABLE_CONNECTION {
+                    policy.on_stable();
+                    tokio::time::sleep(BASE_BACKOFF).await;
+                } else {
+                    tracing::warn!(
+                        target: "remote",
+                        lasted_ms = lasted.as_millis() as u64,
+                        "the relay took this media socket and dropped it; backing off"
+                    );
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(target: "remote", "media relay connect failed: {e}");
@@ -576,13 +624,41 @@ mod tests {
     }
 
     #[test]
-    fn coming_back_resets_the_backoff() {
+    fn a_connection_that_lasted_resets_the_backoff() {
+        let mut p = ReconnectPolicy::new();
+        for _ in 0..6 {
+            p.on_failure();
+        }
+        p.on_stable();
+        assert_eq!(p.on_failure().wait, BASE_BACKOFF);
+    }
+
+    #[test]
+    fn merely_coming_up_does_not() {
+        // This assertion used to read the other way, and the behaviour it
+        // described is what kept two sockets redialling every four seconds
+        // with nobody using them. A relay that accepts the upgrade and drops
+        // the socket satisfies `on_connected` every single time, so the count
+        // never grew and the wait never left its first step. Only lasting
+        // counts; see `STABLE_CONNECTION`.
         let mut p = ReconnectPolicy::new();
         for _ in 0..6 {
             p.on_failure();
         }
         p.on_connected();
-        assert_eq!(p.on_failure().wait, BASE_BACKOFF);
+        assert!(p.on_failure().wait > BASE_BACKOFF);
+    }
+
+    #[test]
+    fn a_flap_still_gets_the_gateway_back_into_the_registry() {
+        // Not resetting the backoff must not cost the re-registration: a socket
+        // that is up should carry frames at once, and one that turns out to be
+        // flapping detaches again on its own.
+        let mut p = ReconnectPolicy::new();
+        for _ in 0..UNREGISTER_AFTER {
+            p.on_failure();
+        }
+        assert!(p.on_connected(), "detached gateway must be re-registered");
     }
 
     #[test]
