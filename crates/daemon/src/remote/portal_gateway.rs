@@ -591,7 +591,9 @@ impl PortalGateway {
             binary,
             route = ?route,
             delivered,
-            peer_running = via_peer,
+            // Open, not merely negotiating — the distinction that had four
+            // ranges handed to a channel which never opened.
+            peer_open = via_peer,
             fits_peer,
             peer_took_it = sent,
             portal_wants_media,
@@ -600,19 +602,25 @@ impl PortalGateway {
         );
     }
 
-    /// Whether a peer connection is up and could take a range.
+    /// Whether the data channel is open and would actually carry a range.
     ///
-    /// Both of these keep the `webrtc` cfg out of the routing itself: without
-    /// the feature there is no peer connection, so the answer is simply no and
-    /// every range goes the way it always did.
-    #[cfg(feature = "webrtc")]
+    /// The path, not the slot. A `PeerSlot` is `Running` from the moment a task
+    /// owns the endpoint — "connected *or connecting*", as its own doc says —
+    /// which spans the whole ICE, DTLS and SCTP negotiation. `RtcState` knows
+    /// the difference: it is `Forming` until `ChannelOpen` and only then `Peer`,
+    /// which is what `use_relay` was written to answer.
+    ///
+    /// Asking the slot sent ranges into a connection whose channel never
+    /// opened. `try_send` took them, because it only puts them on a queue toward
+    /// the driver, so the head logged four ranges delivered peer-to-peer while
+    /// the negotiation behind them timed out on DTLS and the bytes went nowhere.
+    /// The player waited out its thirty seconds and asked again — the same shape
+    /// of failure this whole path keeps producing, and the same lesson: a thing
+    /// that reports success has to be the thing that did the work.
+    ///
+    /// Feature-independent, because `path()` is always `Relay` without `webrtc`.
     async fn peer_carries_bytes(&self) -> bool {
-        self.peer.lock().await.is_running()
-    }
-
-    #[cfg(not(feature = "webrtc"))]
-    async fn peer_carries_bytes(&self) -> bool {
-        false
+        !self.rtc.path().use_relay()
     }
 
     /// Hand bytes to the data channel. False means it would not take them, and
@@ -1683,12 +1691,57 @@ mod tests {
     }
 
     /// Put a live data channel on the gateway and hand back its receiving end.
+    ///
+    /// Both halves, because both are what "open" means: a driver holding the
+    /// endpoint *and* a `ChannelOpen` having landed. A slot alone is the
+    /// negotiating state, which is what `still_forming` covers below.
     #[cfg(feature = "webrtc")]
     async fn with_peer(gw: &PortalGateway, depth: usize) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let rx = still_forming(gw, depth).await;
+        gw.rtc.set_path(super::super::rtc::Path::Peer);
+        rx
+    }
+
+    /// A peer connection that is being negotiated: a driver owns the endpoint,
+    /// but no `ChannelOpen` has arrived, so nothing can be written yet.
+    #[cfg(feature = "webrtc")]
+    async fn still_forming(
+        gw: &PortalGateway,
+        depth: usize,
+    ) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
         let (data, rx) = tokio::sync::mpsc::channel(depth);
         let (signals, _sig) = tokio::sync::mpsc::channel(4);
         *gw.peer.lock().await = super::super::rtc_peer::PeerSlot::Running { data, signals };
+        gw.rtc.set_path(super::super::rtc::Path::Forming);
         rx
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_connection_still_forming_does_not_get_handed_a_range() {
+        // `PeerSlot::Running` means "connected *or connecting*", and the
+        // connecting half lasts seconds — ICE, DTLS, then SCTP. Routing on it
+        // handed four ranges to a channel that had not opened. `try_send` took
+        // them, because it only queues toward the driver, so they were logged
+        // as delivered peer-to-peer while the negotiation timed out on DTLS
+        // behind them and the bytes went nowhere. The player spun for thirty
+        // seconds and asked again.
+        let media = Arc::new(CollectSink::default());
+        let (gw, chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+        let mut rx = still_forming(&gw, 4).await;
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a channel that has not opened must not be handed anything"
+        );
+        assert_eq!(
+            media.sent.lock().await.len(),
+            1,
+            "the relay carries it until the channel is genuinely open"
+        );
+        assert!(chat.sent.lock().await.is_empty());
     }
 
     #[cfg(feature = "webrtc")]
