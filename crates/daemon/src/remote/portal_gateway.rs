@@ -373,13 +373,13 @@ impl PortalGateway {
         // accounting to matter, and on the data channel those bytes never reach
         // it at all. Chat is small and stays where it is.
         //
-        // Decided before the read because it changes how much to read.
+        // Whether it *fits* is decided after framing, in the send below. Not
+        // here, by reading less: the portal plans its offsets up front from its
+        // own copy of the chunk size and does not look at how much came back,
+        // so a short read leaves a hole it never asks about again. A picture
+        // arrived a quarter complete and a video played not at all, each range
+        // logged as served without complaint.
         let via_peer = binary && self.peer_carries_bytes().await;
-        let length = length.min(if via_peer {
-            PEER_CHUNK_BYTES
-        } else {
-            super::asset::CHUNK_BYTES
-        });
 
         // Scoped so the guard cannot outlive the block: held across the await
         // below it would make this future non-Send.
@@ -463,13 +463,15 @@ impl PortalGateway {
                     Wire::Binary(b) => b.clone(),
                     Wire::Text(t) => t.as_bytes().to_vec(),
                 };
-                let ok = self.peer_try_send(bytes).await;
+                let fits = bytes.len() <= PEER_FRAME_LIMIT;
+                let ok = fits && self.peer_try_send(bytes).await;
                 if !ok {
-                    // Full, or gone between the check and here. Falling back
-                    // rather than dropping: a range that never arrives stalls
-                    // the player on a timeout, and the relay still works.
+                    // Too big for SCTP, full, or gone between the check and
+                    // here. Falling back rather than dropping or shortening: a
+                    // range that never arrives stalls the player on a timeout,
+                    // and a short one leaves a hole nobody asks about.
                     tracing::debug!(
-                        target: "remote", id, offset,
+                        target: "remote", id, offset, fits,
                         "the data channel would not take this range; using the relay"
                     );
                 }
@@ -912,16 +914,25 @@ impl PortalGateway {
 /// on purpose: the same delivery carries loop progress and schedule ticks,
 /// and relaxing the filter to all EventBus traffic would hand a portal every
 /// internal event the daemon publishes.
-/// How much of a range to read when it is going over the data channel.
+/// The largest frame worth handing to the data channel.
 ///
-/// SCTP will not carry a message of any size. Browsers negotiate
-/// `a=max-message-size` and settle around 256 KiB, which is exactly
-/// [`super::asset::CHUNK_BYTES`] — before the frame header and the AEAD tag are
-/// added, which put it over. Anything over the limit is not truncated, it is
-/// refused, so the ceiling has to be under it with room to spare rather than
-/// near it. Four chunks where the relay sent one, and none of the four is a
-/// billed message.
-const PEER_CHUNK_BYTES: usize = 64 * 1024;
+/// SCTP will not carry a message of any size: browsers negotiate
+/// `a=max-message-size` and commonly settle at 256 KiB, and an oversized
+/// message is refused rather than truncated. That is exactly
+/// [`super::asset::CHUNK_BYTES`] before the frame header and the AEAD tag,
+/// which put a full range over it.
+///
+/// So a full-sized range takes the relay and a smaller one does not. Shrinking
+/// the range instead was tried and was worse than doing nothing: the portal
+/// plans its offsets from its own copy of the chunk size and never reads how
+/// much actually came back, so every short read left a hole it did not go back
+/// for. Pictures came through in quarters and video did not play, with every
+/// range logged as served.
+///
+/// Carrying whole files this way — most images are one range — is worth having
+/// on its own. Carrying video too needs the two ends to agree a chunk size
+/// rather than each holding a constant, which is a change for both of them.
+const PEER_FRAME_LIMIT: usize = 192 * 1024;
 
 /// Where a served range is written.
 ///
@@ -1397,17 +1408,21 @@ mod tests {
 
     #[cfg(feature = "webrtc")]
     #[tokio::test]
-    async fn a_range_on_the_data_channel_stays_under_the_sctp_limit() {
-        // SCTP refuses an oversized message rather than truncating it, so a
-        // full CHUNK_BYTES range plus header and AEAD tag would simply not
-        // arrive. Reading less is what keeps it deliverable.
+    async fn a_range_too_big_for_sctp_takes_the_relay_whole() {
+        // Never shortened. The portal plans its offsets up front from its own
+        // copy of the chunk size and never reads how much came back, so a short
+        // read leaves a hole it does not return for: a picture arrived a
+        // quarter complete and a video would not play, every range logged as
+        // served. A full-sized range goes to the relay intact instead.
         let dir = tempfile::tempdir().unwrap();
         let chat = Arc::new(CollectSink::default());
+        let media = Arc::new(CollectSink::default());
         let gw = PortalGateway::new(None, chat, "sess-big", None, None, "chan-big")
-            .with_asset_root(dir.path().to_path_buf());
+            .with_asset_root(dir.path().to_path_buf())
+            .with_media_sink(media.clone());
         let id = {
             let mut store = gw.assets.lock().expect("asset store");
-            let big = vec![3u8; super::super::asset::CHUNK_BYTES];
+            let big = vec![3u8; super::super::asset::CHUNK_BYTES * 2];
             store.put(&big, "big.mp4", "video/mp4").unwrap().id
         };
         let mut rx = with_peer(&gw, 4).await;
@@ -1416,15 +1431,39 @@ mod tests {
         ask["length"] = serde_json::json!(super::super::asset::CHUNK_BYTES);
         gw.apply_asset_pull(&ask).await;
 
-        let raw = rx.try_recv().expect("a range was expected");
-        assert!(
-            raw.len() <= PEER_CHUNK_BYTES + 4096,
-            "the whole frame, header and tag included, has to clear the limit;              got {}",
-            raw.len()
+        assert!(rx.try_recv().is_err(), "too big for the data channel");
+        let sent = media.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Binary(raw) = &sent[0] else {
+            panic!("media must be binary")
+        };
+        let frame = super::super::media_frame::decode(raw).unwrap();
+        assert_eq!(
+            frame.data.len(),
+            super::super::asset::CHUNK_BYTES,
+            "the whole range the portal asked for, or its plan skips what is missing"
         );
-        let frame = super::super::media_frame::decode(&raw).unwrap();
-        assert_eq!(frame.data.len(), PEER_CHUNK_BYTES);
-        assert!(!frame.eof, "there is more of this file to come");
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whole_small_asset_still_goes_peer_to_peer() {
+        // The common case, and the one worth having: an image is one range and
+        // fits, so it never reaches the relay at all.
+        let media = Arc::new(CollectSink::default());
+        let (gw, _chat, id, _d) = gateway_with_asset(Some(media.clone())).await;
+        let mut rx = with_peer(&gw, 4).await;
+
+        gw.apply_asset_pull(&pull(&id, true, true)).await;
+
+        let raw = rx
+            .try_recv()
+            .expect("a 4 KiB asset belongs on the data channel");
+        assert_eq!(
+            super::super::media_frame::decode(&raw).unwrap().data,
+            vec![7u8; 4096]
+        );
+        assert!(media.sent.lock().await.is_empty());
     }
 
     #[tokio::test]
