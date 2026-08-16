@@ -430,7 +430,7 @@ impl PortalGateway {
             // chat tracker must not be left waiting on a seq that will never
             // arrive there. The frame is identical, which is what lets the far
             // end put both through one decoder.
-            Ok((bytes, eof)) if via_peer => (
+            Ok((bytes, eof)) if via_peer && fits_the_data_channel(bytes.len()) => (
                 session.media_socket_frame(id, offset, &bytes, eof),
                 Route::Peer,
             ),
@@ -463,15 +463,13 @@ impl PortalGateway {
                     Wire::Binary(b) => b.clone(),
                     Wire::Text(t) => t.as_bytes().to_vec(),
                 };
-                let fits = bytes.len() <= PEER_FRAME_LIMIT;
-                let ok = fits && self.peer_try_send(bytes).await;
+                let ok = self.peer_try_send(bytes).await;
                 if !ok {
-                    // Too big for SCTP, full, or gone between the check and
-                    // here. Falling back rather than dropping or shortening: a
-                    // range that never arrives stalls the player on a timeout,
-                    // and a short one leaves a hole nobody asks about.
+                    // Full, or gone since the check. Falling back rather than
+                    // dropping: a range that never arrives stalls the player on
+                    // a timeout with nothing to show.
                     tracing::debug!(
-                        target: "remote", id, offset, fits,
+                        target: "remote", id, offset,
                         "the data channel would not take this range; using the relay"
                     );
                 }
@@ -480,10 +478,20 @@ impl PortalGateway {
             _ => false,
         };
         if !sent {
-            match (route, &self.media_sink) {
-                (Route::Chat, _) => self.sink.send(wire).await,
-                (_, Some(media)) => media.send(wire).await,
-                (_, None) => self.sink.send(wire).await,
+            // `via_media` is the portal saying it is listening on the second
+            // socket, and it governs here too. Falling back from the data
+            // channel straight onto that socket ignored it: a portal whose
+            // media socket had failed to connect said so, and 256 KiB a time
+            // went into a channel it was not attached to. The head logged every
+            // range as served, the player showed an empty source, and the same
+            // four offsets were asked for again half a minute later, forever.
+            match (route, via_media, &self.media_sink) {
+                // Framed for the chat socket, so that is where it goes — an
+                // error reply among others, which is small, structured, and
+                // belongs on the socket guaranteed to be up.
+                (Route::Chat, _, _) => self.sink.send(wire).await,
+                (_, true, Some(media)) => media.send(wire).await,
+                _ => self.sink.send(wire).await,
             }
         }
     }
@@ -933,6 +941,12 @@ impl PortalGateway {
 /// on its own. Carrying video too needs the two ends to agree a chunk size
 /// rather than each holding a constant, which is a change for both of them.
 const PEER_FRAME_LIMIT: usize = 192 * 1024;
+
+/// Whether a range of `payload` bytes will fit in a data channel message once
+/// it is framed. The allowance covers the frame header and the AEAD tag.
+fn fits_the_data_channel(payload: usize) -> bool {
+    payload.saturating_add(4096) <= PEER_FRAME_LIMIT
+}
 
 /// Where a served range is written.
 ///
@@ -1442,6 +1456,46 @@ mod tests {
             frame.data.len(),
             super::super::asset::CHUNK_BYTES,
             "the whole range the portal asked for, or its plan skips what is missing"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_portal_without_a_media_socket_is_not_written_to_one() {
+        // The portal reports whether its second socket is open, and the head
+        // must not go around that answer. Falling back from the data channel
+        // straight onto the media socket did: a portal whose media socket had
+        // failed to connect said `mediaChannel: false`, and 256 KiB a time went
+        // into a channel nobody was attached to. Every range was logged as
+        // served, the player showed an empty source, and the same four offsets
+        // were asked for again half a minute later, without end.
+        let dir = tempfile::tempdir().unwrap();
+        let chat = Arc::new(CollectSink::default());
+        let media = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, chat.clone(), "sess-nm", None, None, "chan-nm")
+            .with_asset_root(dir.path().to_path_buf())
+            .with_media_sink(media.clone());
+        let id = {
+            let mut store = gw.assets.lock().expect("asset store");
+            let big = vec![5u8; super::super::asset::CHUNK_BYTES];
+            store.put(&big, "big.mp4", "video/mp4").unwrap().id
+        };
+        // A live peer connection, and a range far too big for it.
+        let mut rx = with_peer(&gw, 4).await;
+
+        let mut ask = pull(&id, true, false); // mediaChannel: false
+        ask["length"] = serde_json::json!(super::super::asset::CHUNK_BYTES);
+        gw.apply_asset_pull(&ask).await;
+
+        assert!(rx.try_recv().is_err(), "too big for the data channel");
+        assert!(
+            media.sent.lock().await.is_empty(),
+            "the portal said it is not listening there"
+        );
+        assert_eq!(
+            chat.sent.lock().await.len(),
+            1,
+            "so it goes down the chat socket"
         );
     }
 
