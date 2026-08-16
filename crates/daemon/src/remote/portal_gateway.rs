@@ -462,15 +462,26 @@ impl PortalGateway {
         // says it is listening there; this side has to actually be connected, or
         // the range would be written into nothing and the player would wait out
         // its timeout for bytes that were never sent.
-        let via_media = binary
-            && frame
-                .get("mediaChannel")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            && match &self.media_sink {
-                Some(s) => s.is_connected().await,
-                None => false,
-            };
+        //
+        // Kept as separate answers rather than one boolean. When a range does
+        // not arrive, *which* of them was false is the entire question, and a
+        // collapsed `via_media` cannot say.
+        let portal_wants_media = frame
+            .get("mediaChannel")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let media_connected = match &self.media_sink {
+            Some(s) => s.is_connected().await,
+            None => false,
+        };
+        let via_media = binary && portal_wants_media && media_connected;
+
+        // Taken before the bytes are framed and moved into the wire.
+        let payload_len = match &served {
+            Ok((bytes, _)) => bytes.len(),
+            Err(_) => 0,
+        };
+        let fits_peer = fits_the_data_channel(payload_len);
 
         let mut session = self.session.lock().await;
         // Destination is decided with the frame, not from the request. They
@@ -508,6 +519,12 @@ impl PortalGateway {
         };
         drop(session);
 
+        // Taken before the wire is moved into whichever sink takes it.
+        let framed_len = match &wire {
+            Wire::Binary(b) => b.len(),
+            Wire::Text(t) => t.len(),
+        };
+
         let sent = match route {
             Route::Peer => {
                 let bytes = match &wire {
@@ -528,7 +545,9 @@ impl PortalGateway {
             }
             _ => false,
         };
-        if !sent {
+        let delivered = if sent {
+            "peer"
+        } else {
             // `via_media` is the portal saying it is listening on the second
             // socket, and it governs here too. Falling back from the data
             // channel straight onto that socket ignored it: a portal whose
@@ -540,11 +559,45 @@ impl PortalGateway {
                 // Framed for the chat socket, so that is where it goes — an
                 // error reply among others, which is small, structured, and
                 // belongs on the socket guaranteed to be up.
-                (Route::Chat, _, _) => self.sink.send(wire).await,
-                (_, true, Some(media)) => media.send(wire).await,
-                _ => self.sink.send(wire).await,
+                (Route::Chat, _, _) => {
+                    self.sink.send(wire).await;
+                    "chat"
+                }
+                (_, true, Some(media)) => {
+                    media.send(wire).await;
+                    "media"
+                }
+                _ => {
+                    self.sink.send(wire).await;
+                    "chat"
+                }
             }
-        }
+        };
+
+        // Where the bytes actually went, and every answer that decided it.
+        //
+        // `asset range served` says a range was *read*, not that it was
+        // delivered, and the two have been confused before: every range logged
+        // as served while the player sat on an empty source and asked for the
+        // same four offsets again half a minute later. Read tells you the store
+        // worked. This tells you which socket the bytes were handed to, and —
+        // when they still do not arrive — which of the three conditions sent
+        // them there.
+        tracing::info!(
+            target: "remote",
+            id, offset,
+            payload = payload_len,
+            framed = framed_len,
+            binary,
+            route = ?route,
+            delivered,
+            peer_running = via_peer,
+            fits_peer,
+            peer_took_it = sent,
+            portal_wants_media,
+            media_connected,
+            "asset range routed"
+        );
     }
 
     /// Whether a peer connection is up and could take a range.

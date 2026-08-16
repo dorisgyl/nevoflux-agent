@@ -465,9 +465,32 @@ async fn serve_media(mut read: WsRead, sink: &WsSink) {
     loop {
         tokio::select! {
             item = read.next() => match item {
-                // Nothing is expected inbound, but anything arriving still
-                // proves the path is alive.
-                Some(Ok(_)) => last_inbound = Instant::now(),
+                // Anything arriving proves the path is alive. One kind of
+                // message says more than that.
+                Some(Ok(msg)) => {
+                    last_inbound = Instant::now();
+                    // The relay's presence notice — the only thing this socket
+                    // ever receives, and the only thing that says whether the
+                    // ranges written here reach anybody. Discarded, a portal
+                    // that never attached its second socket is indistinguishable
+                    // from one that did: the relay keeps nothing and says
+                    // nothing, so every range is logged as served and the player
+                    // spins on an empty source. The chat socket has read this
+                    // since the beginning; this one did not.
+                    if let Message::Text(text) = &msg {
+                        match super::relay_protocol::peer_count(text) {
+                            Some(0) => tracing::warn!(
+                                target: "remote",
+                                "nobody is attached to the media channel; ranges written there go nowhere"
+                            ),
+                            Some(n) => tracing::info!(
+                                target: "remote", peers = n,
+                                "the media channel has a listener"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
                 Some(Err(e)) => {
                     tracing::warn!(target: "remote", "media relay socket error: {e} - reconnecting");
                     return;
