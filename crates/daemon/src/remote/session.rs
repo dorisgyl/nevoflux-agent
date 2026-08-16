@@ -102,13 +102,40 @@ impl PortalSession {
     }
 
     /// Translate a chat `DaemonEnvelope` payload (an `AgentMessage` JSON) into
-    /// downlink wire frames: translate → seq-tag → encode. Non-chat / unparseable
-    /// payloads yield nothing.
-    pub fn on_chat(&mut self, payload: &Value) -> Vec<Wire> {
+    /// downlink wire frames: translate → repair → seq-tag → encode. Non-chat /
+    /// unparseable payloads yield nothing.
+    ///
+    /// `resolve` says what a `nevo-asset:` id in the body actually names. That
+    /// needs the asset store, which this layer must not see — so it arrives as
+    /// a closure, exactly as [`on_resume`](Self::on_resume)'s `read_media`
+    /// does, and the sans-IO property in the module header still holds.
+    ///
+    /// It happens here rather than inside the translator because here is the
+    /// last point before the text is sealed and sent, and the translator's
+    /// holdback has by now guaranteed that any reference in the delta is a
+    /// whole one.
+    pub fn on_chat(
+        &mut self,
+        payload: &Value,
+        resolve: &dyn Fn(&str) -> translate::RefFate,
+    ) -> Vec<Wire> {
         self.translator
             .downlink(payload)
             .into_iter()
-            .map(|frame| {
+            .map(|mut frame| {
+                if frame.get("kind").and_then(Value::as_str) == Some("stream_delta") {
+                    if let Some(delta) = frame.get("delta").and_then(Value::as_str) {
+                        let (repaired, changed) = translate::repair_asset_refs(delta, resolve);
+                        if changed > 0 {
+                            tracing::warn!(
+                                target: "remote",
+                                changed,
+                                "body referred to media the store does not hold"
+                            );
+                            frame["delta"] = Value::String(repaired);
+                        }
+                    }
+                }
                 let wire = self.sequencer.tag(frame);
                 self.encode(&wire)
             })
@@ -401,10 +428,17 @@ mod tests {
         json!({ "type": "stream_chunk", "payload": { "content": content, "done": done } })
     }
 
+    /// A resolver that takes every reference at its word — for the tests here,
+    /// which are about sequencing and encoding rather than what an id names.
+    /// The store-backed one lives in `portal_gateway`, with its own tests.
+    fn as_written() -> impl Fn(&str) -> translate::RefFate {
+        |_id: &str| translate::RefFate::Known
+    }
+
     #[test]
     fn plaintext_on_chat_emits_seq_tagged_wire_frames() {
         let mut s = PortalSession::new(None, None, None);
-        let out = s.on_chat(&chunk("hi", false));
+        let out = s.on_chat(&chunk("hi", false), &as_written());
         // stream_start (seq 0) then stream_delta (seq 1)
         assert_eq!(out.len(), 2);
         let m0: WireMessage = match &out[0] {
@@ -424,7 +458,7 @@ mod tests {
     fn e2e_on_chat_emits_binary_that_decodes_back() {
         let key = [7u8; 32];
         let mut s = PortalSession::new(Some(key), None, None);
-        let out = s.on_chat(&chunk("hi", false));
+        let out = s.on_chat(&chunk("hi", false), &as_written());
         assert!(matches!(out[0], Wire::Binary(_)), "E2E should be binary");
         // decode round-trips to the same WireMessage.
         let decoded = s.decode(&out[1]).unwrap();
@@ -467,15 +501,15 @@ mod tests {
     #[test]
     fn on_resume_resends_buffered_tail() {
         let mut s = PortalSession::new(None, None, None);
-        s.on_chat(&chunk("a", false)); // seq 0 (start) + 1 (delta)
-        s.on_chat(&chunk("", true)); // seq 2 (end)
+        s.on_chat(&chunk("a", false), &as_written()); // seq 0 (start) + 1 (delta)
+        s.on_chat(&chunk("", true), &as_written()); // seq 2 (end)
         assert_eq!(seqs_of(&s.on_resume(1, no_media)), vec![1, 2]);
     }
 
     #[test]
     fn a_resume_across_media_rebuilds_it_from_the_store() {
         let mut s = PortalSession::new(None, None, None);
-        s.on_chat(&chunk("a", false)); // seq 0, 1
+        s.on_chat(&chunk("a", false), &as_written()); // seq 0, 1
         s.downlink_frame(super::super::asset::data_frame(
             "asset-1",
             4096,
@@ -590,7 +624,7 @@ mod tests {
     #[test]
     fn a_resume_replays_a_binary_range_as_binary() {
         let mut s = PortalSession::new(None, None, None);
-        s.on_chat(&chunk("a", false)); // seq 0, 1
+        s.on_chat(&chunk("a", false), &as_written()); // seq 0, 1
         s.downlink_media("asset-1", 2048, &[5u8; 300], false); // seq 2
 
         let wires = s.on_resume(2, |id, offset, len| {
@@ -616,7 +650,7 @@ mod tests {
         // An adopted file can be deleted mid-session. Skipping the frame would
         // leave a hole the portal's in-order tracker waits on forever.
         let mut s = PortalSession::new(None, None, None);
-        s.on_chat(&chunk("a", false));
+        s.on_chat(&chunk("a", false), &as_written());
         s.downlink_frame(super::super::asset::data_frame(
             "gone", 0, &[1u8; 10], false,
         ));

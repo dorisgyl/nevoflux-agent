@@ -64,6 +64,13 @@ pub struct PortalGateway {
     /// Asset ids already announced, so a reference repeated across deltas does
     /// not announce the same media twice.
     announced: Mutex<std::collections::HashSet<String>>,
+    /// What the turn currently open has already put on the wire.
+    ///
+    /// Scoped to the turn on purpose. It is the candidate set for repairing a
+    /// body reference that names nothing, and a broken reference must only ever
+    /// be pointed at media the same reply produced — hanging it on the previous
+    /// message's picture would be a different wrong answer, not a fix.
+    turn_assets: Mutex<TurnAssets>,
     /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
     push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
     /// Which path this session's media takes, and whether a peer connection is
@@ -125,6 +132,13 @@ const REOFFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "webrtc")]
 const MAX_UNANSWERED_OFFERS: u32 = 5;
 
+/// Media announced under the turn currently open, and which turn that is.
+#[derive(Default)]
+struct TurnAssets {
+    stream: String,
+    ids: Vec<String>,
+}
+
 /// The upload ids a frame declares. A non-string entry is skipped rather than
 /// failing the whole message.
 fn upload_ids(frame: &serde_json::Value) -> Vec<String> {
@@ -168,6 +182,7 @@ impl PortalGateway {
                 ASSET_QUOTA_BYTES,
             ),
             announced: Mutex::new(std::collections::HashSet::new()),
+            turn_assets: Mutex::new(TurnAssets::default()),
             push_rx: Mutex::new(Some(super::push::register(&session_ref))),
             rtc: Arc::new(super::rtc::RtcState::new()),
             ice_servers: Vec::new(),
@@ -294,20 +309,45 @@ impl PortalGateway {
         Some(id)
     }
 
-    /// Announce any media the outgoing text refers to.
+    /// What this turn has produced that a body reference naming nothing could
+    /// have meant.
+    ///
+    /// Two sources, because neither is complete on its own. `pending` holds
+    /// media stored but not yet announced — a tool that finished while the
+    /// reply was being written — and the turn's first announcement empties it.
+    /// `turn_assets` holds what that announcement took. Between them they cover
+    /// the whole turn, whichever side of the announcement the text falls on.
+    async fn turn_candidates(&self) -> Vec<String> {
+        let stream = self.session.lock().await.current_stream_id();
+        let mut out = {
+            let turn = self.turn_assets.lock().await;
+            if turn.stream == stream {
+                turn.ids.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        for id in self.assets.lock().expect("asset store").pending_ids() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Announce any media this turn holds, and anything the text refers to.
     ///
     /// The head writes `![alt](nevo-asset:<id>)` — the reference says *where*
     /// to draw; this frame says *what* to draw, and the player needs the mime
     /// type and the size before it can ask for a single byte. Announced once
     /// per id: a reference split across deltas must not announce twice.
-    async fn announce_referenced(&self, payload: &serde_json::Value) {
-        let Some(text) = payload
-            .get("payload")
-            .and_then(|p| p.get("content"))
-            .and_then(|c| c.as_str())
-        else {
-            return;
-        };
+    ///
+    /// `named` comes from the repair pass in `on_chat`, so every id in it has
+    /// already been matched against the store and is whole. Scanning the raw
+    /// payload here instead was scanning a *delta*: a reference split mid-id
+    /// yielded a truncated one, and this warned about media nobody had asked
+    /// for.
+    async fn announce_referenced(&self, named: &[String]) {
         // Everything stored since the last turn, plus anything the text names.
         // The stored ones are what make a picture appear at all; the named ones
         // are usually the same offers and are deduped below.
@@ -315,9 +355,9 @@ impl PortalGateway {
             .into_iter()
             .map(|o| o.id)
             .collect();
-        for id in super::translate::asset_refs(text) {
-            if !ids.contains(&id) {
-                ids.push(id);
+        for id in named {
+            if !ids.contains(id) {
+                ids.push(id.clone());
             }
         }
         for id in ids {
@@ -340,11 +380,22 @@ impl PortalGateway {
             );
             let frame = serde_json::json!({
                 "kind": "asset",
-                "streamId": stream,
+                "streamId": stream.clone(),
                 "asset": offer,
             });
             let wire = self.session.lock().await.downlink_frame(frame);
             self.sink.send(wire).await;
+            // Recorded after it is on the wire, so the candidate set never
+            // offers to repair a reference towards media the portal has not
+            // been told about.
+            {
+                let mut turn = self.turn_assets.lock().await;
+                if turn.stream != stream {
+                    turn.stream = stream;
+                    turn.ids.clear();
+                }
+                turn.ids.push(id);
+            }
         }
     }
 
@@ -1006,11 +1057,42 @@ impl RemoteGateway for PortalGateway {
                 "gateway.project: type={:?}",
                 env.payload.get("type").and_then(|v| v.as_str())
             );
+            // What a `nevo-asset:` id in the body actually names. Built here
+            // because this is the layer that owns the store, and before the
+            // session lock so the store is never held underneath it.
+            //
+            // The id is the one part of this path a model types by hand, and it
+            // was the one part nothing checked: a reference to media that does
+            // not exist is well-formed by construction, so the portal drew a
+            // player at an id it had never been offered and every range came
+            // back 404.
+            let candidates = std::sync::Mutex::new(self.turn_candidates().await);
+            let named = std::sync::Mutex::new(Vec::<String>::new());
+            let assets = std::sync::Arc::clone(&self.assets);
+            let resolve = |id: &str| -> super::translate::RefFate {
+                let mut unclaimed = candidates.lock().expect("ref candidates");
+                if assets.lock().expect("asset store").contains(id) {
+                    // A reference that is right spends what it names, so what
+                    // is left is only what a wrong one could still have meant.
+                    unclaimed.retain(|c| c != id);
+                    named.lock().expect("named refs").push(id.to_string());
+                    return super::translate::RefFate::Known;
+                }
+                if unclaimed.len() == 1 {
+                    return super::translate::RefFate::Rewrite(unclaimed.remove(0));
+                }
+                // Nothing to mean, or a choice between two — and putting the
+                // wrong picture in the reader's message is worse than putting
+                // none, which is all a drop costs: the media still arrives by
+                // announcement.
+                super::translate::RefFate::Drop
+            };
             let (wires, open) = {
                 let mut session = self.session.lock().await;
-                let wires = session.on_chat(&env.payload);
+                let wires = session.on_chat(&env.payload, &resolve);
                 (wires, session.open_stream_id())
             };
+            let named = named.into_inner().expect("named refs");
             // So a tool starting during this turn can stamp what it makes
             // later with the turn that asked for it.
             super::push::set_stream(&self.session_id, open.as_deref());
@@ -1028,7 +1110,7 @@ impl RemoteGateway for PortalGateway {
             // request that asked for it. Ordering also matters to the reader:
             // the message an asset belongs to has to have been started before
             // anything can be hung off it.
-            self.announce_referenced(&env.payload).await;
+            self.announce_referenced(&named).await;
         }
     }
 }
@@ -1321,6 +1403,147 @@ mod tests {
             store.put(&[7u8; 4096], "clip.mp4", "video/mp4").unwrap().id
         };
         (gw, chat, id, dir)
+    }
+
+    /// The body as the phone would reassemble it, out of a plaintext sink.
+    async fn delta_text(sink: &CollectSink) -> String {
+        sink.sent
+            .lock()
+            .await
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<serde_json::Value>(t).ok(),
+                _ => None,
+            })
+            .filter(|f| f["frame"]["kind"] == "stream_delta")
+            .filter_map(|f| f["frame"]["delta"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// A gateway with one piece of media stored and not yet announced — the
+    /// state a turn is in when a tool has run and the head is writing.
+    async fn gateway_mid_turn(
+        session: &str,
+    ) -> (PortalGateway, Arc<CollectSink>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), session, None, None, session)
+            .with_asset_root(dir.path().to_path_buf());
+        let id = {
+            let mut store = gw.assets.lock().expect("asset store");
+            store.put(&[7u8; 64], "clip.mp4", "video/mp4").unwrap().id
+        };
+        (gw, sink, id, dir)
+    }
+
+    #[tokio::test]
+    async fn a_body_id_the_store_never_minted_is_pointed_at_what_the_turn_made() {
+        // The reported defect. The store held 073340af…, the daemon announced
+        // it and served four ranges — and the head wrote a UUID of its own, so
+        // the page drew a second player at an id the portal had never been
+        // offered and answered it 404 eleven times.
+        let (gw, sink, real, _d) = gateway_mid_turn("sess-invented").await;
+
+        gw.project(&OutboundEvent::Chat(chat_env_for(
+            "sess-invented",
+            "看这个 ![clip.mp4](nevo-asset:1f2a9b3e-8c4d-4e5f-9a1b-7c6d5e4f3a2b) 就是它",
+            false,
+        )))
+        .await;
+
+        let body = delta_text(&sink).await;
+        assert!(
+            !body.contains("1f2a9b3e"),
+            "an id nothing minted reached the phone: {body}"
+        );
+        assert!(
+            body.contains(&format!("nevo-asset:{real}")),
+            "the one thing the turn made is what it meant: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_id_with_nothing_to_mean_leaves_the_words_and_takes_the_player() {
+        // No media this turn, so there is nothing the reference could have
+        // been. A player pointed at nothing is worse than no player: it asks
+        // for a range that cannot be answered and never stops asking.
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess-empty", None, None, "sess-empty");
+
+        gw.project(&OutboundEvent::Chat(chat_env_for(
+            "sess-empty",
+            "这是结果：![截图](nevo-asset:deadbeef-0000-4000-8000-000000000000) 请看。",
+            false,
+        )))
+        .await;
+
+        let body = delta_text(&sink).await;
+        assert_eq!(body, "这是结果：截图 请看。");
+    }
+
+    #[tokio::test]
+    async fn a_body_id_the_store_holds_is_left_exactly_as_the_head_wrote_it() {
+        // The path that already worked, and the one this must not disturb.
+        let (gw, sink, real, _d) = gateway_mid_turn("sess-correct").await;
+
+        gw.project(&OutboundEvent::Chat(chat_env_for(
+            "sess-correct",
+            &format!("好了 ![clip.mp4](nevo-asset:{real}) 完成"),
+            false,
+        )))
+        .await;
+
+        assert_eq!(
+            delta_text(&sink).await,
+            format!("好了 ![clip.mp4](nevo-asset:{real}) 完成")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_split_across_deltas_is_repaired_as_one_piece() {
+        // Deltas break anywhere. Repairing half a reference would leave the
+        // other half on the wire, so the whole image has to be held until it
+        // closes — which is also what stopped the scan reading a truncated id.
+        let (gw, sink, real, _d) = gateway_mid_turn("sess-split").await;
+
+        for piece in [
+            "看这个 ![clip",
+            "](nevo-asset:1f2a9b3e-8c4d",
+            "-4e5f-9a1b-7c6d5e4f3a2b)",
+        ] {
+            gw.project(&OutboundEvent::Chat(chat_env_for(
+                "sess-split",
+                piece,
+                false,
+            )))
+            .await;
+        }
+        gw.project(&OutboundEvent::Chat(chat_env_for("sess-split", "", true)))
+            .await;
+
+        let body = delta_text(&sink).await;
+        assert!(!body.contains("1f2a9b3e"), "{body}");
+        assert_eq!(body, format!("看这个 ![clip](nevo-asset:{real})"));
+    }
+
+    #[tokio::test]
+    async fn two_pieces_of_media_are_never_guessed_between() {
+        // With a choice, repairing would be picking one — and putting the
+        // wrong picture in the reader's message is not a repair.
+        let (gw, sink, _first, _d) = gateway_mid_turn("sess-two").await;
+        {
+            let mut store = gw.assets.lock().expect("asset store");
+            store.put(&[8u8; 64], "other.mp4", "video/mp4").unwrap();
+        }
+
+        gw.project(&OutboundEvent::Chat(chat_env_for(
+            "sess-two",
+            "看 ![a](nevo-asset:1f2a9b3e-8c4d-4e5f-9a1b-7c6d5e4f3a2b) 好",
+            false,
+        )))
+        .await;
+
+        assert_eq!(delta_text(&sink).await, "看 a 好");
     }
 
     fn pull(id: &str, binary: bool, media_channel: bool) -> serde_json::Value {

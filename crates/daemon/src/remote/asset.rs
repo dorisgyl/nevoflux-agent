@@ -334,6 +334,16 @@ impl AssetStore {
         std::mem::take(&mut self.pending)
     }
 
+    /// What is stored but not yet announced, without taking it.
+    ///
+    /// [`take_pending`](Self::take_pending) is the announcement path and has to
+    /// empty the list. This is for asking what the turn has produced while it
+    /// is still being written — which is what a body reference naming nothing
+    /// could have meant.
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.pending.iter().map(|o| o.id.clone()).collect()
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.assets.contains_key(id)
     }
