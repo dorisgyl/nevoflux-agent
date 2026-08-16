@@ -39,7 +39,31 @@ pub const MAX_ADOPTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The most one `asset_data` frame may carry, in source bytes. Base64 inflates
 /// by a third — 342 KB — which stays under the relay's ~900 KB frame ceiling
 /// with room for the envelope. Matches the phone's upload chunking.
+///
+/// A ceiling on what a pull may ask for, not a plan. What the portal should
+/// *plan* on is [`PLAN_CHUNK_BYTES`], which it is told; serving less than was
+/// asked is what this must never do.
 pub const CHUNK_BYTES: usize = 256 * 1024;
+
+/// The range size a head with a peer connection asks the portal to plan on.
+///
+/// The largest payload that still fits a WebRTC data channel message once it is
+/// framed and sealed — see `portal_gateway::fits_the_data_channel`, which a test
+/// there pins against this so neither can drift alone.
+///
+/// [`CHUNK_BYTES`] is over that limit by construction: SCTP messages are
+/// commonly negotiated at 256 KiB and a full range is exactly that before its
+/// header and tag. So every range fell back to the relay, and a peer connection
+/// that had been negotiated, connected and reported as carrying media carried
+/// none of it.
+///
+/// The cost is more ranges for the same file — about four in five of the
+/// former size — which is paid on the relay path and refunded on the peer one,
+/// where the bytes stop being billed at all. Only offered where there is a peer
+/// path to use: without the `webrtc` feature there is no data channel, and
+/// nothing to buy with the extra requests.
+#[cfg(feature = "webrtc")]
+pub const PLAN_CHUNK_BYTES: usize = 188 * 1024;
 
 /// The downlink frame carrying one range of an asset.
 ///
@@ -100,6 +124,30 @@ pub struct AssetOffer {
     /// and nothing else, so absence costs only the label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub of: Option<u32>,
+    /// How large a range to ask for. See [`PLAN_CHUNK_BYTES`].
+    ///
+    /// The two ends used to hold this as a constant apiece, which is a contract
+    /// only while they agree — and they stopped agreeing the moment a range had
+    /// to fit a data channel. Absent means this head has no preference and the
+    /// portal's own default stands, which is what a portal that predates the
+    /// field does anyway.
+    #[serde(rename = "chunkBytes", skip_serializing_if = "Option::is_none")]
+    pub chunk_bytes: Option<usize>,
+}
+
+/// What to tell the portal to plan on, if anything.
+///
+/// `None` without the `webrtc` feature: no data channel exists to fit a range
+/// into, so asking for smaller ranges would buy nothing and cost requests.
+fn plan_chunk() -> Option<usize> {
+    #[cfg(feature = "webrtc")]
+    {
+        Some(PLAN_CHUNK_BYTES)
+    }
+    #[cfg(not(feature = "webrtc"))]
+    {
+        None
+    }
 }
 
 struct Asset {
@@ -217,6 +265,7 @@ impl AssetStore {
             group: None,
             seq: None,
             of: None,
+            chunk_bytes: plan_chunk(),
         };
         self.pending.push(offer.clone());
         self.assets.insert(
@@ -290,6 +339,7 @@ impl AssetStore {
             group: group.or_else(|| seq.map(|_| id.clone())),
             seq,
             of,
+            chunk_bytes: plan_chunk(),
         };
         self.used += size;
         // An ungrouped asset waits for the next outgoing text to be announced.
@@ -325,6 +375,7 @@ impl AssetStore {
             group: a.group.clone(),
             seq: a.seq,
             of: a.of,
+            chunk_bytes: plan_chunk(),
         })
     }
 

@@ -1048,9 +1048,31 @@ const PEER_FRAME_LIMIT: usize = 192 * 1024;
 
 /// Whether a range of `payload` bytes will fit in a data channel message once
 /// it is framed. The allowance covers the frame header and the AEAD tag.
-fn fits_the_data_channel(payload: usize) -> bool {
+const fn fits_the_data_channel(payload: usize) -> bool {
     payload.saturating_add(4096) <= PEER_FRAME_LIMIT
 }
+
+/// What the store advertises has to be something this will actually take.
+///
+/// The two constants live apart — one is what the portal is told to plan on,
+/// the other is what the send path will carry — and they only mean anything
+/// together. Drifted, every range falls back to the relay in silence while a
+/// peer connection sits there negotiated, connected, and reported as carrying
+/// media. That is precisely what they did, for as long as nothing checked.
+///
+/// A compile error rather than a failing test, because a build that cannot
+/// honour this should not exist.
+#[cfg(feature = "webrtc")]
+const _: () = {
+    assert!(
+        fits_the_data_channel(super::asset::PLAN_CHUNK_BYTES),
+        "the advertised chunk must fit the data channel, or the peer path carries nothing"
+    );
+    assert!(
+        super::asset::PLAN_CHUNK_BYTES < super::asset::CHUNK_BYTES,
+        "advertising the portal's own default would cost a field and buy nothing"
+    );
+};
 
 /// Where a served range is written.
 ///
@@ -1597,6 +1619,31 @@ mod tests {
         .await;
 
         assert_eq!(delta_text(&sink).await, "看 a 好");
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_offer_tells_the_portal_what_to_plan_on() {
+        // Without it the portal plans on its own constant, which is a full
+        // 256 KiB — over the data channel's message limit once framed, so every
+        // range of every video took the relay while the peer connection it had
+        // just finished negotiating carried nothing at all.
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess-chunk", None, None, "chan-chunk")
+            .with_asset_root(dir.path().to_path_buf());
+        let offer = {
+            let mut store = gw.assets.lock().expect("asset store");
+            store.put(&[1u8; 32], "clip.mp4", "video/mp4").unwrap()
+        };
+
+        assert_eq!(
+            offer.chunk_bytes,
+            Some(super::super::asset::PLAN_CHUNK_BYTES)
+        );
+        // On the wire under the name the portal reads it by.
+        let json = serde_json::to_value(&offer).unwrap();
+        assert_eq!(json["chunkBytes"], super::super::asset::PLAN_CHUNK_BYTES);
     }
 
     fn pull(id: &str, binary: bool, media_channel: bool) -> serde_json::Value {
