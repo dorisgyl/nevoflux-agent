@@ -75,6 +75,10 @@ impl Default for WsSink {
 
 #[async_trait]
 impl WireSink for WsSink {
+    async fn is_connected(&self) -> bool {
+        self.write.lock().await.is_some()
+    }
+
     async fn send(&self, wire: Wire) {
         let msg = wire_to_message(wire);
         let mut guard = self.write.lock().await;
@@ -142,6 +146,18 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Consecutive failures before the gateway is taken out of the registry.
 const UNREGISTER_AFTER: u32 = 8;
 
+/// How long a socket must last before reconnecting counts as starting over.
+///
+/// Connecting is not succeeding. A relay that accepts the upgrade and drops the
+/// socket at once satisfies every check this loop used to make, so the failure
+/// count went back to zero on every attempt and the wait never grew past its
+/// first step. Two sockets redialling every four seconds, for as long as the
+/// process lived: forty-three thousand connections a day against a daily
+/// allowance of a hundred thousand, with the machine otherwise idle. Found by
+/// tailing the relay after every client had supposedly been shut down and
+/// watching the pairs arrive on a metronome.
+const STABLE_CONNECTION: Duration = Duration::from_secs(5);
+
 /// What to do after one failed attempt.
 #[derive(Debug, PartialEq, Eq)]
 struct Step {
@@ -191,9 +207,21 @@ impl ReconnectPolicy {
 
     /// Account for a connection that came up. Returns whether the gateway has
     /// to be put back into the registry.
+    ///
+    /// Deliberately leaves the failure count alone: coming up is not the same
+    /// as working, and clearing it here is what let a flap run at full speed
+    /// forever. [`Self::on_stable`] is what a connection has to earn.
+    ///
+    /// Re-registering still belongs here — a socket that is up should carry
+    /// frames immediately, and a channel that turns out to be flapping detaches
+    /// again on its own.
     fn on_connected(&mut self) -> bool {
-        self.failures = 0;
         std::mem::take(&mut self.detached)
+    }
+
+    /// Account for a connection that lasted; see [`STABLE_CONNECTION`].
+    fn on_stable(&mut self) {
+        self.failures = 0;
     }
 }
 
@@ -252,11 +280,32 @@ pub async fn run_gateway(
                 let (write, read) = ws.split();
                 sink.set(write).await;
                 // Tell the portal what this head is set to, before any chat.
+                // Repeated when the relay says someone arrived, because this
+                // one goes nowhere if the channel is still empty.
                 gateway.announce().await;
+                // No offer here. The relay keeps nothing for a channel with no
+                // one attached, so an offer made now reaches whoever happens to
+                // be watching at this instant and nobody else — and a portal
+                // opened a second later would wait forever for one that had
+                // already been thrown away. The relay tells this end when a
+                // portal is there, on joining and on arrival; that is what
+                // triggers the offer, in `on_wire_in`.
+                let up = Instant::now();
                 serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
                 sink.clear().await;
-                // A dropped socket is not a failed attempt; reconnect promptly.
-                tokio::time::sleep(BASE_BACKOFF).await;
+                let lasted = up.elapsed();
+                if lasted >= STABLE_CONNECTION {
+                    // It did its job; a drop now is not the last one's fault.
+                    policy.on_stable();
+                    tokio::time::sleep(BASE_BACKOFF).await;
+                } else {
+                    tracing::warn!(
+                        target: "remote",
+                        lasted_ms = lasted.as_millis() as u64,
+                        "the relay took this socket and dropped it; backing off"
+                    );
+                    back_off(&mut policy, &registry, &gateway_id).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(target: "remote", "relay connect failed: {e}");
@@ -278,7 +327,7 @@ pub async fn run_gateway(
 async fn serve(
     mut read: WsRead,
     sink: &WsSink,
-    gateway: &PortalGateway,
+    gateway: &Arc<PortalGateway>,
     session_id: &str,
     injector: &dyn Injector,
 ) {
@@ -315,6 +364,147 @@ async fn serve(
                     tracing::warn!(
                         target: "remote",
                         "relay silent for {SILENT_DEADLINE:?} - assuming a dead socket, reconnecting"
+                    );
+                    return;
+                }
+                Liveness::Ping => sink.ping().await,
+            },
+        }
+    }
+}
+
+/// The relay channel that carries this session's media.
+///
+/// A sibling of the chat channel rather than the same one. The relay routes by
+/// name, so a distinct name is a distinct Durable Object and a genuinely
+/// separate socket — which is the whole point: a 256 KB range on the chat
+/// socket sits in front of every token behind it, and a reply that takes a
+/// quarter of a second to clear is a quarter of a second the answer is not
+/// being typed.
+pub fn media_channel_of(channel_id: &str) -> String {
+    format!("{channel_id}-m")
+}
+
+/// Keep this session's media socket dialled.
+///
+/// Send-only from here. The portal asks for ranges on the chat socket, where
+/// the request is a few dozen bytes and blocks nothing; only the answers come
+/// back this way. So there is no read loop to run — inbound frames are drained
+/// and dropped, which is what keeps the keepalive's pongs from piling up.
+///
+/// Never gives up, for the same reason [`run_gateway`] does not: a media socket
+/// that retired itself over a lunch break would leave the session permanently
+/// unable to show a picture, with nothing in the logs to say why.
+pub async fn run_media_socket(
+    relay_base: &str,
+    channel_id: &str,
+    account_base: String,
+    account_token: String,
+    sink: Arc<WsSink>,
+) {
+    let channel = media_channel_of(channel_id);
+    let mut policy = ReconnectPolicy::new();
+
+    loop {
+        let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "remote", "mint media relay JWT failed: {e}");
+                tokio::time::sleep(policy.on_failure().wait).await;
+                continue;
+            }
+        };
+        let url = format!("{relay_base}/?c={channel}&t={token}");
+
+        match connect_async(url.as_str()).await {
+            Ok((ws, _resp)) => {
+                tracing::info!(target: "remote", "media relay connected (channel {channel})");
+                policy.on_connected();
+                let (write, read) = ws.split();
+                sink.set(write).await;
+                let up = Instant::now();
+                serve_media(read, &sink).await;
+                // Clearing the write half is what makes `is_connected` false, so
+                // the next range falls back to the chat socket rather than being
+                // written into a socket that leads nowhere.
+                sink.clear().await;
+                let lasted = up.elapsed();
+                if lasted >= STABLE_CONNECTION {
+                    policy.on_stable();
+                    tokio::time::sleep(BASE_BACKOFF).await;
+                } else {
+                    tracing::warn!(
+                        target: "remote",
+                        lasted_ms = lasted.as_millis() as u64,
+                        "the relay took this media socket and dropped it; backing off"
+                    );
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "remote", "media relay connect failed: {e}");
+                tokio::time::sleep(policy.on_failure().wait).await;
+            }
+        }
+    }
+}
+
+/// Pump one connected media socket until it stops leading anywhere.
+///
+/// Same silence deadline as the chat socket: a NAT that drops an idle flow
+/// sends no FIN, so only the absence of traffic gives it away. A media socket
+/// is idle far more often than a chat one, which makes the keepalive the only
+/// thing standing between it and a half-open socket nobody notices until the
+/// next picture fails to arrive.
+async fn serve_media(mut read: WsRead, sink: &WsSink) {
+    let mut last_inbound = Instant::now();
+    let mut ticker = tokio::time::interval(PING_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            item = read.next() => match item {
+                // Anything arriving proves the path is alive. One kind of
+                // message says more than that.
+                Some(Ok(msg)) => {
+                    last_inbound = Instant::now();
+                    // The relay's presence notice — the only thing this socket
+                    // ever receives, and the only thing that says whether the
+                    // ranges written here reach anybody. Discarded, a portal
+                    // that never attached its second socket is indistinguishable
+                    // from one that did: the relay keeps nothing and says
+                    // nothing, so every range is logged as served and the player
+                    // spins on an empty source. The chat socket has read this
+                    // since the beginning; this one did not.
+                    if let Message::Text(text) = &msg {
+                        match super::relay_protocol::peer_count(text) {
+                            Some(0) => tracing::warn!(
+                                target: "remote",
+                                "nobody is attached to the media channel; ranges written there go nowhere"
+                            ),
+                            Some(n) => tracing::info!(
+                                target: "remote", peers = n,
+                                "the media channel has a listener"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(target: "remote", "media relay socket error: {e} - reconnecting");
+                    return;
+                }
+                None => {
+                    tracing::warn!(target: "remote", "media relay disconnected - reconnecting");
+                    return;
+                }
+            },
+            _ = ticker.tick() => match assess(last_inbound.elapsed()) {
+                Liveness::Dead => {
+                    tracing::warn!(
+                        target: "remote",
+                        "media relay silent for {SILENT_DEADLINE:?} - reconnecting"
                     );
                     return;
                 }
@@ -457,13 +647,41 @@ mod tests {
     }
 
     #[test]
-    fn coming_back_resets_the_backoff() {
+    fn a_connection_that_lasted_resets_the_backoff() {
+        let mut p = ReconnectPolicy::new();
+        for _ in 0..6 {
+            p.on_failure();
+        }
+        p.on_stable();
+        assert_eq!(p.on_failure().wait, BASE_BACKOFF);
+    }
+
+    #[test]
+    fn merely_coming_up_does_not() {
+        // This assertion used to read the other way, and the behaviour it
+        // described is what kept two sockets redialling every four seconds
+        // with nobody using them. A relay that accepts the upgrade and drops
+        // the socket satisfies `on_connected` every single time, so the count
+        // never grew and the wait never left its first step. Only lasting
+        // counts; see `STABLE_CONNECTION`.
         let mut p = ReconnectPolicy::new();
         for _ in 0..6 {
             p.on_failure();
         }
         p.on_connected();
-        assert_eq!(p.on_failure().wait, BASE_BACKOFF);
+        assert!(p.on_failure().wait > BASE_BACKOFF);
+    }
+
+    #[test]
+    fn a_flap_still_gets_the_gateway_back_into_the_registry() {
+        // Not resetting the backoff must not cost the re-registration: a socket
+        // that is up should carry frames at once, and one that turns out to be
+        // flapping detaches again on its own.
+        let mut p = ReconnectPolicy::new();
+        for _ in 0..UNREGISTER_AFTER {
+            p.on_failure();
+        }
+        assert!(p.on_connected(), "detached gateway must be re-registered");
     }
 
     #[test]

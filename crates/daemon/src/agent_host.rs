@@ -5389,6 +5389,77 @@ impl HostFunctions for DaemonHostFunctions {
             .map_err(|message| HostError { code: 4, message })
     }
 
+    #[cfg(feature = "webrtc")]
+    fn screencast_start(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        let session = self.session_id.as_deref().ok_or_else(|| HostError {
+            code: 4,
+            message: "screencast_start: nobody is watching this session".into(),
+        })?;
+
+        // Asked before the encoder starts, and named as what it is. Recording a
+        // screen is not something to slip past someone inside a tool that says
+        // it is doing something else.
+        self.check_tool_permission("screen_record", "share this screen live")?;
+
+        let ffmpeg = crate::canvas_video::ffmpeg::resolve_ffmpeg().map_err(|e| HostError {
+            code: 4,
+            message: format!("screencast_start: no ffmpeg to capture with: {e}"),
+        })?;
+        let fps = request.get("fps").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+        let bitrate = request
+            .get("bitrate_bps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4_000_000) as u32;
+
+        // The host runs on a blocking worker; `block_in_place` is how the rest
+        // of this file reaches async work from here.
+        let started = tokio::task::block_in_place(|| {
+            Handle::current().block_on(async {
+                crate::remote::screencast::start(session, &ffmpeg, fps, bitrate).await
+            })
+        });
+        match started {
+            Ok(s) => serde_json::to_value(&s).map_err(|e| HostError {
+                code: 4,
+                message: format!("serialize screencast_start response: {e}"),
+            }),
+            Err(message) => Err(HostError { code: 4, message }),
+        }
+    }
+
+    #[cfg(feature = "webrtc")]
+    fn screencast_stop(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        let session = self.session_id.as_deref().ok_or_else(|| HostError {
+            code: 4,
+            message: "screencast_stop: nobody is watching this session".into(),
+        })?;
+        // Not permission-gated. Stopping is always the safe direction, and a
+        // prompt in front of it is a prompt in front of someone withdrawing
+        // consent.
+        tokio::task::block_in_place(|| {
+            Handle::current().block_on(async { crate::remote::screencast::stop(session).await })
+        })
+        .map(|()| serde_json::json!({ "stopped": true }))
+        .map_err(|message| HostError { code: 4, message })
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    fn screencast_start(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "this build has no peer-to-peer transport, so it cannot                       share a screen. The relay path carries files and pictures                       but not a live stream."
+                .into(),
+        })
+    }
+
+    #[cfg(not(feature = "webrtc"))]
+    fn screencast_stop(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "this build has no peer-to-peer transport".into(),
+        })
+    }
+
     fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::SynthesizeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {

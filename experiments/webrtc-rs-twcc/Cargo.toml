@@ -1,0 +1,36 @@
+# Standalone on purpose. `webrtc` pulls ~250 crates, and none of them belong in
+# the daemon's build graph while this is still an evaluation.
+[workspace]
+
+[package]
+name = "webrtc-rs-twcc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+webrtc = "0.20.2"
+rtc = "0.20.2"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+bytes = "1"
+anyhow = "1"
+
+[profile.dev]
+# Linking the full webrtc stack with fat debug info exhausts the linker on
+# 16 GB Windows boxes (LNK1102).
+debug = 0
+
+[profile.release]
+debug = 0
+
+# rtc-mdns 0.20.2 calls `Ipv4Addr::from_octets`, still unstable behind `ip_from`
+# (rust#131360), so the dependency does not build on stable. `setup.sh` vendors a
+# copy with the one-line stable equivalent into the path below.
+#
+# The stanza is always active and `vendor/` is not committed, so building before
+# running setup.sh fails on a missing path. That is deliberate: a loud missing
+# directory beats quietly resolving to the unpatched crate and failing later
+# inside someone else's source.
+[patch.crates-io]
+rtc-mdns = { path = "vendor/rtc-mdns" }

@@ -1,0 +1,39 @@
+[package]
+name = "nevoflux-rtc-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebRTC transport for NevoFlux remote sessions: signalling, peer connection, data channel"
+
+[dependencies]
+# Sans-IO WebRTC. Chosen over webrtc-rs because it ships a working, test-covered
+# GCC bandwidth estimator and a pacer; see experiments/str0m-bwe/README.md.
+str0m = { version = "0.22", default-features = false, features = ["aws-lc-rs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hmac = "0.12"
+sha1 = "0.10"
+md5 = "0.7"
+
+[features]
+# The socket-owning event loop. Off by default so the protocol logic can be
+# depended on without pulling a runtime in with it.
+tokio-driver = ["dep:tokio"]
+
+[dependencies.tokio]
+workspace = true
+# `process` and `io-util` are for the capture child process. Without them
+# the library only builds when a dev-dependency happens to unify
+# tokio's features in — which the test build did, hiding this.
+features = ["net", "time", "sync", "rt", "macros", "process", "io-util"]
+optional = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+# So the ignored live tests can show what the transport decided; a TURN
+# failure is a decision (wrong nonce, refused channel) and not a panic.
+tracing-subscriber = { workspace = true }
+

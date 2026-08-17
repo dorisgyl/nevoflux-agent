@@ -25,8 +25,13 @@ members = [
     "crates/computer",
     "crates/builtin-wasm",
     "crates/tts",
+    "crates/rtc-transport",
     "crates/asr",
 ]
+# Evaluation harnesses (see experiments/README.md). Excluded rather than left
+# unlisted so the intent is on the record: they pull dependency trees that must
+# not reach the daemon's build graph.
+exclude = ["experiments"]
 
 [workspace.package]
 version = "0.3.15"
@@ -102,6 +107,11 @@ default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-
 embedding = ["nevoflux-daemon/embedding"]
 # Local Kokoro speech, forwarded to nevoflux-daemon.
 tts-local = ["nevoflux-daemon/tts-local"]
+# Peer-to-peer transport for remote sessions, forwarded to nevoflux-daemon.
+# Off by default: str0m pulls ~100 crates and the path is not proven on real
+# networks yet. Without it every range takes the relay, as it does today.
+#   cargo build --features webrtc
+webrtc = ["nevoflux-daemon/webrtc"]
 # Local SenseVoice transcription, forwarded to nevoflux-daemon.
 asr-sensevoice = ["nevoflux-daemon/asr-sensevoice"]
 # Whisper via Candle, forwarded to nevoflux-daemon. On by default; the

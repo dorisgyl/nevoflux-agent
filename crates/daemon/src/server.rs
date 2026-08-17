@@ -8254,6 +8254,16 @@ async fn handle_chat_message(
                                 mode,
                                 execution_tier: Some(execution_tier),
                                 injector_proxy_id: _proxy_id.clone(),
+                                // Read per attempt rather than cached at
+                                // startup, so editing config.toml and pairing
+                                // again picks up a new STUN server without a
+                                // daemon restart.
+                                ice_servers: crate::config::AgentConfig::load()
+                                    .map(|c| c.remote_control.ice_servers)
+                                    .unwrap_or_default(),
+                                cloudflare_turn: crate::config::AgentConfig::load()
+                                    .ok()
+                                    .and_then(|c| c.remote_control.cloudflare_turn),
                             };
                             match crate::remote::start::open_channel(req, registry, msg_tx).await {
                                 Ok(_gateway) => serde_json::json!({

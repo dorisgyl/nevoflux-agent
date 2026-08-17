@@ -160,13 +160,36 @@ pub fn is_logged_in(store: &dyn TokenStore) -> bool {
 // --- thin async HTTP wrappers (integration-tested against a live nevoflux.app) ---
 
 /// `POST /api/auth/device/code` — start the device grant.
+/// A network error with its cause, not just its headline.
+///
+/// `reqwest` reports the outermost layer — "error sending request for url" —
+/// and keeps what actually happened in the source chain. Printed with `{e}`
+/// that is thrown away, leaving a message that says a request failed and
+/// nothing about whether the name did not resolve, the handshake was refused,
+/// or the connection timed out. Those need different answers from whoever is
+/// reading the log, which is the whole reason to print an error at all.
+fn because(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let text = c.to_string();
+        // Layers routinely repeat the layer below verbatim; say it once.
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        cause = c.source();
+    }
+    out
+}
+
 pub async fn request_device_code(base_url: &str, client_id: &str) -> Result<DeviceCodeResp> {
     let resp = reqwest::Client::new()
         .post(format!("{base_url}{DEVICE_CODE_PATH}"))
         .json(&json!({ "client_id": client_id, "scope": "openid profile email" }))
         .send()
         .await
-        .map_err(|e| DaemonError::InternalError(format!("device code request: {e}")))?;
+        .map_err(|e| DaemonError::InternalError(format!("device code request: {}", because(&e))))?;
     let body: Value = resp
         .json()
         .await
@@ -189,7 +212,7 @@ pub async fn poll_device_token(
         }))
         .send()
         .await
-        .map_err(|e| DaemonError::InternalError(format!("device token poll: {e}")))?;
+        .map_err(|e| DaemonError::InternalError(format!("device token poll: {}", because(&e))))?;
     let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
     Ok(parse_token_poll(&body))
 }
@@ -201,7 +224,7 @@ pub async fn mint_do_jwt(base_url: &str, account_token: &str) -> Result<String> 
         .bearer_auth(account_token)
         .send()
         .await
-        .map_err(|e| DaemonError::InternalError(format!("mint jwt request: {e}")))?;
+        .map_err(|e| DaemonError::InternalError(format!("mint jwt request: {}", because(&e))))?;
     let header_jwt = resp
         .headers()
         .get("set-auth-jwt")
@@ -224,7 +247,9 @@ pub async fn claim_device(
         .json(&json!({ "device_id": device_id, "name": name }))
         .send()
         .await
-        .map_err(|e| DaemonError::InternalError(format!("claim device request: {e}")))?;
+        .map_err(|e| {
+            DaemonError::InternalError(format!("claim device request: {}", because(&e)))
+        })?;
     if resp.status().is_success() {
         Ok(())
     } else {
@@ -359,5 +384,43 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.load().unwrap(), None);
         assert!(!is_logged_in(&store));
+    }
+
+    #[test]
+    fn a_network_error_says_what_actually_happened() {
+        // `reqwest` reports "error sending request for url" and keeps the real
+        // reason underneath. Printed with `{e}` that is lost, and a log that
+        // cannot tell a blocked handshake from an unresolved name sends the
+        // reader looking in the wrong place -- which it did.
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|l| l as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let e = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "tcp connect error",
+                Some(Box::new(Layer("connection timed out", None))),
+            ))),
+        );
+        assert_eq!(
+            because(&e),
+            "error sending request: tcp connect error: connection timed out"
+        );
+
+        // A layer that merely repeats the one below adds nothing.
+        let doubled = Layer("dns error", Some(Box::new(Layer("dns error", None))));
+        assert_eq!(because(&doubled), "dns error");
     }
 }
