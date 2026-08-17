@@ -39,6 +39,7 @@ pub fn transcribe_segmented(
             text: String::new(),
             segments: Vec::new(),
             language: language.unwrap_or("unknown").to_string(),
+            audio_event: None,
         });
     }
 
@@ -100,6 +101,12 @@ pub fn transcribe_segmented(
         language: dominant_language(&languages)
             .unwrap_or_else(|| language.unwrap_or("unknown").to_string()),
         segments,
+        // Deliberately not reported for a segmented pass. The tag describes one
+        // utterance, and this joins many: a recording that is mostly speech with
+        // music at the end has no single honest answer, and inventing one would
+        // be worse than saying nothing. The conversation path transcribes one
+        // utterance at a time and gets the tag from there.
+        audio_event: None,
     })
 }
 
@@ -142,6 +149,7 @@ mod tests {
         Transcript {
             text: text.into(),
             language: language.into(),
+            audio_event: None,
             segments: segs
                 .iter()
                 .map(|(a, b, x)| Segment {

@@ -73,6 +73,16 @@ pub struct Transcript {
     pub segments: Vec<Segment>,
     /// The language the engine reports having heard.
     pub language: String,
+    /// What kind of sound this was, when the engine says: `Speech`, `BGM`,
+    /// `Applause`, `Laughter`.
+    ///
+    /// `None` means the engine does not report it — not that the audio was
+    /// silent. Callers gating on this must treat `None` as "cannot judge" and
+    /// let the audio through; rejecting on `None` would make voice input stop
+    /// working entirely under any engine that lacks the tag, which is a far
+    /// worse failure than losing a filter that never could stop a colleague
+    /// talking anyway.
+    pub audio_event: Option<String>,
 }
 
 /// The seam both engines sit behind.

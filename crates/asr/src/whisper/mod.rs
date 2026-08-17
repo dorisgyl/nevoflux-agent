@@ -522,6 +522,9 @@ impl Transcriber for WhisperEngine {
             text: text.trim().to_string(),
             segments,
             language: reported_language,
+            // Whisper has no audio-event tag. `None` says so; callers gating on
+            // it must let the audio through rather than reject everything.
+            audio_event: None,
         })
     }
 }
