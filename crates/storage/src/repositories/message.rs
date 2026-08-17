@@ -258,6 +258,60 @@ impl<'a> MessageRepository<'a> {
             }
         })
     }
+
+    /// The most recent message with a given role.
+    ///
+    /// Used to find the answer that was being read aloud when the user cut it
+    /// off: the assistant message being spoken is, by construction, the latest
+    /// one in that session.
+    pub fn get_last_by_role(&self, session_id: &str, role: &str) -> Result<Option<Message>> {
+        self.db.with_connection(|conn| {
+            let result = conn
+                .query_row(
+                    "SELECT id, session_id, role, content, content_type, created_at, metadata
+                     FROM messages WHERE session_id = ?1 AND role = ?2
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![session_id, role],
+                    row_to_message,
+                )
+                .optional()?;
+            match result {
+                Some(message_result) => Ok(Some(message_result?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Merge keys into a message's `metadata`, leaving `content` untouched.
+    ///
+    /// This is how a delivery note lands (ADR-0004): the answer itself is the
+    /// authoritative content, and *how much of it actually reached the user* is
+    /// a fact about the delivery, not a second copy of the answer. Merging
+    /// rather than replacing matters because other writers own other keys in
+    /// the same blob.
+    pub fn merge_metadata(
+        &self,
+        id: &str,
+        patch: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bool> {
+        let existing = self.get(id)?;
+        let Some(message) = existing else {
+            return Ok(false);
+        };
+        let mut merged = message.metadata.unwrap_or_default();
+        for (k, v) in patch {
+            merged.insert(k.clone(), v.clone());
+        }
+        // `Json` 是 `#[from] serde_json::Error`,所以 `?` 直接就位。
+        let json = serde_json::to_string(&merged)?;
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE messages SET metadata = ?1 WHERE id = ?2",
+                params![json, id],
+            )?;
+            Ok(true)
+        })
+    }
 }
 
 /// Convert a database row to a Message.
@@ -305,6 +359,90 @@ mod tests {
     fn create_test_session(db: &Database, id: &str) {
         let repo = SessionRepository::new(db);
         repo.create(CreateSessionParams::new().with_id(id)).unwrap();
+    }
+
+    #[test]
+    fn last_by_role_finds_the_answer_that_was_being_spoken() {
+        let db = setup_db();
+        create_test_session(&db, "s1");
+        let repo = MessageRepository::new(&db);
+        repo.create(CreateMessageParams::new(
+            "s1",
+            MessageRole::Assistant,
+            "old",
+        ))
+        .unwrap();
+        repo.create(CreateMessageParams::new(
+            "s1",
+            MessageRole::User,
+            "question",
+        ))
+        .unwrap();
+        let newest = repo
+            .create(CreateMessageParams::new(
+                "s1",
+                MessageRole::Assistant,
+                "new",
+            ))
+            .unwrap();
+
+        let got = repo.get_last_by_role("s1", "assistant").unwrap().unwrap();
+        assert_eq!(
+            got.id, newest.id,
+            "取的必须是最新那条,不是最后写入的任意一条"
+        );
+        assert_eq!(
+            repo.get_last_by_role("s1", "user")
+                .unwrap()
+                .unwrap()
+                .content,
+            "question"
+        );
+        assert!(repo
+            .get_last_by_role("s-none", "assistant")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn merge_metadata_keeps_other_writers_keys() {
+        // 投递注记是后写进去的,而同一个 blob 里已经有别人的键
+        // (`tool_name` 就在被 json_extract 读)。整体替换会把它们抹掉。
+        let db = setup_db();
+        create_test_session(&db, "s1");
+        let repo = MessageRepository::new(&db);
+        let mut meta = HashMap::new();
+        meta.insert("tool_name".to_string(), serde_json::json!("browser_read"));
+        let msg = repo
+            .create(
+                CreateMessageParams::new("s1", MessageRole::Assistant, "answer")
+                    .with_metadata(meta),
+            )
+            .unwrap();
+
+        let mut patch = HashMap::new();
+        patch.insert(
+            "voice_delivery".to_string(),
+            serde_json::json!({ "interrupted": true, "played_sentences": 2 }),
+        );
+        assert!(repo.merge_metadata(&msg.id, &patch).unwrap());
+
+        let got = repo.get(&msg.id).unwrap().unwrap().metadata.unwrap();
+        assert_eq!(got["tool_name"], "browser_read", "别人的键被抹掉了");
+        assert_eq!(got["voice_delivery"]["played_sentences"], 2);
+        assert_eq!(
+            repo.get(&msg.id).unwrap().unwrap().content,
+            "answer",
+            "content 是权威内容,注记不该动它"
+        );
+    }
+
+    #[test]
+    fn merge_metadata_on_a_missing_message_is_not_an_error() {
+        // 打断可能在消息落库之前到达。报错会把一次正常的时序当成故障。
+        let db = setup_db();
+        let repo = MessageRepository::new(&db);
+        assert!(!repo.merge_metadata("nope", &HashMap::new()).unwrap());
     }
 
     #[test]

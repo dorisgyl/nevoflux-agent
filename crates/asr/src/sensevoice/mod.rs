@@ -331,24 +331,32 @@ impl Transcriber for SenseVoice {
 
         let mut tokens = Self::greedy_decode(logits, out_frames, vocab_size);
 
-        // The first four are tags, not speech. The language tag is the only
-        // one this crate reports; emotion and audio event are dropped because
-        // nothing asks for them and exposing them would be a promise to keep.
-        let detected = tokens
-            .first()
-            .map(|(id, _)| {
-                self.vocab
-                    .get(*id)
-                    .trim_matches(['<', '|', '>'])
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".into());
+        // The first four are tags, not speech: language, emotion, audio event,
+        // itn. Language and audio event are reported; emotion is still dropped
+        // because nothing asks for it.
+        //
+        // The audio event tag was dropped too until the voice pipeline needed a
+        // way to tell a person talking from music, applause, or laughter coming
+        // out of a video in another tab. The model was computing it all along.
+        let tag = |i: usize| {
+            tokens
+                .get(i)
+                .map(|(id, _)| {
+                    self.vocab
+                        .get(*id)
+                        .trim_matches(['<', '|', '>'])
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+        };
+        let detected = tag(0).unwrap_or_else(|| "unknown".into());
+        let audio_event = tag(2);
         if tokens.len() <= NUM_TAG_TOKENS {
             return Ok(Transcript {
                 text: String::new(),
                 segments: Vec::new(),
                 language: detected,
+                audio_event,
             });
         }
         tokens.drain(..NUM_TAG_TOKENS);
@@ -362,6 +370,7 @@ impl Transcriber for SenseVoice {
             text,
             segments,
             language: detected,
+            audio_event,
         })
     }
 }

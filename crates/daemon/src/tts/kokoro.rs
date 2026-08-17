@@ -111,6 +111,46 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
     Ok((model_path, voices_path))
 }
 
+/// The conversation path's handle on the synthesizer.
+///
+/// Same process-level instance the tool path uses — the model is 92 MB and a
+/// second copy would buy nothing.
+///
+/// It returns the synthesizer and nothing else on purpose. The tool path's
+/// `speak()` also decides *who hears it*, by asking a global registry; the
+/// conversation path must not, because "whoever is attached to this session"
+/// cannot tell a video voiceover from an answer meant for the person sitting
+/// in front of the sidebar. Handing back only the engine forces the caller to
+/// name its own audience (ADR-0001).
+#[cfg(feature = "tts-local")]
+pub fn conversation_synthesizer(
+    cfg: &KokoroConfig,
+) -> Result<std::sync::Arc<nevoflux_tts::Synthesizer>, TtsError> {
+    let model_path = resolve(cfg.model_path.as_deref(), MODEL_FILE)
+        .ok_or_else(|| missing("model", MODEL_FILE))?;
+    let voices_path = resolve(cfg.voices_path.as_deref(), VOICES_FILE)
+        .ok_or_else(|| missing("voice bank", VOICES_FILE))?;
+    if !model_path.exists() {
+        return Err(missing("model", MODEL_FILE));
+    }
+    if !voices_path.exists() {
+        return Err(missing("voice bank", VOICES_FILE));
+    }
+    let threads = cfg
+        .threads
+        .unwrap_or_else(nevoflux_tts::model::default_threads);
+    synthesizer(&model_path, &voices_path, threads)
+}
+
+#[cfg(not(feature = "tts-local"))]
+pub fn conversation_synthesizer(
+    _cfg: &crate::config::KokoroConfig,
+) -> Result<std::sync::Arc<()>, TtsError> {
+    Err(TtsError::ConfigMissing(
+        "voice conversation needs the `tts-local` feature".into(),
+    ))
+}
+
 /// Roughly how long a passage takes to say.
 ///
 /// 12.7 characters a second, measured off Kokoro's own output rather than
@@ -143,7 +183,8 @@ fn synthesizer(
         threads,
         "loading Kokoro; first call pays the model load, later ones do not"
     );
-    let built = nevoflux_tts::Synthesizer::new(model_path, voices_path, threads).map_err(map_err)?;
+    let built =
+        nevoflux_tts::Synthesizer::new(model_path, voices_path, threads).map_err(map_err)?;
     let arc = Arc::new(built);
     // A concurrent first call may have won the race; either Arc is equally
     // usable, so take whichever landed.
@@ -309,7 +350,7 @@ pub async fn synthesize_local(
     // for: no portal attached, or a composition that wants the file itself.
     let live = session
         .as_deref()
-        .is_some_and(crate::remote::push::attached)
+        .is_some_and(crate::remote::push::portal_attached)
         && req.composition_id.is_none();
 
     if live {
@@ -319,7 +360,14 @@ pub async fn synthesize_local(
             // `false`: the answer has gone, so the join would be assembled
             // for nobody.
             if let Err(e) = speak(
-                model_path, voices_path, threads, text, voice, session, stream, false,
+                model_path,
+                voices_path,
+                threads,
+                text,
+                voice,
+                session,
+                stream,
+                false,
             ) {
                 // The caller has already been answered, so this is the only
                 // place it can be said at all.
@@ -340,7 +388,14 @@ pub async fn synthesize_local(
     let voice = requested_voice.clone();
     let (audio, group) = tokio::task::block_in_place(move || {
         speak(
-            model_path, voices_path, threads, text, voice, session, stream, true,
+            model_path,
+            voices_path,
+            threads,
+            text,
+            voice,
+            session,
+            stream,
+            true,
         )
     })?;
     // `keep` was true, so there is a reading here.

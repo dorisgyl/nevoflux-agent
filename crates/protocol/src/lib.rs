@@ -37,6 +37,7 @@ pub mod execution_tier;
 pub mod extract;
 pub mod json_repair;
 pub mod mcp;
+pub mod speech;
 pub mod subagent;
 pub mod tools;
 pub mod tts;
@@ -63,6 +64,12 @@ pub use envelope::{AuthInfo, DaemonEnvelope, ProxyEnvelope};
 pub use error::{ProtocolError, Result};
 pub use execution_tier::{classify_tool, tier_auto_approves, ExecutionTier, RiskBucket};
 pub use tools::{is_read_only_tool, READ_ONLY_TOOLS};
+
+pub use speech::{
+    SpeechCancel, SpeechCancelReason, SpeechChunk, SpeechEnd, SpeechError, SpeechFinal,
+    SpeechPartial, SpeechStart, VoiceAudio, VoiceBargeIn, VoiceDone, VoiceFailed,
+    SPEECH_SAMPLE_RATE,
+};
 
 // Re-export chat messages
 pub use chat::{

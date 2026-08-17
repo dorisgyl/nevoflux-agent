@@ -51,7 +51,11 @@ pub fn register(session_id: &str) -> UnboundedReceiver<serde_json::Value> {
 /// Report which turn is open, so a producer starting now can learn it.
 /// Called by the gateway every time it translates something downlink.
 pub fn set_stream(session_id: &str, stream: Option<&str>) {
-    if let Some(ch) = registry().lock().expect("push registry").get_mut(session_id) {
+    if let Some(ch) = registry()
+        .lock()
+        .expect("push registry")
+        .get_mut(session_id)
+    {
         ch.stream = stream.unwrap_or_default().to_string();
     }
 }
@@ -61,8 +65,21 @@ pub fn set_stream(session_id: &str, stream: Option<&str>) {
 /// Distinct from having a session id, which the daemon always has. A producer
 /// asks this to decide whether its output has somewhere to go on its own — if
 /// it does, the caller need not wait for it.
-pub fn attached(session_id: &str) -> bool {
-    registry().lock().expect("push registry").contains_key(session_id)
+///
+/// **Named for the portal on purpose.** This registry holds one channel per
+/// session, and `register` overwrites — so a second consumer does not join, it
+/// evicts. The voice conversation path needs an audience too, and registering
+/// it here would both evict the portal and flip this predicate for every
+/// `tts_synthesize_local` call on the session: video voiceovers would go
+/// fire-and-forget, return an empty `audio_b64`, and be read aloud to whoever
+/// is sitting in front of the sidebar. The bare name `attached` invited exactly
+/// that; the qualified one makes the mistake fail to compile. See ADR-0001 —
+/// conversation speech names its own audience instead of discovering one.
+pub fn portal_attached(session_id: &str) -> bool {
+    registry()
+        .lock()
+        .expect("push registry")
+        .contains_key(session_id)
 }
 
 /// The turn open on this session right now, for a producer to stamp what it
@@ -133,11 +150,11 @@ mod tests {
         // The daemon always has a session id. Whether anyone is listening to
         // it is a different question, and the one that decides whether a
         // producer's output has somewhere to go without the caller waiting.
-        assert!(!attached("sess-detached"));
+        assert!(!portal_attached("sess-detached"));
         let _rx = register("sess-detached");
-        assert!(attached("sess-detached"));
+        assert!(portal_attached("sess-detached"));
         forget("sess-detached");
-        assert!(!attached("sess-detached"));
+        assert!(!portal_attached("sess-detached"));
     }
 
     #[tokio::test]

@@ -379,6 +379,32 @@ fn sensevoice(
     Ok(ENGINE.get_or_init(|| Arc::new(engine)).clone())
 }
 
+/// The conversation path's handle on the recognizer.
+///
+/// Same process-level instance the offline path uses — deliberately, because
+/// the model is 237 MB and a second copy would buy nothing. What keeps the two
+/// from starving each other is [`crate::speech::AsrScheduler`], not a second
+/// engine.
+///
+/// Returns the trait object rather than the concrete type so the speech
+/// orchestration never learns which engine it is talking to; that is what lets
+/// its cadence logic be tested on a machine with no model weights at all.
+#[cfg(feature = "asr-sensevoice")]
+pub fn conversation_transcriber(
+    cfg: &TtsConfig,
+) -> Result<std::sync::Arc<dyn nevoflux_asr::Transcriber>, TtsError> {
+    Ok(sensevoice(&cfg.sensevoice)?)
+}
+
+#[cfg(not(feature = "asr-sensevoice"))]
+pub fn conversation_transcriber(
+    _cfg: &TtsConfig,
+) -> Result<std::sync::Arc<dyn nevoflux_asr::Transcriber>, TtsError> {
+    Err(TtsError::ConfigMissing(
+        "voice conversation needs the `asr-sensevoice` feature".into(),
+    ))
+}
+
 /// The VAD, kept for the life of the process like the recognizer.
 ///
 /// 2 MB, so residency is not about the load cost; it is about not paying an
