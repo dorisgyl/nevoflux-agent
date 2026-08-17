@@ -91,6 +91,9 @@ pub struct PortalGateway {
     /// Offers sent since one was last answered. Reset by an accepted answer.
     #[cfg(feature = "webrtc")]
     unanswered_offers: Mutex<u32>,
+    /// Whether giving up on the peer path has been said. Once is the point.
+    #[cfg(feature = "webrtc")]
+    gave_up_on_peer: std::sync::atomic::AtomicBool,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -193,6 +196,8 @@ impl PortalGateway {
             last_offer: Mutex::new(None),
             #[cfg(feature = "webrtc")]
             unanswered_offers: Mutex::new(0),
+            #[cfg(feature = "webrtc")]
+            gave_up_on_peer: std::sync::atomic::AtomicBool::new(false),
             media_sink: None,
         }
     }
@@ -823,6 +828,23 @@ impl PortalGateway {
         if self.rtc.path() == super::rtc::Path::Peer {
             return;
         }
+        // Answered every time and open none of them. The backstop below counts
+        // offers that went unanswered, which this is not: the portal replies,
+        // the count resets, and the asking never stops. Said once, because a
+        // line per attempt is what this is here to end.
+        if self.rtc.keeps_failing() {
+            if !self
+                .gave_up_on_peer
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::info!(
+                    target: "remote",
+                    gateway = %self.id,
+                    "peer connections keep failing to form; staying on the relay"
+                );
+            }
+            return;
+        }
         // Reported with the offer. A run showed two offers four seconds apart
         // when the second owed ten, and one gateway cannot do that — so either
         // the count is not what this code thinks, or a second gateway is on the
@@ -943,6 +965,16 @@ impl PortalGateway {
                     // Cheap, idempotent, and the portal cannot render a reply
                     // without it.
                     self.announce().await;
+                    // A run of failures describes one pairing of two networks,
+                    // and somebody attaching changes the other half of it —
+                    // a different phone, or the same one off the train. Bounded
+                    // either way: this buys four more attempts, not forever.
+                    #[cfg(feature = "webrtc")]
+                    {
+                        self.rtc.reconsider();
+                        self.gave_up_on_peer
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.spawn_offer();
                 } else {
                     // The relay saying a frame reached nobody. Worth a line:
@@ -2190,6 +2222,40 @@ mod tests {
         assert!(
             sink.sent.lock().await.is_empty(),
             "offered over a connection that was already carrying media"
+        );
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_session_whose_connections_never_open_stops_asking() {
+        // The gap the backstop below does not cover. That one counts offers
+        // sent since one was *answered*, and a portal that answers every offer
+        // and then loses DTLS resets it on each attempt — which is a real
+        // network, met here: eight consecutive failures in ten minutes, every
+        // offer answered, the count never above one.
+        let sink = Arc::new(CollectSink::default());
+        let gw = sealed_gw(sink.clone());
+
+        for _ in 0..super::super::rtc::GIVE_UP_AFTER_FAILURES {
+            gw.rtc.set_path(super::super::rtc::Path::Forming);
+            gw.rtc.set_path(super::super::rtc::Path::Relay);
+        }
+        // Not the interval talking: the clock is clear and the count is not.
+        *gw.last_offer.lock().await = None;
+        gw.offer_peer_connection().await;
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "kept offering a connection that has failed to form four times"
+        );
+
+        // A portal attaching is a different far end, so it is asked again.
+        gw.rtc.reconsider();
+        *gw.last_offer.lock().await = None;
+        gw.offer_peer_connection().await;
+        assert_eq!(
+            sink.sent.lock().await.len(),
+            1,
+            "a new portal did not get an offer"
         );
     }
 
