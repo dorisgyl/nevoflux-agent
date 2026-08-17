@@ -185,11 +185,14 @@ pub struct TtsConfig {
     /// then `tts_synthesize_local` returns ConfigMissing.
     #[serde(default)]
     pub kokoro: KokoroConfig,
-    /// Whisper local ONNX path config (P5b-3). Same gating contract as
-    /// Kokoro — `tts_transcribe` returns ConfigMissing until
-    /// `model_path` resolves.
+    /// Whisper local config. Only reachable in a build with `asr-whisper`;
+    /// otherwise `tts_transcribe` reports EngineUnavailable rather than
+    /// anything about this section.
     #[serde(default)]
     pub whisper: WhisperConfig,
+    /// SenseVoice local ONNX config — the default transcription engine.
+    #[serde(default)]
+    pub sensevoice: SenseVoiceConfig,
 }
 
 /// Kokoro local TTS config.
@@ -246,13 +249,63 @@ pub struct KokoroConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WhisperConfig {
-    /// Filesystem path to the Whisper ONNX model. None → tool returns
-    /// ConfigMissing.
+    /// Directory holding `config.json`, `tokenizer.json` and
+    /// `model.safetensors` -- the HuggingFace layout Candle reads. None → look
+    /// for `whisper-<default_size>` under `~/.cache/nevoflux/models/`.
+    ///
+    /// Not whisper.cpp's `ggml-*.bin`: that is the file most people reach for
+    /// and Candle cannot read it. `just whisper-model` fetches the right one.
     #[serde(default)]
     pub model_path: Option<String>,
-    /// Default model size (`tiny` / `base` / `small` / `medium`).
+    /// Which size to look for (`tiny` / `base` / `small` / `medium` /
+    /// `large-v3-turbo`). Defaults to `base`.
+    ///
+    /// Measured peak resident memory *for the model alone*: base 585 MB,
+    /// small 1.90 GB, large-v3-turbo 4.77 GB. A running daemon is larger than
+    /// any of these and not by a little: it also holds Kokoro (442 MB) once
+    /// something synthesizes, the embedding model from the `embedding`
+    /// feature, and ONNX Runtime arenas, which grow and are never returned.
+    /// One observed daemon sat at 2.09 GB after a synthesize-then-transcribe
+    /// round trip on `base`. Read these numbers as the cost of choosing a
+    /// size, not as the size of the process. `base` is the default for footprint, and it
+    /// matched `small` on the English clip they were compared on -- but
+    /// Whisper is only reached for languages SenseVoice cannot distinguish,
+    /// and `base` is known to trail `small` on most non-English. Raise this if
+    /// non-English transcription is weak; that is the trade it exists for.
     #[serde(default)]
     pub default_size: Option<String>,
+}
+
+/// SenseVoice local ASR config — the default transcription engine.
+///
+/// `[tts.sensevoice]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.sensevoice]
+/// model_path  = "~/.cache/nevoflux/models/sensevoice-small.int8.onnx"
+/// tokens_path = "~/.cache/nevoflux/models/sensevoice-tokens.txt"
+/// threads     = 4
+/// ```
+///
+/// Both paths are optional: unset means look in `~/.cache/nevoflux/models/`
+/// for the names `just fetch-asr-models` writes. Those names are a local
+/// convention rather than the upstream ones, which disagree with each other.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SenseVoiceConfig {
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Token table. Must be the one shipped beside the weights: the model
+    /// states its vocab size in metadata, and a table of a different length
+    /// silently decodes the tail of the vocabulary to nothing.
+    #[serde(default)]
+    pub tokens_path: Option<String>,
+    /// fsmn-vad weights. Only consulted for audio longer than 30 s, which is
+    /// the most SenseVoice can take in one pass.
+    #[serde(default)]
+    pub vad_path: Option<String>,
+    /// ONNX intra-op thread count. None → logical cores capped at four,
+    /// matching the Kokoro default.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 /// ElevenLabs HTTP API config.
@@ -564,6 +617,11 @@ pub struct LlmConfig {
     #[serde(default)]
     pub openclaw: ProviderConfig,
 
+    /// User-defined providers, keyed by the stable id that follows `custom:`
+    /// in [`LlmConfig::provider`]. See [`CustomProviderConfig`].
+    #[serde(default)]
+    pub custom: std::collections::BTreeMap<String, CustomProviderConfig>,
+
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -611,6 +669,54 @@ pub struct ProviderConfig {
     pub use_streaming: Option<bool>,
 }
 
+/// Wire protocol a custom provider speaks.
+///
+/// Selects which existing client path in [`crate::wasm::llm`] builds the
+/// request. A custom provider never introduces a new transport — it reuses the
+/// Anthropic or OpenAI path with its own `base_url`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomWire {
+    /// OpenAI-compatible `/chat/completions`.
+    Openai,
+    /// Anthropic `/v1/messages`.
+    Anthropic,
+}
+
+impl CustomWire {
+    /// The `ProviderType` whose client path serves this wire.
+    pub fn provider_type(self) -> nevoflux_llm::ProviderType {
+        match self {
+            CustomWire::Openai => nevoflux_llm::ProviderType::OpenAi,
+            CustomWire::Anthropic => nevoflux_llm::ProviderType::Anthropic,
+        }
+    }
+}
+
+/// A user-defined provider.
+///
+/// `base` carries everything a builtin provider has, flattened into the same
+/// TOML table so `[llm.custom.my-llm]` stays hand-editable. Holding a real
+/// [`ProviderConfig`] (rather than duplicating its fields) is what lets
+/// [`LlmConfig::provider_config`] return a borrow for builtin and custom
+/// providers alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    /// Name shown in the UI. Freely editable; never used as an identity.
+    pub display_name: String,
+
+    /// Which wire protocol this endpoint speaks.
+    pub wire: CustomWire,
+
+    /// Card accent colour as `#rrggbb`. `None` renders the default surface.
+    #[serde(default)]
+    pub accent: Option<String>,
+
+    /// Key, model, base URL, context window and streaming flag.
+    #[serde(flatten)]
+    pub base: ProviderConfig,
+}
+
 /// Providers that delegate the turn to an external agent over ACP, so their
 /// prompt is assembled by `wasm::llm::build_acp_content*`.
 ///
@@ -640,6 +746,63 @@ pub fn is_acp_provider(provider: &str) -> bool {
     ACP_PROVIDERS.contains(&provider.to_lowercase().as_str())
 }
 
+/// Prefix marking a user-defined provider id.
+pub const CUSTOM_PREFIX: &str = "custom:";
+
+/// Strip the `custom:` prefix, returning the bare id.
+///
+/// Returns `None` for builtin ids and for a bare `custom:` with no id, so
+/// callers can treat "not custom" and "malformed custom" identically.
+pub fn custom_id(id: &str) -> Option<&str> {
+    id.strip_prefix(CUSTOM_PREFIX).filter(|s| !s.is_empty())
+}
+
+/// The stand-in key for providers that authenticate by other means.
+///
+/// The client builders require a non-empty key even when the endpoint ignores
+/// it — CLI providers carry their own auth, and a local OpenAI-compatible
+/// server usually needs none at all.
+pub fn keyless_placeholder(id: &str) -> Option<&'static str> {
+    if custom_id(id).is_some() {
+        return Some("custom-local");
+    }
+    match id {
+        "claude-code" | "claude_code" => Some("claude-code-cli"),
+        "gemini-cli" | "gemini_cli" => Some("gemini-cli"),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some("antigravity"),
+        "ollama" => Some("ollama-local"),
+        "kimi-agent" | "kimi_agent" | "kimi" => Some("kimi-agent-cli"),
+        "openclaw" | "open_claw" | "open-claw" => Some("openclaw-acp"),
+        _ => None,
+    }
+}
+
+/// Canonical builtin provider ids, in display order.
+///
+/// This is the config layer's list. `PROVIDER_METAS` in `server.rs` is the UI's
+/// card list and is deliberately shorter — `gemini-cli` is configurable but has
+/// no card. Do not conflate them.
+pub const BUILTIN_PROVIDER_IDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "openrouter",
+    "qwen",
+    "deepseek",
+    "claude-code",
+    "gemini-cli",
+    "antigravity",
+    "gemini",
+    "groq",
+    "ollama",
+    "mistral",
+    "xai",
+    "cohere",
+    "perplexity",
+    "together",
+    "kimi-agent",
+    "openclaw",
+];
+
 impl LlmConfig {
     /// Get the active provider name.
     pub fn active_provider(&self) -> Option<&str> {
@@ -652,6 +815,125 @@ impl LlmConfig {
     /// carry an image in its prompt.
     pub fn active_provider_is_acp(&self) -> bool {
         self.active_provider().is_some_and(is_acp_provider)
+    }
+
+    /// The one place that maps a provider id to its stored configuration.
+    ///
+    /// Accepts every builtin id and alias, plus `custom:<id>` for a
+    /// user-defined provider. Every other provider-dependent lookup in this
+    /// file — and `config.llm.get` / `config.llm.set` in `server.rs` —
+    /// delegates here, so a new provider becomes visible everywhere at once.
+    pub fn provider_config(&self, id: &str) -> Option<&ProviderConfig> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| &c.base);
+        }
+        match id {
+            "anthropic" => Some(&self.anthropic),
+            "openai" => Some(&self.openai),
+            "deepseek" => Some(&self.deepseek),
+            "qwen" => Some(&self.qwen),
+            "gemini" => Some(&self.gemini),
+            "groq" => Some(&self.groq),
+            "openrouter" => Some(&self.openrouter),
+            "mistral" => Some(&self.mistral),
+            "xai" | "grok" => Some(&self.xai),
+            "cohere" => Some(&self.cohere),
+            "perplexity" => Some(&self.perplexity),
+            "together" => Some(&self.together),
+            "ollama" => Some(&self.ollama),
+            "claude-code" | "claude_code" => Some(&self.claude_code),
+            "gemini-cli" | "gemini_cli" => Some(&self.gemini_cli),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&self.antigravity),
+            "kimi-agent" | "kimi_agent" | "kimi" => Some(&self.kimi_agent),
+            "openclaw" | "open_claw" | "open-claw" => Some(&self.openclaw),
+            _ => None,
+        }
+    }
+
+    /// Mutable twin of [`LlmConfig::provider_config`].
+    pub fn provider_config_mut(&mut self, id: &str) -> Option<&mut ProviderConfig> {
+        if let Some(key) = custom_id(id) {
+            let key = key.to_string();
+            return self.custom.get_mut(&key).map(|c| &mut c.base);
+        }
+        match id {
+            "anthropic" => Some(&mut self.anthropic),
+            "openai" => Some(&mut self.openai),
+            "deepseek" => Some(&mut self.deepseek),
+            "qwen" => Some(&mut self.qwen),
+            "gemini" => Some(&mut self.gemini),
+            "groq" => Some(&mut self.groq),
+            "openrouter" => Some(&mut self.openrouter),
+            "mistral" => Some(&mut self.mistral),
+            "xai" | "grok" => Some(&mut self.xai),
+            "cohere" => Some(&mut self.cohere),
+            "perplexity" => Some(&mut self.perplexity),
+            "together" => Some(&mut self.together),
+            "ollama" => Some(&mut self.ollama),
+            "claude-code" | "claude_code" => Some(&mut self.claude_code),
+            "gemini-cli" | "gemini_cli" => Some(&mut self.gemini_cli),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut self.antigravity),
+            "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut self.kimi_agent),
+            "openclaw" | "open_claw" | "open-claw" => Some(&mut self.openclaw),
+            _ => None,
+        }
+    }
+
+    /// The wire protocol to speak for `id`.
+    ///
+    /// Builtin ids parse to their own `ProviderType`; `custom:<id>` resolves to
+    /// `OpenAi` or `Anthropic` according to its `wire` field. Prefer this over
+    /// a bare `id.parse::<ProviderType>()` anywhere the id may come from
+    /// [`LlmConfig::active_provider`], which can name a custom provider.
+    pub fn resolve_wire(&self, id: &str) -> Option<nevoflux_llm::ProviderType> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| c.wire.provider_type());
+        }
+        id.parse::<nevoflux_llm::ProviderType>().ok()
+    }
+
+    /// Human-readable name for UI and logs. Builtin ids return the id itself.
+    pub fn display_name(&self, id: &str) -> Option<String> {
+        if let Some(key) = custom_id(id) {
+            return self.custom.get(key).map(|c| c.display_name.clone());
+        }
+        self.provider_config(id).map(|_| id.to_string())
+    }
+
+    /// Whether `id` is usable as-is.
+    ///
+    /// A builtin provider needs an API key. A custom provider needs a
+    /// `base_url` — its key is optional, because a local OpenAI-compatible
+    /// server commonly has no auth at all.
+    pub fn is_provider_configured(&self, id: &str) -> bool {
+        let Some(pc) = self.provider_config(id) else {
+            return false;
+        };
+        if custom_id(id).is_some() {
+            return pc.base_url.as_deref().is_some_and(|u| !u.is_empty());
+        }
+        pc.api_key.as_deref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Every provider id this config knows: builtins in display order, then
+    /// custom providers in id order.
+    pub fn all_provider_ids(&self) -> Vec<String> {
+        BUILTIN_PROVIDER_IDS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(self.custom.keys().map(|k| format!("{CUSTOM_PREFIX}{k}")))
+            .collect()
+    }
+
+    /// The provider to activate once `removed` is gone.
+    ///
+    /// Builtins are preferred in display order, then custom providers by id, so
+    /// deleting the active provider lands somewhere predictable rather than
+    /// dropping the user back into onboarding when an alternative exists.
+    pub fn fallback_provider_after_removing(&self, removed: &str) -> Option<String> {
+        self.all_provider_ids()
+            .into_iter()
+            .find(|id| id != removed && self.is_provider_configured(id))
     }
 
     /// Returns `true` if at least one LLM provider is usable.
@@ -668,31 +950,15 @@ impl LlmConfig {
     /// identical whether computed in the daemon or in the separately-launched
     /// proxy process reading the same `config.toml`.
     ///
-    /// Keep the provider list in sync with `get_provider_config` in server.rs.
+    /// The provider list comes from [`LlmConfig::all_provider_ids`] and each
+    /// entry is judged by [`LlmConfig::is_provider_configured`], so custom
+    /// providers count here without any extra wiring.
     pub fn has_any_configured_provider(&self) -> bool {
-        let any_key = [
-            &self.anthropic,
-            &self.openai,
-            &self.deepseek,
-            &self.qwen,
-            &self.gemini,
-            &self.groq,
-            &self.openrouter,
-            &self.mistral,
-            &self.xai,
-            &self.cohere,
-            &self.perplexity,
-            &self.together,
-            &self.ollama,
-            &self.claude_code,
-            &self.gemini_cli,
-            &self.antigravity,
-            &self.kimi_agent,
-            &self.openclaw,
-        ]
-        .iter()
-        .any(|pc| pc.api_key.is_some());
-        if any_key {
+        if self
+            .all_provider_ids()
+            .iter()
+            .any(|id| self.is_provider_configured(id))
+        {
             return true;
         }
 
@@ -716,150 +982,42 @@ impl LlmConfig {
     }
 
     /// Get the API key for the active provider.
+    ///
+    /// An empty stored key counts as absent, so a keyless endpoint falls
+    /// through to [`keyless_placeholder`] rather than handing the client
+    /// builder an empty string.
     pub fn active_api_key(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.api_key.as_deref(),
-            "openai" => self.openai.api_key.as_deref(),
-            "qwen" => self.qwen.api_key.as_deref(),
-            "deepseek" => self.deepseek.api_key.as_deref(),
-            "openrouter" => self.openrouter.api_key.as_deref(),
-            "claude-code" | "claude_code" => self
-                .claude_code
-                .api_key
-                .as_deref()
-                .or(Some("claude-code-cli")),
-            "gemini-cli" | "gemini_cli" => {
-                self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
-            }
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.api_key.as_deref().or(Some("antigravity"))
-            }
-            "gemini" => self.gemini.api_key.as_deref(),
-            "groq" => self.groq.api_key.as_deref(),
-            "ollama" => self.ollama.api_key.as_deref().or(Some("ollama-local")),
-            "mistral" => self.mistral.api_key.as_deref(),
-            "xai" | "grok" => self.xai.api_key.as_deref(),
-            "cohere" => self.cohere.api_key.as_deref(),
-            "perplexity" => self.perplexity.api_key.as_deref(),
-            "together" => self.together.api_key.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self
-                .kimi_agent
-                .api_key
-                .as_deref()
-                .or(Some("kimi-agent-cli")),
-            "openclaw" | "open_claw" | "open-claw" => {
-                self.openclaw.api_key.as_deref().or(Some("openclaw-acp"))
-            }
-            _ => None,
-        }
+        let id = self.active_provider()?;
+        let pc = self.provider_config(id)?;
+        pc.api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .or_else(|| keyless_placeholder(id))
     }
 
     /// Get the model for the active provider.
     pub fn active_model(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.model.as_deref(),
-            "openai" => self.openai.model.as_deref(),
-            "qwen" => self.qwen.model.as_deref(),
-            "deepseek" => self.deepseek.model.as_deref(),
-            "openrouter" => self.openrouter.model.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.model.as_deref()
-            }
-            "gemini" => self.gemini.model.as_deref(),
-            "groq" => self.groq.model.as_deref(),
-            "ollama" => self.ollama.model.as_deref(),
-            "mistral" => self.mistral.model.as_deref(),
-            "xai" | "grok" => self.xai.model.as_deref(),
-            "cohere" => self.cohere.model.as_deref(),
-            "perplexity" => self.perplexity.model.as_deref(),
-            "together" => self.together.model.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
-            _ => self.default_model.as_deref(),
+        let id = self.active_provider()?;
+        match self.provider_config(id) {
+            Some(pc) => pc.model.as_deref(),
+            None => self.default_model.as_deref(),
         }
     }
 
     /// Get the configured model for a specific provider name.
     pub fn model_for_provider(&self, provider: &str) -> Option<&str> {
-        match provider {
-            "anthropic" => self.anthropic.model.as_deref(),
-            "openai" => self.openai.model.as_deref(),
-            "qwen" => self.qwen.model.as_deref(),
-            "deepseek" => self.deepseek.model.as_deref(),
-            "openrouter" => self.openrouter.model.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.model.as_deref()
-            }
-            "gemini" => self.gemini.model.as_deref(),
-            "groq" => self.groq.model.as_deref(),
-            "ollama" => self.ollama.model.as_deref(),
-            "mistral" => self.mistral.model.as_deref(),
-            "xai" | "grok" => self.xai.model.as_deref(),
-            "cohere" => self.cohere.model.as_deref(),
-            "perplexity" => self.perplexity.model.as_deref(),
-            "together" => self.together.model.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
-            _ => None,
-        }
+        self.provider_config(provider)?.model.as_deref()
     }
 
     /// Get the base URL for the active provider.
     pub fn active_base_url(&self) -> Option<&str> {
-        match self.active_provider()? {
-            "anthropic" => self.anthropic.base_url.as_deref(),
-            "openai" => self.openai.base_url.as_deref(),
-            "qwen" => self.qwen.base_url.as_deref(),
-            "deepseek" => self.deepseek.base_url.as_deref(),
-            "openrouter" => self.openrouter.base_url.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.base_url.as_deref()
-            }
-            "gemini" => self.gemini.base_url.as_deref(),
-            "groq" => self.groq.base_url.as_deref(),
-            "ollama" => self.ollama.base_url.as_deref(),
-            "mistral" => self.mistral.base_url.as_deref(),
-            "xai" | "grok" => self.xai.base_url.as_deref(),
-            "cohere" => self.cohere.base_url.as_deref(),
-            "perplexity" => self.perplexity.base_url.as_deref(),
-            "together" => self.together.base_url.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
-            _ => None,
-        }
+        let id = self.active_provider()?;
+        self.provider_config(id)?.base_url.as_deref()
     }
 
     /// Get the base URL for a specific provider by name.
     pub fn base_url_for_provider(&self, provider: &str) -> Option<&str> {
-        match provider {
-            "anthropic" => self.anthropic.base_url.as_deref(),
-            "openai" => self.openai.base_url.as_deref(),
-            "qwen" => self.qwen.base_url.as_deref(),
-            "deepseek" => self.deepseek.base_url.as_deref(),
-            "openrouter" => self.openrouter.base_url.as_deref(),
-            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
-                self.antigravity.base_url.as_deref()
-            }
-            "gemini" => self.gemini.base_url.as_deref(),
-            "groq" => self.groq.base_url.as_deref(),
-            "ollama" => self.ollama.base_url.as_deref(),
-            "mistral" => self.mistral.base_url.as_deref(),
-            "xai" | "grok" => self.xai.base_url.as_deref(),
-            "cohere" => self.cohere.base_url.as_deref(),
-            "perplexity" => self.perplexity.base_url.as_deref(),
-            "together" => self.together.base_url.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
-            _ => None,
-        }
+        self.provider_config(provider)?.base_url.as_deref()
     }
 
     /// Get use_streaming for the active provider. Defaults to true.
@@ -871,30 +1029,12 @@ impl LlmConfig {
     }
 
     /// Get use_streaming for a specific provider.
-    /// Defaults to `false` for providers that don't support streaming (Qwen, Ollama),
+    /// Defaults to `false` for providers that don't support streaming (Ollama),
     /// `true` for all others.
     pub fn use_streaming_for_provider(&self, provider: &str) -> bool {
-        let value = match provider {
-            "anthropic" => self.anthropic.use_streaming,
-            "openai" => self.openai.use_streaming,
-            "qwen" => self.qwen.use_streaming,
-            "deepseek" => self.deepseek.use_streaming,
-            "openrouter" => self.openrouter.use_streaming,
-            "claude-code" | "claude_code" => self.claude_code.use_streaming,
-            "gemini-cli" | "gemini_cli" => self.gemini_cli.use_streaming,
-            "antigravity" | "antigravity-cli" | "antigravity_cli" => self.antigravity.use_streaming,
-            "gemini" => self.gemini.use_streaming,
-            "groq" => self.groq.use_streaming,
-            "ollama" => self.ollama.use_streaming,
-            "mistral" => self.mistral.use_streaming,
-            "xai" | "grok" => self.xai.use_streaming,
-            "cohere" => self.cohere.use_streaming,
-            "perplexity" => self.perplexity.use_streaming,
-            "together" => self.together.use_streaming,
-            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.use_streaming,
-            "openclaw" | "open_claw" | "open-claw" => self.openclaw.use_streaming,
-            _ => None,
-        };
+        let value = self
+            .provider_config(provider)
+            .and_then(|pc| pc.use_streaming);
         // Providers that don't support streaming default to false
         let default = !matches!(provider, "ollama");
         value.unwrap_or(default)
@@ -903,41 +1043,28 @@ impl LlmConfig {
     /// Get list of configured providers with their model names.
     /// Returns (provider_name, model_name) pairs for all providers with API keys.
     pub fn configured_providers(&self) -> Vec<(String, String)> {
-        let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 18] = [
-            ("anthropic", &self.anthropic),
-            ("openai", &self.openai),
-            ("openrouter", &self.openrouter),
-            ("qwen", &self.qwen),
-            ("deepseek", &self.deepseek),
-            ("claude-code", &self.claude_code),
-            ("gemini-cli", &self.gemini_cli),
-            ("antigravity", &self.antigravity),
-            ("gemini", &self.gemini),
-            ("groq", &self.groq),
-            ("ollama", &self.ollama),
-            ("mistral", &self.mistral),
-            ("xai", &self.xai),
-            ("cohere", &self.cohere),
-            ("perplexity", &self.perplexity),
-            ("together", &self.together),
-            ("kimi-agent", &self.kimi_agent),
-            ("openclaw", &self.openclaw),
-        ];
-
-        for (name, config) in &providers {
-            if config.api_key.is_some() {
-                let model = config.model.clone().unwrap_or_else(|| match name
-                    .parse::<nevoflux_llm::ProviderType>(
-                ) {
-                    Ok(pt) => nevoflux_llm::default_model_for(pt).to_string(),
-                    Err(_) => name.to_string(),
-                });
-                let is_active = active == Some(*name);
-                let suffix = if is_active { " (active)" } else { "" };
-                result.push((name.to_string(), format!("{}{}", model, suffix)));
+        let mut result = Vec::new();
+        for id in self.all_provider_ids() {
+            if !self.is_provider_configured(&id) {
+                continue;
             }
+            let Some(pc) = self.provider_config(&id) else {
+                continue;
+            };
+            let model = pc
+                .model
+                .clone()
+                .unwrap_or_else(|| match self.resolve_wire(&id) {
+                    Some(pt) => nevoflux_llm::default_model_for(pt).to_string(),
+                    None => id.clone(),
+                });
+            let suffix = if active == Some(id.as_str()) {
+                " (active)"
+            } else {
+                ""
+            };
+            result.push((id.clone(), format!("{}{}", model, suffix)));
         }
         result
     }
@@ -946,51 +1073,18 @@ impl LlmConfig {
     ///
     /// Resolution order:
     /// 1. Provider-specific `context_window` from config
-    /// 2. Known default for the provider type
+    /// 2. Known default for the provider's wire protocol
     /// 3. Fallback: 128,000 tokens
     pub fn context_window(&self) -> u32 {
-        use nevoflux_llm::ProviderType;
-
-        // Check provider-specific config override
-        let provider_config_window = match self.active_provider() {
-            Some("anthropic") => self.anthropic.context_window,
-            Some("openai") => self.openai.context_window,
-            Some("qwen") => self.qwen.context_window,
-            Some("deepseek") => self.deepseek.context_window,
-            Some("claude-code") | Some("claude_code") => self.claude_code.context_window,
-            Some("gemini-cli") | Some("gemini_cli") => self.gemini_cli.context_window,
-            Some("antigravity") | Some("antigravity-cli") | Some("antigravity_cli") => {
-                self.antigravity.context_window
-            }
-            Some("gemini") => self.gemini.context_window,
-            Some("groq") => self.groq.context_window,
-            Some("ollama") => self.ollama.context_window,
-            Some("mistral") => self.mistral.context_window,
-            Some("xai") | Some("grok") => self.xai.context_window,
-            Some("cohere") => self.cohere.context_window,
-            Some("perplexity") => self.perplexity.context_window,
-            Some("together") => self.together.context_window,
-            Some("kimi-agent") | Some("kimi_agent") | Some("kimi") => {
-                self.kimi_agent.context_window
-            }
-            Some("openclaw") | Some("open_claw") | Some("open-claw") => {
-                self.openclaw.context_window
-            }
-            _ => None,
+        let Some(id) = self.active_provider() else {
+            return 128_000;
         };
-
-        if let Some(window) = provider_config_window {
+        if let Some(window) = self.provider_config(id).and_then(|pc| pc.context_window) {
             return window;
         }
-
-        // Fall back to known provider default
-        if let Some(provider_name) = self.active_provider() {
-            if let Ok(provider_type) = provider_name.parse::<ProviderType>() {
-                return nevoflux_llm::default_context_window_for(provider_type);
-            }
+        if let Some(wire) = self.resolve_wire(id) {
+            return nevoflux_llm::default_context_window_for(wire);
         }
-
-        // Ultimate fallback
         128_000
     }
 }
@@ -1019,6 +1113,7 @@ impl Default for LlmConfig {
             together: ProviderConfig::default(),
             kimi_agent: ProviderConfig::default(),
             openclaw: ProviderConfig::default(),
+            custom: std::collections::BTreeMap::new(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),
@@ -1856,6 +1951,535 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_hand_written_custom_provider_toml_parses() {
+        // The shape a user types into ~/.config/nevoflux/config.toml by hand.
+        let src = r##"
+provider = "custom:my-llm"
+
+[custom.my-llm]
+display_name = "My LLM"
+wire = "openai"
+accent = "#7c5cff"
+api_key = "sk-abc"
+model = "gpt-4o"
+base_url = "https://api.example.com/v1"
+context_window = 32768
+
+[custom.local]
+display_name = "Local llama.cpp"
+wire = "anthropic"
+base_url = "http://127.0.0.1:8080"
+"##;
+        let cfg: LlmConfig = toml::from_str(src).expect("hand-written custom section parses");
+
+        assert_eq!(cfg.active_provider(), Some("custom:my-llm"));
+        assert_eq!(cfg.active_api_key(), Some("sk-abc"));
+        assert_eq!(cfg.active_model(), Some("gpt-4o"));
+        assert_eq!(cfg.active_base_url(), Some("https://api.example.com/v1"));
+        assert_eq!(cfg.context_window(), 32_768);
+        assert!(cfg.is_provider_configured("custom:my-llm"));
+
+        // The keyless one is usable purely on its base_url.
+        assert!(cfg.is_provider_configured("custom:local"));
+        assert_eq!(
+            cfg.resolve_wire("custom:local"),
+            Some(nevoflux_llm::ProviderType::Anthropic)
+        );
+
+        // Both show up for the sidebar model picker, custom ids last.
+        let listed = cfg.configured_providers();
+        assert!(listed.iter().any(|(id, _)| id == "custom:my-llm"));
+        assert!(listed.iter().any(|(id, _)| id == "custom:local"));
+    }
+
+    #[test]
+    fn test_unknown_wire_value_is_rejected() {
+        // A typo in `wire` must fail loudly at parse time rather than silently
+        // defaulting to one of the two protocols.
+        let src = r#"
+[custom.oops]
+display_name = "Oops"
+wire = "grpc"
+base_url = "https://x.test"
+"#;
+        assert!(toml::from_str::<LlmConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_fallback_provider_after_removing() {
+        let mut cfg = custom_cfg(
+            "mine",
+            "Mine",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.anthropic.api_key = Some("sk-ant".to_string());
+        // Builtins are preferred, in display order.
+        assert_eq!(
+            cfg.fallback_provider_after_removing("custom:mine")
+                .as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn test_fallback_provider_none_left() {
+        let cfg = custom_cfg(
+            "only",
+            "Only",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.fallback_provider_after_removing("custom:only"), None);
+    }
+
+    #[test]
+    fn test_fallback_prefers_another_custom_when_no_builtin() {
+        let mut cfg = LlmConfig::default();
+        for id in ["aaa", "bbb"] {
+            cfg.custom.insert(
+                id.to_string(),
+                CustomProviderConfig {
+                    display_name: id.to_string(),
+                    wire: CustomWire::Openai,
+                    accent: None,
+                    base: ProviderConfig {
+                        base_url: Some("https://x.test/v1".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            cfg.fallback_provider_after_removing("custom:aaa")
+                .as_deref(),
+            Some("custom:bbb")
+        );
+    }
+
+    #[test]
+    fn test_custom_provider_counts_as_configured_without_key() {
+        let cfg = custom_cfg(
+            "local",
+            "Local",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.is_provider_configured("custom:local"));
+        assert!(cfg.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_custom_provider_without_base_url_is_not_configured() {
+        let cfg = custom_cfg(
+            "broken",
+            "Broken",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!cfg.is_provider_configured("custom:broken"));
+        assert!(!cfg.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_configured_providers_includes_custom() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                model: Some("gpt-4o".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:my-llm".to_string());
+        cfg.openai.api_key = Some("sk-oai".to_string());
+
+        let listed = cfg.configured_providers();
+        assert!(listed.iter().any(|(name, _)| name == "openai"));
+        let (_, model) = listed
+            .iter()
+            .find(|(name, _)| name == "custom:my-llm")
+            .expect("custom provider is listed");
+        assert_eq!(model, "gpt-4o (active)");
+    }
+
+    #[test]
+    fn test_configured_providers_custom_without_model_uses_wire_default() {
+        let cfg = custom_cfg(
+            "ant",
+            "Ant",
+            CustomWire::Anthropic,
+            ProviderConfig {
+                base_url: Some("https://y.test".to_string()),
+                ..Default::default()
+            },
+        );
+        let listed = cfg.configured_providers();
+        let (_, model) = listed
+            .iter()
+            .find(|(name, _)| name == "custom:ant")
+            .expect("custom provider is listed");
+        assert_eq!(model, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_all_provider_ids_order() {
+        let cfg = custom_cfg("zeta", "Z", CustomWire::Openai, ProviderConfig::default());
+        let ids = cfg.all_provider_ids();
+        assert_eq!(ids.first().map(String::as_str), Some("anthropic"));
+        assert_eq!(ids.last().map(String::as_str), Some("custom:zeta"));
+    }
+
+    #[test]
+    fn test_custom_provider_active_lookups() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                model: Some("gpt-4o".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                context_window: Some(32_768),
+                use_streaming: Some(false),
+                add_dirs: None,
+            },
+        );
+        cfg.provider = Some("custom:my-llm".to_string());
+
+        assert_eq!(cfg.active_api_key(), Some("sk-1"));
+        assert_eq!(cfg.active_model(), Some("gpt-4o"));
+        assert_eq!(cfg.model_for_provider("custom:my-llm"), Some("gpt-4o"));
+        assert_eq!(cfg.active_base_url(), Some("https://x.test/v1"));
+        assert!(!cfg.active_use_streaming());
+        assert_eq!(cfg.context_window(), 32_768);
+    }
+
+    #[test]
+    fn test_custom_provider_keyless_uses_placeholder() {
+        let mut cfg = custom_cfg(
+            "local",
+            "Local",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:local".to_string());
+        // A local OpenAI-compatible server needs no key; the placeholder keeps
+        // the client builder happy the way ollama-local does.
+        assert_eq!(cfg.active_api_key(), Some("custom-local"));
+        // Streaming defaults on.
+        assert!(cfg.active_use_streaming());
+    }
+
+    #[test]
+    fn test_custom_provider_context_window_falls_back_to_wire_default() {
+        let mut cfg = custom_cfg(
+            "oai",
+            "OAI",
+            CustomWire::Openai,
+            ProviderConfig {
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.provider = Some("custom:oai".to_string());
+        assert_eq!(cfg.context_window(), 128_000);
+
+        cfg.custom.insert(
+            "ant".to_string(),
+            CustomProviderConfig {
+                display_name: "Ant".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig {
+                    base_url: Some("https://y.test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.provider = Some("custom:ant".to_string());
+        assert_eq!(cfg.context_window(), 200_000);
+    }
+
+    #[test]
+    fn test_generic_custom_base_url_is_not_mimo() {
+        // Guards spec risk 3: the MiMo Anthropic-compat heuristic must not fire
+        // for a user-supplied endpoint.
+        assert!(
+            !crate::wasm::llm::is_mimo_anthropic_compat_base_url_for_test(Some(
+                "https://gateway.mycorp.internal/anthropic"
+            ))
+        );
+        assert!(
+            crate::wasm::llm::is_mimo_anthropic_compat_base_url_for_test(Some(
+                "https://api.xiaomimimo.com/anthropic"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_provider_config_parity_with_named_fields() {
+        let cfg = LlmConfig::default();
+        // Every builtin id and alias must resolve to the very same struct the
+        // named field holds. Mirrors the arms of the old get_provider_config.
+        let cases: &[(&str, *const ProviderConfig)] = &[
+            ("anthropic", &cfg.anthropic),
+            ("openai", &cfg.openai),
+            ("deepseek", &cfg.deepseek),
+            ("qwen", &cfg.qwen),
+            ("gemini", &cfg.gemini),
+            ("groq", &cfg.groq),
+            ("openrouter", &cfg.openrouter),
+            ("mistral", &cfg.mistral),
+            ("xai", &cfg.xai),
+            ("grok", &cfg.xai),
+            ("cohere", &cfg.cohere),
+            ("perplexity", &cfg.perplexity),
+            ("together", &cfg.together),
+            ("ollama", &cfg.ollama),
+            ("claude-code", &cfg.claude_code),
+            ("claude_code", &cfg.claude_code),
+            ("gemini-cli", &cfg.gemini_cli),
+            ("gemini_cli", &cfg.gemini_cli),
+            ("antigravity", &cfg.antigravity),
+            ("antigravity-cli", &cfg.antigravity),
+            ("antigravity_cli", &cfg.antigravity),
+            ("kimi-agent", &cfg.kimi_agent),
+            ("kimi_agent", &cfg.kimi_agent),
+            ("kimi", &cfg.kimi_agent),
+            ("openclaw", &cfg.openclaw),
+            ("open_claw", &cfg.openclaw),
+            ("open-claw", &cfg.openclaw),
+        ];
+        for (id, expected) in cases {
+            let got = cfg
+                .provider_config(id)
+                .unwrap_or_else(|| panic!("provider_config({id}) returned None"));
+            assert!(
+                std::ptr::eq(got, *expected),
+                "provider_config({id}) resolved to the wrong field"
+            );
+        }
+        assert!(cfg.provider_config("nope").is_none());
+    }
+
+    /// Build a one-entry custom map for the lookup tests.
+    fn custom_cfg(id: &str, name: &str, wire: CustomWire, base: ProviderConfig) -> LlmConfig {
+        let mut cfg = LlmConfig::default();
+        cfg.custom.insert(
+            id.to_string(),
+            CustomProviderConfig {
+                display_name: name.to_string(),
+                wire,
+                accent: None,
+                base,
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn test_provider_config_resolves_custom() {
+        let cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig {
+                api_key: Some("sk-1".to_string()),
+                base_url: Some("https://x.test/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let pc = cfg
+            .provider_config("custom:my-llm")
+            .expect("custom resolves");
+        assert_eq!(pc.api_key.as_deref(), Some("sk-1"));
+        assert!(cfg.provider_config("custom:missing").is_none());
+        assert!(cfg.provider_config("custom:").is_none());
+        assert!(
+            cfg.provider_config("my-llm").is_none(),
+            "bare id must not resolve"
+        );
+    }
+
+    #[test]
+    fn test_provider_config_mut_resolves_custom() {
+        let mut cfg = custom_cfg(
+            "my-llm",
+            "My LLM",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        cfg.provider_config_mut("custom:my-llm").unwrap().model = Some("gpt-4o".to_string());
+        assert_eq!(
+            cfg.custom.get("my-llm").unwrap().base.model.as_deref(),
+            Some("gpt-4o")
+        );
+        cfg.provider_config_mut("openai").unwrap().model = Some("gpt-5".to_string());
+        assert_eq!(cfg.openai.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn test_resolve_wire() {
+        use nevoflux_llm::ProviderType;
+        let mut cfg = custom_cfg(
+            "oai",
+            "OAI-ish",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        cfg.custom.insert(
+            "ant".to_string(),
+            CustomProviderConfig {
+                display_name: "Ant-ish".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig::default(),
+            },
+        );
+
+        assert_eq!(cfg.resolve_wire("anthropic"), Some(ProviderType::Anthropic));
+        assert_eq!(
+            cfg.resolve_wire("claude_code"),
+            Some(ProviderType::ClaudeCode)
+        );
+        assert_eq!(cfg.resolve_wire("grok"), Some(ProviderType::XAi));
+        assert_eq!(cfg.resolve_wire("custom:oai"), Some(ProviderType::OpenAi));
+        assert_eq!(
+            cfg.resolve_wire("custom:ant"),
+            Some(ProviderType::Anthropic)
+        );
+        assert_eq!(cfg.resolve_wire("custom:missing"), None);
+        assert_eq!(cfg.resolve_wire("nope"), None);
+    }
+
+    #[test]
+    fn test_display_name() {
+        let cfg = custom_cfg(
+            "my-llm",
+            "\u{516c}\u{53f8}\u{7f51}\u{5173}",
+            CustomWire::Openai,
+            ProviderConfig::default(),
+        );
+        assert_eq!(
+            cfg.display_name("custom:my-llm").as_deref(),
+            Some("\u{516c}\u{53f8}\u{7f51}\u{5173}")
+        );
+        assert_eq!(cfg.display_name("openai").as_deref(), Some("openai"));
+        assert_eq!(cfg.display_name("custom:missing"), None);
+    }
+
+    #[test]
+    fn test_custom_provider_toml_round_trip() {
+        let mut config = LlmConfig::default();
+        config.provider = Some("custom:my-llm".to_string());
+        config.custom.insert(
+            "my-llm".to_string(),
+            CustomProviderConfig {
+                display_name: "My LLM".to_string(),
+                wire: CustomWire::Openai,
+                accent: Some("#7c5cff".to_string()),
+                base: ProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    model: Some("gpt-4o".to_string()),
+                    context_window: Some(32_768),
+                    add_dirs: None,
+                    base_url: Some("https://api.example.com/v1".to_string()),
+                    use_streaming: Some(true),
+                },
+            },
+        );
+        config.custom.insert(
+            "local".to_string(),
+            CustomProviderConfig {
+                display_name: "\u{672c}\u{5730}\u{7ad9}".to_string(),
+                wire: CustomWire::Anthropic,
+                accent: None,
+                base: ProviderConfig {
+                    api_key: None,
+                    model: None,
+                    context_window: None,
+                    add_dirs: None,
+                    base_url: Some("http://127.0.0.1:8080".to_string()),
+                    use_streaming: None,
+                },
+            },
+        );
+
+        let serialized =
+            toml::to_string(&config).expect("serialize LlmConfig with custom providers");
+        let parsed: LlmConfig = toml::from_str(&serialized).expect("reparse LlmConfig");
+
+        assert_eq!(parsed.custom.len(), 2);
+        let mine = parsed
+            .custom
+            .get("my-llm")
+            .expect("my-llm survives round trip");
+        assert_eq!(mine.display_name, "My LLM");
+        assert_eq!(mine.wire, CustomWire::Openai);
+        assert_eq!(mine.accent.as_deref(), Some("#7c5cff"));
+        assert_eq!(mine.base.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(mine.base.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(mine.base.context_window, Some(32_768));
+        assert_eq!(
+            mine.base.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(mine.base.use_streaming, Some(true));
+
+        let local = parsed
+            .custom
+            .get("local")
+            .expect("local survives round trip");
+        assert_eq!(local.display_name, "\u{672c}\u{5730}\u{7ad9}");
+        assert_eq!(local.wire, CustomWire::Anthropic);
+        assert_eq!(local.accent, None);
+        assert_eq!(local.base.api_key, None);
+        assert_eq!(
+            local.base.base_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+
+        // The flattened fields must sit directly under the provider table, not
+        // in a nested [custom.my-llm.base] table.
+        assert!(
+            serialized.contains("[custom.my-llm]"),
+            "actual:\n{serialized}"
+        );
+        assert!(
+            !serialized.contains("base]"),
+            "flatten regressed:\n{serialized}"
+        );
+    }
+
+    #[test]
+    fn test_custom_provider_absent_by_default() {
+        let config = LlmConfig::default();
+        assert!(config.custom.is_empty());
+        let serialized = toml::to_string(&config).expect("serialize default LlmConfig");
+        let parsed: LlmConfig = toml::from_str(&serialized).expect("reparse default");
+        assert!(parsed.custom.is_empty());
+    }
 
     #[test]
     fn test_daemon_config_default() {

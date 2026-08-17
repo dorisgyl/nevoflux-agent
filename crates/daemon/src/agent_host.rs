@@ -41,7 +41,6 @@ use nevoflux_protocol::subagent::{
 use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::VectorSearchResult;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::runtime::Handle;
@@ -1128,27 +1127,35 @@ impl DaemonHostFunctions {
 
     /// Get API key for a specific provider from config or environment.
     fn get_api_key_for_provider(&self, provider: &str) -> Result<String, HostError> {
-        // First check config struct for known providers
-        let key = match provider {
-            "anthropic" => self.config.llm.anthropic.api_key.as_deref(),
-            "openai" => self.config.llm.openai.api_key.as_deref(),
-            "qwen" => self.config.llm.qwen.api_key.as_deref(),
-            "deepseek" => self.config.llm.deepseek.api_key.as_deref(),
-            "openrouter" => self.config.llm.openrouter.api_key.as_deref(),
-            "claude-code" | "claude_code" => self.config.llm.claude_code.api_key.as_deref(),
-            "kimi-agent" | "kimi_agent" | "kimi" => self.config.llm.kimi_agent.api_key.as_deref(),
-            _ => None,
-        };
+        // Config first — one lookup covers every builtin id, every alias, and
+        // `custom:<id>`. (This used to be a partial hand-written match that
+        // listed only seven providers.)
+        let key = self
+            .config
+            .llm
+            .provider_config(provider)
+            .and_then(|pc| pc.api_key.as_deref());
 
         if let Some(k) = key.filter(|k| !k.is_empty()) {
             return Ok(k.to_string());
         }
 
+        // Keyless providers (ollama, the CLI agents, and any custom endpoint
+        // with no auth) answer with their sentinel before we consult the
+        // environment, since no env var would ever hold their key.
+        if let Some(placeholder) = crate::config::keyless_placeholder(provider) {
+            return Ok(placeholder.to_string());
+        }
+
         // Fall back to environment variable
-        let pt = ProviderType::from_str(provider).map_err(|_| HostError {
-            code: 3,
-            message: format!("Invalid provider: {}", provider),
-        })?;
+        let pt = self
+            .config
+            .llm
+            .resolve_wire(provider)
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: format!("Invalid provider: {}", provider),
+            })?;
         let env_var = nevoflux_llm::api_key_env_var(pt);
         match std::env::var(env_var) {
             Ok(k) => Ok(k),
@@ -1272,10 +1279,17 @@ impl HostFunctions for DaemonHostFunctions {
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
-        let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
-            code: 3,
-            message: format!("Invalid provider: {}", provider_name),
-        })?;
+        // resolve_wire, not ProviderType::from_str — `provider_name` may be a
+        // custom endpoint (`custom:<id>`), which only the config can map to the
+        // Anthropic or OpenAI client path.
+        let provider = self
+            .config
+            .llm
+            .resolve_wire(&provider_name)
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: format!("Invalid provider: {}", provider_name),
+            })?;
 
         debug!(
             "llm_chat: provider={}, model={}, messages={}",
@@ -1566,10 +1580,17 @@ impl HostFunctions for DaemonHostFunctions {
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
-        let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
-            code: 3,
-            message: format!("Invalid provider: {}", provider_name),
-        })?;
+        // resolve_wire, not ProviderType::from_str — `provider_name` may be a
+        // custom endpoint (`custom:<id>`), which only the config can map to the
+        // Anthropic or OpenAI client path.
+        let provider = self
+            .config
+            .llm
+            .resolve_wire(&provider_name)
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: format!("Invalid provider: {}", provider_name),
+            })?;
 
         // Check if this provider supports streaming
         let use_streaming = self.config.llm.use_streaming_for_provider(&provider_name);
@@ -3683,8 +3704,8 @@ impl HostFunctions for DaemonHostFunctions {
             // Falls back to no-op rewrite if LLM is not available.
             let result = match self.resolve_provider_and_model() {
                 Ok((provider_name, api_key, model, base_url)) => {
-                    match ProviderType::from_str(&provider_name) {
-                        Ok(provider) => {
+                    match self.config.llm.resolve_wire(&provider_name) {
+                        Some(provider) => {
                             debug!(
                                 "orchestrate: LLM rewrite enabled (provider={}, model={})",
                                 provider_name, model
@@ -3699,7 +3720,7 @@ impl HostFunctions for DaemonHostFunctions {
                                 cancel_flag,
                             )
                         }
-                        Err(_) => {
+                        None => {
                             debug!(
                                 "orchestrate: invalid provider '{}', falling back to no-op rewrite",
                                 provider_name
@@ -4996,10 +5017,14 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn set_model_override(&self, provider: &str, model: &str) -> HostResult<()> {
         // Validate provider name
-        let _provider_type = ProviderType::from_str(provider).map_err(|_| HostError {
-            code: 10,
-            message: format!("Invalid provider: {}", provider),
-        })?;
+        let _provider_type = self
+            .config
+            .llm
+            .resolve_wire(provider)
+            .ok_or_else(|| HostError {
+                code: 10,
+                message: format!("Invalid provider: {}", provider),
+            })?;
 
         // Validate API key exists for this provider
         self.get_api_key_for_provider(provider)?;
@@ -5510,10 +5535,11 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 4,
                 message: format!("invalid tts_transcribe args: {e}"),
             })?;
-        let cfg = self.config.tts.whisper.clone();
+        let cfg = self.config.tts.clone();
+        let database = self.services.as_ref().map(|s| s.database.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                crate::tts::transcribe(&cfg, &req)
+                crate::tts::transcribe(&cfg, &req, database.as_deref())
                     .await
                     .map_err(|e| HostError {
                         code: e.code() as i32,
@@ -7545,6 +7571,102 @@ mod tests {
         let services = HostServices::new(db);
         let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
         (host, rt)
+    }
+
+    /// Build a host whose active provider is a custom OpenAI-wire endpoint.
+    fn setup_host_with_custom_provider(
+        api_key: Option<&str>,
+    ) -> (DaemonHostFunctions, tokio::runtime::Runtime) {
+        let mut cfg = AgentConfig::default();
+        cfg.llm.provider = Some("custom:gmcc".to_string());
+        cfg.llm.custom.insert(
+            "gmcc".to_string(),
+            crate::config::CustomProviderConfig {
+                display_name: "GMCC".to_string(),
+                wire: crate::config::CustomWire::Openai,
+                accent: None,
+                base: crate::config::ProviderConfig {
+                    api_key: api_key.map(|k| k.to_string()),
+                    model: Some("gpt-4o".to_string()),
+                    base_url: Some("https://gmcc.test/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let host =
+            DaemonHostFunctions::new(Arc::new(cfg), rt.handle().clone()).with_services(services);
+        (host, rt)
+    }
+
+    #[test]
+    fn custom_provider_resolves_for_the_chat_path() {
+        // Regression: llm_chat / llm_stream_start used ProviderType::from_str,
+        // which rejects `custom:<id>` and failed every turn with
+        // "Host error (3): Invalid provider: custom:gmcc".
+        let (host, _rt) = setup_host_with_custom_provider(Some("sk-gmcc"));
+        let (provider_name, api_key, model, base_url) =
+            host.resolve_provider_and_model().expect("resolves");
+        assert_eq!(provider_name, "custom:gmcc");
+        assert_eq!(api_key, "sk-gmcc");
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(base_url.as_deref(), Some("https://gmcc.test/v1"));
+
+        // The wire the chat path will actually speak.
+        assert_eq!(
+            host.config.llm.resolve_wire(&provider_name),
+            Some(ProviderType::OpenAi)
+        );
+    }
+
+    #[test]
+    fn custom_provider_api_key_lookup_covers_config_and_keyless() {
+        let (host, _rt) = setup_host_with_custom_provider(Some("sk-gmcc"));
+        assert_eq!(
+            host.get_api_key_for_provider("custom:gmcc").unwrap(),
+            "sk-gmcc"
+        );
+
+        // Keyless custom endpoint: falls through to the shared sentinel rather
+        // than looking for an environment variable that cannot exist.
+        let (keyless, _rt2) = setup_host_with_custom_provider(None);
+        assert_eq!(
+            keyless.get_api_key_for_provider("custom:gmcc").unwrap(),
+            "custom-local"
+        );
+    }
+
+    #[test]
+    fn get_api_key_for_provider_covers_every_builtin() {
+        // The old hand-written match listed only seven providers, so the rest
+        // silently fell through to the environment.
+        let mut cfg = AgentConfig::default();
+        for id in crate::config::BUILTIN_PROVIDER_IDS {
+            cfg.llm
+                .provider_config_mut(id)
+                .unwrap_or_else(|| panic!("no config slot for builtin {id}"))
+                .api_key = Some(format!("key-{id}"));
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(Arc::new(cfg), rt.handle().clone());
+        for id in crate::config::BUILTIN_PROVIDER_IDS {
+            assert_eq!(
+                host.get_api_key_for_provider(id).unwrap(),
+                format!("key-{id}"),
+                "builtin provider {id} did not resolve from config"
+            );
+        }
+    }
+
+    #[test]
+    fn set_model_override_accepts_a_custom_provider() {
+        let (host, _rt) = setup_host_with_custom_provider(Some("sk-gmcc"));
+        host.set_model_override("custom:gmcc", "gpt-4o-mini")
+            .expect("custom provider is a valid override target");
+        host.set_model_override("not-a-provider", "x")
+            .expect_err("unknown provider is still rejected");
     }
 
     /// Setup host with an empty skills registry (no default directories).

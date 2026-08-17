@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Core daemon for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
 # Peer-to-peer transport for remote sessions. Off by default: str0m pulls around
 # a hundred crates, and until a session can reach the peer path that cost buys
 # nothing. `remote::rtc` compiles either way and falls back to the relay.
@@ -19,6 +19,21 @@ embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
 tts-local = ["dep:nevoflux-tts"]
+# SenseVoice transcription. On by default: it is the engine `auto` routes to,
+# and without it `tts_transcribe` can only report that it is absent.
+asr-sensevoice = ["nevoflux-asr/sensevoice"]
+# Whisper via Candle. ON by default, which it was not at first.
+#
+# Linking Candle costs +3.3 MB stripped (measured: 106.7 -> 110.0), and the
+# weights load lazily, so a build with this on costs almost nothing until
+# something routes to Whisper. Off by default meant the opposite of a saving:
+# `auto` sends every language SenseVoice cannot distinguish here, so a German
+# recording failed on a stock build and the remedy was a rebuild.
+#
+# What the size costs is memory when it runs, and that is why the default
+# model is `base` (585 MB) rather than large-v3-turbo (4.8 GB). See
+# WHISPER_DEFAULT_SIZE.
+asr-whisper = ["nevoflux-asr/whisper"]
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:
 #   * ort-load-dynamic (default): load `libonnxruntime` at startup via
 #     ORT_DYLIB_PATH or bundled next to the exe. Runs on glibc >= 2.27; ship a
@@ -30,11 +45,13 @@ ort-download-binaries = [
     "nevoflux-llm/ort-download-binaries",
     "nevoflux-llm-gateway/ort-download-binaries",
     "nevoflux-tts?/ort-download-binaries",
+    "nevoflux-asr/ort-download-binaries",
 ]
 ort-load-dynamic = [
     "nevoflux-llm/ort-load-dynamic",
     "nevoflux-llm-gateway/ort-load-dynamic",
     "nevoflux-tts?/ort-load-dynamic",
+    "nevoflux-asr/ort-load-dynamic",
 ]
 
 [dependencies]
@@ -49,6 +66,7 @@ nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-tts = { path = "../tts", optional = true }
 nevoflux-rtc-transport = { path = "../rtc-transport", features = ["tokio-driver"], optional = true }
+nevoflux-asr = { path = "../asr" }
 nevoflux-brain = { path = "../brain" }
 nevoflux-pack = { path = "../pack" }
 

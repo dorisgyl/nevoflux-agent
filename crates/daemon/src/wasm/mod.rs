@@ -5,6 +5,7 @@
 
 pub mod antigravity_session;
 pub mod instance;
+pub mod json_normalizing_client;
 pub mod linker;
 pub mod llm;
 pub mod mcp_http_server;

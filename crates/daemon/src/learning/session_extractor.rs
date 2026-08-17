@@ -195,7 +195,7 @@ pub async fn extract_session_memories(
     let active_provider = config
         .llm
         .active_provider()
-        .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
+        .and_then(|p| config.llm.resolve_wire(p));
     let is_fallback = active_provider.map(|ap| ap != provider).unwrap_or(false);
     let model = if is_fallback {
         nevoflux_llm::default_model_for(provider)

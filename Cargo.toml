@@ -26,6 +26,7 @@ members = [
     "crates/builtin-wasm",
     "crates/tts",
     "crates/rtc-transport",
+    "crates/asr",
 ]
 # Evaluation harnesses (see experiments/README.md). Excluded rather than left
 # unlisted so the intent is on the record: they pull dependency trees that must
@@ -33,7 +34,7 @@ members = [
 exclude = ["experiments"]
 
 [workspace.package]
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 license = "AGPL-3.0"
 repository = "https://github.com/nevoflux-browser/nevoflux-agent"
@@ -102,7 +103,7 @@ wasmtime = "27"
 wasmtime-wasi = "27"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
 embedding = ["nevoflux-daemon/embedding"]
 # Local Kokoro speech, forwarded to nevoflux-daemon.
 tts-local = ["nevoflux-daemon/tts-local"]
@@ -111,6 +112,11 @@ tts-local = ["nevoflux-daemon/tts-local"]
 # networks yet. Without it every range takes the relay, as it does today.
 #   cargo build --features webrtc
 webrtc = ["nevoflux-daemon/webrtc"]
+# Local SenseVoice transcription, forwarded to nevoflux-daemon.
+asr-sensevoice = ["nevoflux-daemon/asr-sensevoice"]
+# Whisper via Candle, forwarded to nevoflux-daemon. On by default; the
+# default model is `base`, chosen for footprint. See the daemon manifest.
+asr-whisper = ["nevoflux-daemon/asr-whisper"]
 # ONNX Runtime linking strategy, forwarded to nevoflux-daemon. Pick one:
 #   * ort-load-dynamic (default): load libonnxruntime at startup via
 #     ORT_DYLIB_PATH or bundled next to the exe (runs on glibc >= 2.27).

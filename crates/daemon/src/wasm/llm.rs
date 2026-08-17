@@ -5,6 +5,7 @@
 
 use crate::error::{DaemonError, Result};
 use crate::wasm::antigravity_session;
+use crate::wasm::json_normalizing_client::JsonNormalizingClient;
 use futures::StreamExt;
 use nevoflux_llm::providers::acp::context::compress_history;
 use nevoflux_llm::providers::acp::tools::{
@@ -501,9 +502,12 @@ async fn execute_openai_chat(
         // so every tool's parameters schema must be strict-compliant.
         let mut request = request;
         sanitize_request_tools_for_openai_strict(&mut request);
-        let client: openai::Client =
-            openai::Client::builder()
+        // JsonNormalizingClient: rig emits a duplicate `role` key in Responses
+        // API request bodies, which OpenAI rejects. See that module's docs.
+        let client: openai::Client<JsonNormalizingClient> =
+            openai::Client::<reqwest::Client>::builder()
                 .api_key(api_key)
+                .http_client(JsonNormalizingClient::new())
                 .build()
                 .map_err(|e| {
                     DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
@@ -600,6 +604,13 @@ fn is_mimo_anthropic_compat_base_url(url: Option<&str>) -> bool {
         lower.contains("xiaomimimo.com") && lower.contains("/anthropic")
     })
     .unwrap_or(false)
+}
+
+/// Test-only accessor for [`is_mimo_anthropic_compat_base_url`], so the config
+/// tests can assert a user-supplied custom base URL never matches it.
+#[cfg(test)]
+pub fn is_mimo_anthropic_compat_base_url_for_test(url: Option<&str>) -> bool {
+    is_mimo_anthropic_compat_base_url(url)
 }
 
 /// Recursively rewrite a JSON Schema so it satisfies OpenAI Responses API
@@ -2681,9 +2692,12 @@ async fn stream_openai(
         // here — see `sanitize_schema_for_openai_strict` docs.
         let mut request = request;
         sanitize_request_tools_for_openai_strict(&mut request);
-        let client: openai::Client =
-            openai::Client::builder()
+        // JsonNormalizingClient: rig emits a duplicate `role` key in Responses
+        // API request bodies, which OpenAI rejects. See that module's docs.
+        let client: openai::Client<JsonNormalizingClient> =
+            openai::Client::<reqwest::Client>::builder()
                 .api_key(api_key)
+                .http_client(JsonNormalizingClient::new())
                 .build()
                 .map_err(|e| {
                     DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
