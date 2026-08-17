@@ -385,11 +385,19 @@ pub fn on_signal(
                         _ => {}
                     }
                 }
-                tracing::info!(target: "rtc", "peer connection gone; back on the relay");
                 // A screencast outliving its connection is a camera left
                 // running with nowhere to send the picture.
                 super::screencast::forget_session(&gone);
                 watch.set_path(Path::Relay);
+                // After the transition, so the count includes this one. It is
+                // what decides whether the session goes on offering, and a
+                // number that decides something has to be readable while it
+                // climbs rather than only when it arrives.
+                tracing::info!(
+                    target: "rtc",
+                    never_formed = watch.failures(),
+                    "peer connection gone; back on the relay"
+                );
             });
 
             *slot = PeerSlot::Running {

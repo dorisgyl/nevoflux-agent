@@ -965,16 +965,9 @@ impl PortalGateway {
                     // Cheap, idempotent, and the portal cannot render a reply
                     // without it.
                     self.announce().await;
-                    // A run of failures describes one pairing of two networks,
-                    // and somebody attaching changes the other half of it —
-                    // a different phone, or the same one off the train. Bounded
-                    // either way: this buys four more attempts, not forever.
-                    #[cfg(feature = "webrtc")]
-                    {
-                        self.rtc.reconsider();
-                        self.gave_up_on_peer
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    // Deliberately not a reason to reconsider a peer path that
+                    // has been refused: this notice is a count, and it arrives
+                    // on every reconnect. See `rtc::GIVE_UP_AFTER_FAILURES`.
                     self.spawn_offer();
                 } else {
                     // The relay saying a frame reached nobody. Worth a line:
@@ -2248,14 +2241,22 @@ mod tests {
             "kept offering a connection that has failed to form four times"
         );
 
-        // A portal attaching is a different far end, so it is asked again.
-        gw.rtc.reconsider();
+        // And a portal attaching does not undo it. That notice arrives on every
+        // reconnect, and the run this was written against dropped the relay
+        // socket eight times in ninety seconds — clearing on each one is a
+        // limit that never trips, on the network it exists for.
+        let inj = CollectInjector::default();
+        for _ in 0..3 {
+            gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), "sess", &inj)
+                .await;
+        }
+        // Each of those sent an announce, which is right and is not an offer.
+        sink.sent.lock().await.clear();
         *gw.last_offer.lock().await = None;
         gw.offer_peer_connection().await;
-        assert_eq!(
-            sink.sent.lock().await.len(),
-            1,
-            "a new portal did not get an offer"
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "a presence notice re-armed a peer path that keeps failing"
         );
     }
 

@@ -93,6 +93,18 @@ pub struct RtcState {
 ///
 /// Four, because a connection that is going to form does so on the first or
 /// second try; four failures in a row is a network saying no, not bad luck.
+///
+/// Nothing re-arms it short of a new session. Re-arming when a portal attaches
+/// was tried and is wrong: the relay's presence notice is a count, not an
+/// identity, and it arrives on every reconnect. On the run this was written
+/// against the relay dropped the socket eight times in ninety seconds, so the
+/// count would have been cleared faster than it could climb — a limit that
+/// never trips, on exactly the flapping network it exists for.
+///
+/// Telling a new far end from the same one reconnecting needs a pairing event,
+/// which the presence notice deliberately is not (the relay does not label
+/// connections). So this gives up for the life of the session, and a session is
+/// short: re-pairing or restarting the head starts it over.
 #[cfg(feature = "webrtc")]
 pub(super) const GIVE_UP_AFTER_FAILURES: u32 = 4;
 
@@ -158,17 +170,21 @@ impl RtcState {
         }
     }
 
-    /// Offer again despite past failures — the far end is new.
+    /// How many have failed to form in a row, for saying so out loud.
     ///
-    /// A count of consecutive failures describes one pairing of two networks.
-    /// When a different portal attaches, the other half of that pair has
-    /// changed and the count no longer describes anything.
-    #[allow(dead_code)]
-    pub fn reconsider(&self) {
+    /// A count that decides something has to be visible while it climbs. This
+    /// one was not, and the run that showed it also showed why that is not a
+    /// small thing: the relay flapped eight times in ninety seconds, and with
+    /// nothing printing the count there was no way to tell from a log whether
+    /// it had reached three or been reset twice on the way.
+    pub fn failures(&self) -> u32 {
         #[cfg(feature = "webrtc")]
         {
-            self.never_formed
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.never_formed.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "webrtc"))]
+        {
+            0
         }
     }
 }
@@ -305,16 +321,35 @@ mod giving_up {
     }
 
     #[test]
-    fn a_portal_arriving_is_a_reason_to_try_again() {
-        // The count describes one pairing of two networks. Somebody attaching
-        // replaces half of it.
+    fn giving_up_is_undone_by_a_connection_and_by_nothing_else() {
+        // A portal attaching used to clear this, on the reasoning that the
+        // count describes one pairing of two networks and somebody arriving
+        // replaces half of it. True, and unusable: the notice that says
+        // somebody arrived is a count, not an identity, and it arrives on every
+        // reconnect — so on a flapping relay the limit was cleared faster than
+        // it could climb.
         let s = RtcState::new();
         for _ in 0..GIVE_UP_AFTER_FAILURES {
             failed(&s);
         }
         assert!(s.keeps_failing());
-        s.reconsider();
+        // Only a connection that opens clears it, and that is loud already.
+        opened_then_died(&s);
         assert!(!s.keeps_failing());
+    }
+
+    #[test]
+    fn the_count_can_be_read_while_it_climbs() {
+        // A number that decides something has to be visible before it decides.
+        // This one was not, and on a run where the relay dropped the socket
+        // eight times in ninety seconds there was no way to tell from the log
+        // whether it had reached three or been cleared twice on the way.
+        let s = RtcState::new();
+        assert_eq!(s.failures(), 0);
+        for i in 1..=GIVE_UP_AFTER_FAILURES {
+            failed(&s);
+            assert_eq!(s.failures(), i);
+        }
     }
 
     #[test]
