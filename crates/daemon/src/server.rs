@@ -230,7 +230,7 @@ type CancellationRegistry = Arc<Mutex<HashMap<String, tokio_util::sync::Cancella
 
 /// Registry for active agent interrupt flags.
 /// Maps session_id to the interrupt flag so stop_generation can signal the agent to stop.
-type InterruptRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+type InterruptRegistry = Arc<crate::interrupt::InterruptRegistry>;
 
 /// Registry for pending tool authorization requests.
 /// Maps tool_id to the response sender.
@@ -944,7 +944,8 @@ pub async fn start_server(
     let cancellation_registry: CancellationRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Create interrupt registry for signalling agents to stop
-    let interrupt_registry: InterruptRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let interrupt_registry: InterruptRegistry =
+        Arc::new(crate::interrupt::InterruptRegistry::new());
 
     // Last browser tab context seen for a session, keyed by session_id.
     //
@@ -964,6 +965,17 @@ pub async fn start_server(
 
     // Create tool auth registry for pending tool authorization requests
     let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // Voice uplink (P2). Process-level for the same reason the recognizer is:
+    // one engine, one scheduler, and the invariant that a session has at most
+    // one utterance being transcribed at a time.
+    let speech_registry = Arc::new(crate::speech::SpeechRegistry::new(Arc::new(
+        crate::speech::AsrScheduler::new(),
+    )));
+    // Voice downlink (P3). Separate from the uplink registry because the two
+    // are independent: the agent can be speaking while the user is not, and
+    // the user can be speaking while the agent is not — that is what full
+    // duplex means.
+    let voice_registry = Arc::new(crate::speech::VoiceRegistry::new());
 
     // Create extraction registry for session-level memory extractors
     let extraction_registry: ExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -2352,6 +2364,8 @@ pub async fn start_server(
     let process_tab_context_registry = tab_context_registry.clone();
     let process_plan_registry = plan_registry.clone();
     let process_tool_auth_registry = tool_auth_registry.clone();
+    let process_speech_registry = speech_registry.clone();
+    let process_voice_registry = voice_registry.clone();
     let process_extraction_registry = extraction_registry.clone();
     let process_event_bus = event_bus.clone();
     let process_subscription_router = subscription_router.clone();
@@ -2467,12 +2481,8 @@ pub async fn start_server(
                 info!("Received stop_generation for session: {}", session_id);
 
                 // Signal the agent to stop via interrupt flag
-                {
-                    let mut registry = process_interrupt_registry.lock().await;
-                    if let Some(flag) = registry.remove(session_id) {
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        info!("Set interrupt flag for session: {}", session_id);
-                    }
+                if process_interrupt_registry.interrupt(session_id).await {
+                    info!("Set interrupt flag for session: {}", session_id);
                 }
 
                 // Cancel the active streaming session forwarder
@@ -2715,6 +2725,307 @@ pub async fn start_server(
                             warn!("No pending tool auth request for tool_id: {}", tool_id);
                         }
                     }
+                }
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // Voice downlink (P3). `voice_say` takes a model answer, splits it
+            // into prose and `<speak>` script, and speaks the script sentence by
+            // sentence; `voice_barge_in` stops it.
+            //
+            // The audience is this connection, passed in explicitly — never
+            // discovered from `remote::push`, which cannot tell an answer meant
+            // for the person at the sidebar from a video voiceover (ADR-0001).
+            // ---------------------------------------------------------------
+            if msg_type == "voice_mode" {
+                let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
+                let session_id = payload
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let on = payload.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+                crate::speech::conversation()
+                    .set_voice_mode(&session_id, on)
+                    .await;
+                debug!("voice mode {} for session {}", on, session_id);
+                continue;
+            }
+
+            if msg_type == "voice_say" || msg_type == "voice_barge_in" {
+                let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
+                let s = |k: &str| {
+                    payload
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let session_id = s("session_id");
+                let turn_id = s("turn_id");
+
+                if msg_type == "voice_barge_in" {
+                    // 两个注册表都要问:`voice_say` 走的是连接级的那个,
+                    // 聊天流式旁路走的是进程级的那个。用户不知道也不该知道
+                    // 这一轮是哪条路来的。
+                    let a = process_voice_registry.barge_in(&session_id, &turn_id).await;
+                    let b = crate::speech::conversation()
+                        .turns
+                        .barge_in(&session_id, &turn_id)
+                        .await;
+                    debug!("voice: barge-in on {} → {:?}/{:?}", turn_id, a, b);
+
+                    // 投递注记(ADR-0004)。
+                    //
+                    // 只在**投递与内容不一致**时写 —— 完整听完是默认假设,
+                    // 为默认假设写注记是纯噪音。写的是元信息而不是副本:模型
+                    // 需要知道的是「用户实际收到了多少」,不是再存一份口语稿。
+                    // 不判「播出 < 生成」:打断**按构造**就意味着截断 ——
+                    // 浏览器只在一轮语音活着时才发这条,轮次一结束就清掉了
+                    // turn_id。留一个算不准的条件,比没有条件更坏。
+                    let played = payload.get("played").and_then(|v| v.as_u64()).unwrap_or(0);
+                    {
+                        let db = process_services.database.clone();
+                        let sid = session_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let repo = nevoflux_storage::repositories::MessageRepository::new(&db);
+                            match repo.get_last_by_role(&sid, "assistant") {
+                                Ok(Some(msg)) => {
+                                    let mut patch = std::collections::HashMap::new();
+                                    patch.insert(
+                                        "voice_delivery".to_string(),
+                                        serde_json::json!({
+                                            "interrupted": true,
+                                            "played_sentences": played,
+                                        }),
+                                    );
+                                    if let Err(e) = repo.merge_metadata(&msg.id, &patch) {
+                                        warn!("voice: delivery note not written: {}", e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!("voice: no assistant message to annotate: {}", e),
+                            }
+                        });
+                    }
+                    continue;
+                }
+
+                let text = s("text");
+                let voice = payload
+                    .get("voice")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let kokoro_cfg = process_config.read().unwrap().tts.kokoro.clone();
+                match crate::tts::kokoro::conversation_synthesizer(&kokoro_cfg) {
+                    Ok(synth) => {
+                        let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
+                        let tx = process_response_tx.clone();
+                        let ident = identity.clone();
+                        let pid = proxy_id.clone();
+                        tokio::spawn(async move {
+                            while let Some(out) = vrx.recv().await {
+                                let (kind, body) = match out {
+                                    crate::speech::VoiceOut::Audio(a) => {
+                                        ("voice_audio", serde_json::to_value(a).unwrap_or_default())
+                                    }
+                                    crate::speech::VoiceOut::Done(d) => {
+                                        ("voice_done", serde_json::to_value(d).unwrap_or_default())
+                                    }
+                                    crate::speech::VoiceOut::Failed(f) => (
+                                        "voice_failed",
+                                        serde_json::to_value(f).unwrap_or_default(),
+                                    ),
+                                };
+                                let env = DaemonEnvelope::new(
+                                    &pid,
+                                    channel,
+                                    serde_json::json!({ "type": kind, "payload": body }),
+                                );
+                                if tx.send((ident.clone(), env)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        let mut turn = crate::speech::VoiceTurn::new(
+                            session_id.clone(),
+                            turn_id.clone(),
+                            voice,
+                            synth,
+                            vtx,
+                        );
+                        process_voice_registry
+                            .begin(&session_id, &turn_id, turn.canceller())
+                            .await;
+
+                        let registry = process_voice_registry.clone();
+                        let sid = session_id.clone();
+                        let tid = turn_id.clone();
+                        tokio::spawn(async move {
+                            // The splitter is fed the whole answer here because
+                            // `voice_say` carries one; on the streaming path it
+                            // gets deltas instead, and its contract is that the
+                            // two produce the same pieces.
+                            let mut sp = crate::speech::SpeakSplitter::new(400);
+                            let mut pieces = sp.push(&text);
+                            pieces.extend(sp.finish());
+                            for p in pieces {
+                                if let crate::speech::Piece::Spoken(sentence) = p {
+                                    turn.say(&sentence).await;
+                                }
+                            }
+                            turn.finish();
+                            registry.end(&sid, &tid).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!("voice: no synthesizer available: {}", e);
+                        let env = DaemonEnvelope::new(
+                            &proxy_id,
+                            channel,
+                            serde_json::json!({
+                                "type": "voice_failed",
+                                "payload": {
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "message": e.to_string(),
+                                }
+                            }),
+                        );
+                        let _ = process_response_tx.send((identity, env)).await;
+                    }
+                }
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // Voice uplink (P2). The browser does capture and VAD; these four
+            // messages carry one utterance from speech-start to authoritative
+            // transcript. Every one of them is checked against the utterance id
+            // by the registry — chunks from a cancelled or superseded utterance
+            // are still in flight and must not land in the next one's buffer.
+            // ---------------------------------------------------------------
+            if let Some(rest) = msg_type.strip_prefix("speech_") {
+                let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
+                let s = |k: &str| {
+                    payload
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let session_id = s("session_id");
+                let utterance_id = s("utterance_id");
+
+                match rest {
+                    "start" => {
+                        let sample_rate = payload
+                            .get("sample_rate")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(nevoflux_protocol::speech::SPEECH_SAMPLE_RATE as u64)
+                            as u32;
+                        let tts_cfg = process_config.read().unwrap().tts.clone();
+                        match crate::tts::asr::conversation_transcriber(&tts_cfg) {
+                            Ok(transcriber) => {
+                                // One forwarding task per utterance: it owns the
+                                // channel back to this proxy and dies with the
+                                // utterance, so nothing process-level has to know
+                                // which connection a transcript belongs to.
+                                let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+                                let tx = process_response_tx.clone();
+                                let ident = identity.clone();
+                                let pid = proxy_id.clone();
+                                tokio::spawn(async move {
+                                    while let Some(emit) = erx.recv().await {
+                                        let (kind, body) = match emit {
+                                            crate::speech::Emit::Partial(p) => (
+                                                "speech_partial",
+                                                serde_json::to_value(p).unwrap_or_default(),
+                                            ),
+                                            crate::speech::Emit::Final(f) => (
+                                                "speech_final",
+                                                serde_json::to_value(f).unwrap_or_default(),
+                                            ),
+                                            crate::speech::Emit::Failed {
+                                                utterance_id,
+                                                message,
+                                            } => (
+                                                "speech_error",
+                                                serde_json::json!({
+                                                    "utterance_id": utterance_id,
+                                                    "message": message,
+                                                }),
+                                            ),
+                                        };
+                                        let env = DaemonEnvelope::new(
+                                            &pid,
+                                            channel,
+                                            serde_json::json!({ "type": kind, "payload": body }),
+                                        );
+                                        if tx.send((ident.clone(), env)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                process_speech_registry
+                                    .start(
+                                        &session_id,
+                                        &utterance_id,
+                                        sample_rate,
+                                        None,
+                                        transcriber,
+                                        etx,
+                                    )
+                                    .await;
+                                debug!(
+                                    "speech: utterance {} started for session {}",
+                                    utterance_id, session_id
+                                );
+                            }
+                            Err(e) => {
+                                warn!("speech: no recognizer available: {}", e);
+                                let env = DaemonEnvelope::new(
+                                    &proxy_id,
+                                    channel,
+                                    serde_json::json!({
+                                        "type": "speech_error",
+                                        "payload": {
+                                            "session_id": session_id,
+                                            "utterance_id": utterance_id,
+                                            "message": e.to_string(),
+                                        }
+                                    }),
+                                );
+                                let _ = process_response_tx.send((identity, env)).await;
+                            }
+                        }
+                    }
+                    "chunk" => {
+                        let seq = payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let pcm = s("pcm");
+                        let routed = process_speech_registry
+                            .chunk(&session_id, &utterance_id, seq, pcm)
+                            .await;
+                        if routed != crate::speech::Routed::Delivered {
+                            debug!(
+                                "speech: chunk {} for {} dropped ({:?})",
+                                seq, utterance_id, routed
+                            );
+                        }
+                    }
+                    "end" => {
+                        process_speech_registry
+                            .end(&session_id, &utterance_id)
+                            .await;
+                    }
+                    "cancel" => {
+                        process_speech_registry
+                            .cancel(&session_id, &utterance_id)
+                            .await;
+                    }
+                    other => warn!("speech: unknown message speech_{}", other),
                 }
                 continue;
             }
@@ -5732,12 +6043,7 @@ async fn handle_chat_message_streaming(
         // A turn already in flight would write its answer into the session we
         // are about to empty. Stop it the same way the stop button does: raise
         // the interrupt flag the agent polls, and cancel the stream forwarder.
-        {
-            let mut registry = interrupt_registry.lock().await;
-            if let Some(flag) = registry.remove(&session_id) {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        interrupt_registry.interrupt(&session_id).await;
         {
             let mut registry = cancellation_registry.lock().await;
             if let Some(token) = registry.remove(&session_id) {
@@ -6038,13 +6344,11 @@ async fn handle_chat_message_streaming(
     }
 
     // Create a per-session interrupt flag and register it so stop_generation can find it
-    let session_interrupt_flag = Arc::new(AtomicBool::new(false));
-    services_with_context.interrupt_flag = session_interrupt_flag.clone();
-    {
-        let mut registry = interrupt_registry.lock().await;
-        registry.insert(session_id.clone(), session_interrupt_flag);
-        debug!("Registered interrupt flag for session: {}", session_id);
-    }
+    // 拿一个轮次令牌。已有的一轮会被停掉 —— 一个 session 同时只有一轮,
+    // 而语音把这条不变量的执行者从 UI 拿走了(ADR-0002)。
+    let (turn_token, session_interrupt_flag) = interrupt_registry.begin(&session_id).await;
+    services_with_context.interrupt_flag = session_interrupt_flag;
+    debug!("Registered interrupt flag for session: {}", session_id);
 
     // Get or create session-level extractor from registry
     let session_extractor = {
@@ -6181,6 +6485,92 @@ async fn handle_chat_message_streaming(
     let stream_title = generated_title.clone();
     let forwarder_cancellation = cancellation_token.clone();
 
+    // 语音旁路:开了语音的 session,把正在流出的回答同时喂给拆流器,
+    // 逐句合成。**只发不等**,而且发失败也只是没有声音 —— 这条路径绝不能
+    // 影响文字回答的转发,那是产品里最承重的一条。
+    let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> =
+        if crate::speech::conversation().voice_mode(&session_id).await {
+            let kokoro_cfg = config.tts.kokoro.clone();
+            match crate::tts::kokoro::conversation_synthesizer(&kokoro_cfg) {
+                Ok(synth) => {
+                    let (ttx, mut trx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
+                    let turn_id = format!("vt_{}", uuid::Uuid::new_v4());
+                    let sid = session_id.clone();
+
+                    // 出口:VoiceOut → envelope。听众是这条连接,显式传入(ADR-0001)。
+                    let tx = response_tx.clone();
+                    let ident = identity.clone();
+                    let pid = proxy_id.clone();
+                    let ch = channel;
+                    tokio::spawn(async move {
+                        while let Some(out) = vrx.recv().await {
+                            let (kind, body) = match out {
+                                crate::speech::VoiceOut::Audio(a) => {
+                                    ("voice_audio", serde_json::to_value(a).unwrap_or_default())
+                                }
+                                crate::speech::VoiceOut::Done(d) => {
+                                    ("voice_done", serde_json::to_value(d).unwrap_or_default())
+                                }
+                                crate::speech::VoiceOut::Failed(f) => {
+                                    ("voice_failed", serde_json::to_value(f).unwrap_or_default())
+                                }
+                            };
+                            let env = DaemonEnvelope::new(
+                                &pid,
+                                ch,
+                                serde_json::json!({ "type": kind, "payload": body }),
+                            );
+                            if tx.send((ident.clone(), env)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    // 入口:delta → 拆流 → 逐句合成。
+                    let sid2 = sid.clone();
+                    let tid = turn_id.clone();
+                    tokio::spawn(async move {
+                        let mut turn = crate::speech::VoiceTurn::new(
+                            sid2.clone(),
+                            tid.clone(),
+                            None,
+                            synth,
+                            vtx,
+                        );
+                        crate::speech::conversation()
+                            .turns
+                            .begin(&sid2, &tid, turn.canceller())
+                            .await;
+                        // 400:Q50 的「等太久」判据 —— `<speak>` 先出,超过这么多
+                        // 正文字符仍未见开标签,这一轮就没有口语稿。
+                        let mut sp = crate::speech::SpeakSplitter::new(400);
+                        while let Some(delta) = trx.recv().await {
+                            for piece in sp.push(&delta) {
+                                if let crate::speech::Piece::Spoken(sentence) = piece {
+                                    turn.say(&sentence).await;
+                                }
+                            }
+                        }
+                        for piece in sp.finish() {
+                            if let crate::speech::Piece::Spoken(sentence) = piece {
+                                turn.say(&sentence).await;
+                            }
+                        }
+                        turn.finish();
+                        crate::speech::conversation().turns.end(&sid2, &tid).await;
+                    });
+                    Some(ttx)
+                }
+                Err(e) => {
+                    warn!("voice mode on but no synthesizer: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Spawn task to forward stream chunks to the sidebar
     // Uses 300ms batch throttle: text chunks are buffered and flushed on interval tick,
     // while tool events and done signals flush immediately.
@@ -6238,6 +6628,12 @@ async fn handle_chat_message_streaming(
                 let text = std::mem::take(&mut buffer);
                 let is_first_chunk = accumulated_text.is_empty();
                 accumulated_text.push_str(&text);
+                // 语音旁路。发不出去只意味着没有声音,文字照走。
+                if let Some(ref tap) = voice_tap {
+                    if !text.is_empty() {
+                        let _ = tap.send(text.clone());
+                    }
+                }
 
                 if !text.is_empty() {
                     if text.len() <= MAX_PROXY_CHUNK {
@@ -6393,11 +6789,9 @@ async fn handle_chat_message_streaming(
         registry.remove(&session_id);
         debug!("Removed cancellation token for session: {}", session_id);
     }
-    {
-        let mut registry = interrupt_registry.lock().await;
-        registry.remove(&session_id);
-        debug!("Removed interrupt flag for session: {}", session_id);
-    }
+    // 只在仍是同一轮时摘除。无条件摘会把刚开始的下一轮也变成不可停。
+    interrupt_registry.end(&session_id, turn_token).await;
+    debug!("Removed interrupt flag for session: {}", session_id);
 
     // Note: Do NOT call trace_collector.cleanup_session() here —
     // it deletes trace_spans from SQLite, preventing the learning
