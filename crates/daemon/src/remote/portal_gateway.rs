@@ -1036,23 +1036,23 @@ impl PortalGateway {
 /// internal event the daemon publishes.
 /// The largest frame worth handing to the data channel.
 ///
-/// SCTP will not carry a message of any size: browsers negotiate
-/// `a=max-message-size` and commonly settle at 256 KiB, and an oversized
-/// message is refused rather than truncated. That is exactly
-/// [`super::asset::CHUNK_BYTES`] before the frame header and the AEAD tag,
-/// which put a full range over it.
+/// The binding limit is str0m's send buffer, not SCTP's message size. This was
+/// set to 192 KiB against `a=max-message-size`, which browsers commonly settle
+/// at 256 KiB — true, and not the constraint that bites. `RtcSctp::available()`
+/// returns `MAX_BUFFERED_ACROSS_STREAMS - buffered`, and that constant is
+/// 128 KiB in str0m 0.22; `Channel::write` refuses anything larger than what is
+/// free rather than accepting part of it. A 188 KiB range therefore could not
+/// fit an *empty* buffer, and every video range was refused — silently, because
+/// the refusal arrives as `Ok(false)` and the caller read it with `is_ok()`.
 ///
-/// So a full-sized range takes the relay and a smaller one does not. Shrinking
-/// the range instead was tried and was worse than doing nothing: the portal
-/// plans its offsets from its own copy of the chunk size and never reads how
-/// much actually came back, so every short read left a hole it did not go back
-/// for. Pictures came through in quarters and video did not play, with every
-/// range logged as served.
+/// So this is now sized to leave room inside 128 KiB rather than inside 256 KiB.
+/// A range that fits still travels peer-to-peer, which is most images and every
+/// screenshot; video does not, and takes the relay as it always has.
 ///
-/// Carrying whole files this way — most images are one range — is worth having
-/// on its own. Carrying video too needs the two ends to agree a chunk size
-/// rather than each holding a constant, which is a change for both of them.
-const PEER_FRAME_LIMIT: usize = 192 * 1024;
+/// Raising it needs str0m's buffer raised first — a private constant, so a fork
+/// or an upstream change, and one made against whatever congestion reasoning
+/// put it at 128 KiB.
+const PEER_FRAME_LIMIT: usize = 120 * 1024;
 
 /// Whether a range of `payload` bytes will fit in a data channel message once
 /// it is framed. The allowance covers the frame header and the AEAD tag.
@@ -1060,25 +1060,35 @@ const fn fits_the_data_channel(payload: usize) -> bool {
     payload.saturating_add(4096) <= PEER_FRAME_LIMIT
 }
 
-/// What the store advertises has to be something this will actually take.
+/// str0m's send buffer, which is what actually decides whether a range fits.
 ///
-/// The two constants live apart — one is what the portal is told to plan on,
-/// the other is what the send path will carry — and they only mean anything
-/// together. Drifted, every range falls back to the relay in silence while a
-/// peer connection sits there negotiated, connected, and reported as carrying
-/// media. That is precisely what they did, for as long as nothing checked.
+/// Private to str0m, so it cannot be imported and is restated here. Pinning it
+/// is the point: if a future str0m raises or lowers it, the number below is the
+/// one thing that has to move with it, and a limit sized against the old value
+/// would go on refusing every range in silence.
+#[cfg(feature = "webrtc")]
+const STR0M_SEND_BUFFER: usize = 128 * 1024;
+
+/// A range this side offers the data channel has to be one it will take.
+///
+/// The limit was sized against SCTP's message size and the buffer is smaller,
+/// so every video range was refused — and refused as `Ok(false)`, which read as
+/// success. Both halves are fixed; this keeps the arithmetic from drifting back.
 ///
 /// A compile error rather than a failing test, because a build that cannot
 /// honour this should not exist.
 #[cfg(feature = "webrtc")]
 const _: () = {
     assert!(
-        fits_the_data_channel(super::asset::PLAN_CHUNK_BYTES),
-        "the advertised chunk must fit the data channel, or the peer path carries nothing"
+        PEER_FRAME_LIMIT < STR0M_SEND_BUFFER,
+        "a range at the limit must fit str0m's buffer with room, not merely equal it"
     );
+    // Sized for the relay and deliberately past what the channel will take, so
+    // that video takes the socket rather than paying four times the requests
+    // for a path that is neither cheaper in bytes nor steadier.
     assert!(
-        super::asset::PLAN_CHUNK_BYTES < super::asset::CHUNK_BYTES,
-        "advertising the portal's own default would cost a field and buy nothing"
+        !fits_the_data_channel(super::asset::CHUNK_BYTES),
+        "if a full range fits the channel, say so here and let video take it"
     );
 };
 
@@ -1629,29 +1639,43 @@ mod tests {
         assert_eq!(delta_text(&sink).await, "看 a 好");
     }
 
-    #[cfg(feature = "webrtc")]
     #[tokio::test]
-    async fn an_offer_tells_the_portal_what_to_plan_on() {
-        // Without it the portal plans on its own constant, which is a full
-        // 256 KiB — over the data channel's message limit once framed, so every
-        // range of every video took the relay while the peer connection it had
-        // just finished negotiating carried nothing at all.
+    async fn an_offer_asks_for_exactly_what_a_pull_will_be_served() {
+        // The property the whole field exists for. The portal plans its offsets
+        // from this number and never reads how much came back, so advertising
+        // more than a pull is served leaves holes it does not return for — and
+        // advertising less is a request paid for and not used.
         let dir = tempfile::tempdir().unwrap();
         let sink = Arc::new(CollectSink::default());
         let gw = PortalGateway::new(None, sink.clone(), "sess-chunk", None, None, "chan-chunk")
             .with_asset_root(dir.path().to_path_buf());
+        let big = vec![1u8; super::super::asset::CHUNK_BYTES + 4096];
         let offer = {
             let mut store = gw.assets.lock().expect("asset store");
-            store.put(&[1u8; 32], "clip.mp4", "video/mp4").unwrap()
+            store.put(&big, "clip.mp4", "video/mp4").unwrap()
         };
+        let advertised = offer.chunk_bytes.expect("the head states a preference");
 
-        assert_eq!(
-            offer.chunk_bytes,
-            Some(super::super::asset::PLAN_CHUNK_BYTES)
-        );
+        let served = {
+            let store = gw.assets.lock().expect("asset store");
+            store.read(&offer.id, 0, advertised).unwrap().len()
+        };
+        assert_eq!(served, advertised, "a plan must never come back short");
+
         // On the wire under the name the portal reads it by.
         let json = serde_json::to_value(&offer).unwrap();
-        assert_eq!(json["chunkBytes"], super::super::asset::PLAN_CHUNK_BYTES);
+        assert_eq!(json["chunkBytes"], advertised);
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_full_range_is_known_not_to_fit_the_data_channel() {
+        // Not a wish but a fact about str0m, and the reason video takes the
+        // socket: the buffer it must fit is 128 KiB, and a full range is four
+        // times that. Stated here so the day it stops being true is a day this
+        // test fails rather than a day nobody notices.
+        assert!(!fits_the_data_channel(super::super::asset::CHUNK_BYTES));
+        assert!(fits_the_data_channel(64 * 1024), "a screenshot still fits");
     }
 
     fn pull(id: &str, binary: bool, media_channel: bool) -> serde_json::Value {
