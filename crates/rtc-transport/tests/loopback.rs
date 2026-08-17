@@ -188,6 +188,49 @@ async fn bytes_cross_the_data_channel_intact() {
 }
 
 #[tokio::test]
+async fn a_range_too_big_for_the_buffer_is_refused_without_taking_the_channel_down() {
+    // str0m bounds what may be buffered across all streams — 128 KiB in 0.22 —
+    // and `Channel::write` declines anything larger than what is free rather
+    // than accepting part of it. It says so with `Ok(false)`, which the caller
+    // read as success for as long as `is_ok()` was the test, so 188 KiB ranges
+    // were counted as sent and dropped here without a word.
+    //
+    // What matters operationally is the other half: a refusal must cost that
+    // one range and nothing else. If it poisoned the channel, the fallback
+    // would be moot — there would be nothing left to fall back from.
+    let (mut head, mut portal) = connect().await;
+
+    expect_event(&mut head, "head channel open", |e| {
+        matches!(e, DriverEvent::ChannelOpen(_))
+    })
+    .await;
+    expect_event(&mut portal, "portal channel open", |e| {
+        matches!(e, DriverEvent::ChannelOpen(_))
+    })
+    .await;
+
+    // Comfortably past the buffer, as a video range is.
+    head.outbound.send(vec![7u8; 200 * 1024]).await.unwrap();
+    // And then something that fits, sent after, so its arrival is proof the
+    // channel survived rather than proof it was merely slow.
+    let small: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    head.outbound.send(small.clone()).await.unwrap();
+
+    let got = expect_event(&mut portal, "the range that fits", |e| {
+        matches!(e, DriverEvent::Data { .. })
+    })
+    .await;
+    let DriverEvent::Data { data, .. } = got else {
+        unreachable!()
+    };
+    assert_eq!(
+        data, small,
+        "the first thing through must be the one that fit; the oversized range \
+         is dropped, not queued ahead of it"
+    );
+}
+
+#[tokio::test]
 async fn the_channel_carries_traffic_in_both_directions() {
     // The asset path is request-response: ranges are asked for on the same
     // channel the answers come back on.

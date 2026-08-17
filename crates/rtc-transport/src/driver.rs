@@ -98,15 +98,48 @@ pub fn add_remote_candidate(rtc: &mut Rtc, sdp_line: &str) -> Result<(), RtcErro
     Ok(())
 }
 
-/// Write on the data channel, if it is open.
+/// Write on the data channel. `true` only when the bytes were taken.
 ///
-/// `false` when it is not — which is ordinary rather than exceptional, since a
-/// connection spends its first moments negotiating and the caller is expected
-/// to fall back to the relay path meanwhile.
+/// `false` is ordinary rather than exceptional: a connection spends its first
+/// moments negotiating, and the caller is expected to use the relay meanwhile.
+///
+/// `Channel::write` reports two different failures and only one of them is an
+/// `Err`. A refusal — the channel is open, healthy, and will not take *these*
+/// bytes — comes back as `Ok(false)`, because str0m bounds what may be buffered
+/// across all streams (128 KiB in 0.22) and declines anything larger than what
+/// is free rather than accepting part of it.
+///
+/// This read that with `is_ok()`, so `Ok(false)` counted as sent. A 188 KiB
+/// range can never fit a 128 KiB buffer, so every video range was refused,
+/// counted as delivered, and dropped here without a line in the log — between a
+/// head that reported four ranges sent peer-to-peer and a player that waited
+/// out its thirty seconds and asked for the same four again, for as long as the
+/// connection stayed up.
 pub fn send_on_channel(rtc: &mut Rtc, id: ChannelId, binary: bool, data: &[u8]) -> bool {
-    match rtc.channel(id) {
-        Some(mut ch) => ch.write(binary, data).is_ok(),
-        None => false,
+    let Some(mut ch) = rtc.channel(id) else {
+        return false;
+    };
+    match ch.write(binary, data) {
+        Ok(true) => true,
+        Ok(false) => {
+            // Warn, not trace. Nothing else says these bytes did not go, and
+            // the caller has already told its own logs that they did.
+            tracing::warn!(
+                target: "rtc",
+                len = data.len(),
+                buffered = ch.buffered_amount(),
+                "the data channel refused a range; it does not fit what is free"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "rtc",
+                len = data.len(), error = %e,
+                "the data channel failed a write"
+            );
+            false
+        }
     }
 }
 
@@ -382,7 +415,17 @@ mod tokio_driver {
                     Some(data) => {
                         let rtc = endpoint.rtc_mut();
                         if !send_on_channel(rtc, channel, true, &data) {
-                            tracing::trace!(target: "rtc", "channel not writable; dropped {} bytes", data.len());
+                            // `send_on_channel` has already said why. What it
+                            // cannot say is what becomes of the bytes: nothing.
+                            // There is no path from here back to the caller,
+                            // which handed them over and moved on, so a refusal
+                            // is a range nobody will send and nobody will ask
+                            // about again until the player times out.
+                            tracing::warn!(
+                                target: "rtc",
+                                len = data.len(),
+                                "dropping a range the data channel would not take"
+                            );
                         }
                     }
                     // The caller hung up.
