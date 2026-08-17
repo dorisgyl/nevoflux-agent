@@ -11,8 +11,15 @@ decision they inform is still open.
 
 | | question | answer |
 |---|---|---|
-| [`webrtc-rs-twcc/`](webrtc-rs-twcc/) | Can `webrtc-rs` drive an encoder bitrate from TWCC? | No estimator exists, and a library gap silently kills receive-side feedback entirely |
+| `webrtc-rs-twcc/` *(removed)* | Can `webrtc-rs` drive an encoder bitrate from TWCC? | No estimator exists, and a library gap silently kills receive-side feedback entirely |
 | [`str0m-bwe/`](str0m-bwe/) | Does any Rust WebRTC stack ship a working one? | `str0m` does; measured good ramp, collapse, and recovery |
+
+The first harness is gone; the decision it informed is not. The peer path is
+built on `str0m`, so the question of whether to build it on `webrtc-rs` will not
+be reopened, and its answer is kept here rather than in code nobody will run
+again. Re-checking it means writing it back from the finding above — which is
+the honest cost of having deleted it, stated rather than hidden behind a link
+that would 404.
 
 ## Background: the remote-media transport
 
