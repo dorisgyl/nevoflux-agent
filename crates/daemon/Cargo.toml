@@ -11,6 +11,10 @@ description = "Core daemon for NevoFlux Agent"
 
 [features]
 default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
+# Peer-to-peer transport for remote sessions. Off by default: str0m pulls around
+# a hundred crates, and until a session can reach the peer path that cost buys
+# nothing. `remote::rtc` compiles either way and falls back to the relay.
+webrtc = ["dep:nevoflux-rtc-transport"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
@@ -61,6 +65,7 @@ nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-tts = { path = "../tts", optional = true }
+nevoflux-rtc-transport = { path = "../rtc-transport", features = ["tokio-driver"], optional = true }
 nevoflux-asr = { path = "../asr" }
 nevoflux-brain = { path = "../brain" }
 nevoflux-pack = { path = "../pack" }

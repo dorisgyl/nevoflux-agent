@@ -352,38 +352,143 @@ impl Translator {
     }
 }
 
-/// Every `nevo-asset:<id>` the text refers to, in order, without repeats.
+/// The scheme a body uses to point at media this side is holding.
+const ASSET_MARKER: &str = "nevo-asset:";
+
+/// What a `nevo-asset:` id written into a body actually names.
 ///
-/// The id is validated to the same shape the portal will accept before it
-/// becomes a path segment there: anything else is not a reference this side
-/// minted, and announcing it would be announcing nothing.
-pub fn asset_refs(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("nevo-asset:") {
-        let after = &rest[at + 11..];
-        let end = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(after.len());
-        let id = &after[..end];
-        if !id.is_empty() && id.len() <= 64 && !out.iter().any(|s| s == id) {
-            out.push(id.to_string());
-        }
-        rest = &after[end..];
-    }
-    out
+/// Shape is not evidence. The id is the one part of this path the model types
+/// by hand, and a well-formed id for media that does not exist is exactly as
+/// easy to produce as well-formed bytes for a picture never seen — four hex
+/// groups is a pattern, and patterns are what a model is good at. So the only
+/// authority on whether a reference means anything is the store, and answering
+/// that needs state this module deliberately does not have.
+///
+/// [`strip_invented_data_urls`] is the same guard for invented *bytes*. This is
+/// its missing half: a reference the store cannot match drew a player that
+/// asked a portal for an id it had never been offered, and got a 404 for every
+/// range, forever.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefFate {
+    /// The store holds it. Leave the reference exactly as written.
+    Known,
+    /// The store does not hold it, and exactly one thing is left that it could
+    /// have meant. Point it there.
+    Rewrite(String),
+    /// The store does not hold it and nothing is left that it could have meant.
+    Drop,
 }
 
-/// Where a markdown image starts that has no closing bracket yet, if any.
-fn unclosed_image_at(text: &str) -> Option<usize> {
-    let start = text.rfind("![")?;
-    // `![alt](` has to have opened, and nothing may have closed it since.
-    let after = &text[start..];
-    let open = after.find('(')?;
-    if after[open..].contains(')') {
+/// One `![alt](nevo-asset:<id>)`, located within a body.
+struct ImageRef<'a> {
+    /// Byte index of the opening `![`.
+    start: usize,
+    alt: &'a str,
+    id: &'a str,
+    /// Byte index one past the closing `)`.
+    end: usize,
+}
+
+/// The markdown image whose target is the marker at `at`, if that is what it is.
+///
+/// `None` for a bare mention in prose. The scheme can be written about, and
+/// only `![alt](…)` is a claim that something should be drawn — which is the
+/// only claim that can be wrong in a way a reader sees.
+fn image_ref_around(text: &str, at: usize) -> Option<ImageRef<'_>> {
+    // `](` with the marker immediately after it, and nothing in between.
+    let target = text[..at].strip_suffix('(')?;
+    let alt_end = target.strip_suffix(']')?.len();
+    let start = target[..alt_end].rfind("![")?;
+    let alt = &target[start + 2..alt_end];
+    if alt.contains(']') {
         return None;
     }
-    Some(start)
+    let after = &text[at + ASSET_MARKER.len()..];
+    // The id runs to the first character an id cannot contain, and that
+    // character has to be the bracket that closes the image.
+    let id_end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))?;
+    if !after[id_end..].starts_with(')') {
+        return None;
+    }
+    Some(ImageRef {
+        start,
+        alt,
+        id: &after[..id_end],
+        end: at + ASSET_MARKER.len() + id_end + 1,
+    })
+}
+
+/// Reconcile every `nevo-asset:` reference in a body against what exists.
+///
+/// Returns the repaired text and how many references were not as written.
+/// `resolve` is supplied by the layer that owns the store — the same shape as
+/// `PortalSession::on_resume`'s `read_media`, and for the same reason.
+pub fn repair_asset_refs(text: &str, resolve: &dyn Fn(&str) -> RefFate) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut repaired = 0usize;
+
+    while let Some(at) = rest.find(ASSET_MARKER) {
+        let Some(r) = image_ref_around(rest, at) else {
+            // Prose. Pass the marker and keep looking past it.
+            out.push_str(&rest[..at + ASSET_MARKER.len()]);
+            rest = &rest[at + ASSET_MARKER.len()..];
+            continue;
+        };
+        match resolve(r.id) {
+            RefFate::Known => out.push_str(&rest[..r.end]),
+            RefFate::Rewrite(real) => {
+                out.push_str(&rest[..at + ASSET_MARKER.len()]);
+                out.push_str(&real);
+                out.push(')');
+                repaired += 1;
+            }
+            // The alt text stays. It is prose the reader was meant to see, and
+            // the media itself still arrives by announcement — so what a drop
+            // costs is where the picture sits, not whether it appears.
+            RefFate::Drop => {
+                out.push_str(&rest[..r.start]);
+                out.push_str(r.alt);
+                repaired += 1;
+            }
+        }
+        rest = &rest[r.end..];
+    }
+    out.push_str(rest);
+    (out, repaired)
+}
+
+/// Where a markdown image starts that has not finished arriving, if any.
+///
+/// Deltas split anywhere, so an image is only ever safe to act on whole: what
+/// it points at decides whether it is forged bytes, a reference to something
+/// real, or a reference to nothing, and a prefix looks like all three.
+///
+/// The alt text used to be enough to release it — `![shot` with no `(` yet read
+/// as "not an image" and went straight out, and the `](nevo-asset:0733` behind
+/// it arrived with nothing left to attach it to. That is how a reference
+/// reached the phone in two pieces and an id came out of the scan truncated.
+fn unclosed_image_at(text: &str) -> Option<usize> {
+    let start = text.rfind("![")?;
+    let after = &text[start + 2..];
+    // Image syntax does not span lines. Without this a stray `![` in prose
+    // would hold the rest of the turn back waiting for a bracket that is never
+    // coming, and the reader would watch a reply stop mid-sentence.
+    if after.contains('\n') {
+        return None;
+    }
+    let Some(close) = after.find(']') else {
+        // `![alt` — the alt text is still arriving.
+        return Some(start);
+    };
+    match after[close + 1..].chars().next() {
+        // `![alt` — the target may still be about to open.
+        None => Some(start),
+        // `![alt](target` — held until it closes.
+        Some('(') if !after[close + 1..].contains(')') => Some(start),
+        // Closed, or never an image to begin with.
+        _ => None,
+    }
 }
 
 /// Take invented image bytes out of a turn's text.
@@ -710,38 +815,90 @@ pub fn uplink(
 mod asset_ref_tests {
     use super::*;
 
-    #[test]
-    fn finds_the_ids_a_body_refers_to() {
-        assert_eq!(
-            asset_refs("看：\n\n![截图](nevo-asset:a1b2c3) 和 ![另一张](nevo-asset:d4e5f6)"),
-            vec!["a1b2c3", "d4e5f6"]
-        );
+    /// A store holding exactly the ids listed, with `spare` left to mean.
+    fn store(known: &[&str], spare: Option<&str>) -> impl Fn(&str) -> RefFate {
+        let known: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+        let spare = spare.map(|s| s.to_string());
+        move |id: &str| {
+            if known.iter().any(|k| k == id) {
+                RefFate::Known
+            } else {
+                match &spare {
+                    Some(s) => RefFate::Rewrite(s.clone()),
+                    None => RefFate::Drop,
+                }
+            }
+        }
     }
 
     #[test]
-    fn announces_a_repeated_reference_once() {
-        // A reference split across deltas arrives more than once; announcing
-        // the same media twice would draw it twice.
-        assert_eq!(
-            asset_refs("![a](nevo-asset:x1) ![b](nevo-asset:x1)"),
-            vec!["x1"]
-        );
+    fn a_reference_the_store_holds_is_left_exactly_as_written() {
+        let text = "看：\n\n![截图](nevo-asset:a1b2c3) 和 ![另一张](nevo-asset:d4e5f6)";
+        let (got, changed) = repair_asset_refs(text, &store(&["a1b2c3", "d4e5f6"], None));
+        assert_eq!(got, text);
+        assert_eq!(changed, 0);
     }
 
     #[test]
-    fn refuses_an_id_that_is_not_one_this_side_minted() {
-        // The same shape the portal will accept before it becomes a path
-        // segment there. Anything else refers to nothing.
-        assert!(asset_refs("nevo-asset:").is_empty());
+    fn an_id_the_store_never_minted_is_pointed_at_what_the_turn_made() {
+        // The reported defect. The store held 073340af…; the head wrote a
+        // UUID of its own, correct in every respect except existing.
+        let (got, changed) = repair_asset_refs(
+            "看这个 ![clip.mp4](nevo-asset:1f2a9b3e-8c4d-4e5f-9a1b-7c6d5e4f3a2b) 就是它",
+            &store(&[], Some("073340af-real")),
+        );
+        assert_eq!(got, "看这个 ![clip.mp4](nevo-asset:073340af-real) 就是它");
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn with_nothing_to_mean_the_reference_goes_and_the_words_stay() {
+        // A player pointed at nothing is worse than no player: it asks for a
+        // range the portal cannot answer, and asks again, and again.
+        let (got, changed) = repair_asset_refs(
+            "这是结果：![截图](nevo-asset:deadbeef) 请看。",
+            &store(&[], None),
+        );
+        assert_eq!(got, "这是结果：截图 请看。");
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn text_that_merely_mentions_the_scheme_is_not_a_reference() {
+        for text in [
+            "the scheme is called nevo-asset: and it takes an id",
+            "写法是 nevo-asset:a1b2c3 这样",
+            // Not closed by the bracket that would make it an image.
+            "![截图](nevo-asset:a1b2c3 还没写完",
+        ] {
+            let (got, changed) = repair_asset_refs(text, &store(&[], None));
+            assert_eq!(got, text, "left alone: {text}");
+            assert_eq!(changed, 0);
+        }
+    }
+
+    #[test]
+    fn an_id_that_is_not_one_this_side_could_have_minted_names_nothing() {
         // The scan stops at the first character an id cannot contain, so a
-        // traversal names nothing rather than naming "..".
-        assert!(asset_refs("nevo-asset:../../etc/passwd").is_empty());
-        assert!(asset_refs(&format!("nevo-asset:{}", "a".repeat(65))).is_empty());
+        // traversal is a reference to `..` — which no store holds.
+        let (got, changed) =
+            repair_asset_refs("![x](nevo-asset:../../etc/passwd)", &store(&[], None));
+        assert_eq!(
+            got, "![x](nevo-asset:../../etc/passwd)",
+            "not an image target"
+        );
+        assert_eq!(changed, 0);
+        // Empty is not an id either, and must not be repaired into one.
+        let (got, _) = repair_asset_refs("![x](nevo-asset:)", &store(&[], Some("real")));
+        assert_eq!(got, "![x](nevo-asset:real)");
     }
 
     #[test]
-    fn ignores_text_that_merely_mentions_the_scheme() {
-        assert!(asset_refs("the scheme is called nevo-asset: and it takes an id").is_empty());
+    fn a_normal_markdown_image_is_none_of_this_functions_business() {
+        let text = "![logo](https://example.com/a.png)";
+        let (got, changed) = repair_asset_refs(text, &store(&[], None));
+        assert_eq!(got, text);
+        assert_eq!(changed, 0);
     }
 }
 
@@ -811,6 +968,43 @@ mod invented_image_tests {
         let mut t = Translator::new();
         let got = turn(&mut t, &["![截图](nevo-asset:", "a1b2c3)", " 看这里"]);
         assert!(got.contains("nevo-asset:a1b2c3"), "{got}");
+    }
+
+    #[test]
+    fn a_reference_split_before_its_bracket_still_arrives_whole() {
+        // Where the id came out truncated. `![截图` alone read as "not an
+        // image" and went out, so the `](nevo-asset:0733` behind it had
+        // nothing to attach to and the scan saw `0733` as the whole id.
+        let mut t = Translator::new();
+        let got = turn(&mut t, &["![截图", "](nevo-asset:0733", "40af)", " 好"]);
+        assert!(got.contains("nevo-asset:073340af"), "{got}");
+    }
+
+    #[test]
+    fn a_stray_bracket_does_not_hold_the_rest_of_the_turn() {
+        // Holding from `![` is only safe because an image cannot span lines.
+        // Without that bound, prose that happens to contain the sequence would
+        // stop the reply on screen until the turn ended.
+        let mut t = Translator::new();
+        let mut text = String::new();
+        for (i, piece) in ["写 ![ 开头\n", "然后继续"].iter().enumerate() {
+            let payload = json!({
+                "type": "stream_chunk",
+                "payload": { "content": piece, "done": i == 1 }
+            });
+            for f in t.downlink(&payload) {
+                if f["kind"] == "stream_delta" {
+                    text.push_str(f["delta"].as_str().unwrap());
+                }
+            }
+            if i == 0 {
+                assert!(
+                    text.contains("开头"),
+                    "held back with no image coming: {text}"
+                );
+            }
+        }
+        assert_eq!(text, "写 ![ 开头\n然后继续");
     }
 
     #[test]

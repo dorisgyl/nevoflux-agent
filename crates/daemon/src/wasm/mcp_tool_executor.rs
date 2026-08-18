@@ -243,6 +243,16 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             format!("Start a sub-agent: \"{}\"", short)
         }
 
+        // Recording the screen. Named plainly, and saying who sees it: the
+        // generic "Perform action: screen_record" is a consent prompt that does
+        // not tell anyone what they are consenting to, which for this in
+        // particular is not good enough.
+        "screen_record" => concat!(
+            "Share your screen LIVE with whoever is watching this session. ",
+            "They will see everything on it, in real time, until it is stopped."
+        )
+        .to_string(),
+
         // Default
         _ => {
             format!("Perform action: {}", tool_name)
@@ -3530,5 +3540,30 @@ mod tests {
         let text = "键盘输入测试：这段文本超过 50 字节，应该被安全截断。";
         let args = serde_json::json!({ "text": text });
         let _desc = describe_tool_action("computer_type_text", &args.to_string());
+    }
+}
+
+#[cfg(test)]
+mod screen_record_consent {
+    use super::describe_tool_action;
+
+    #[test]
+    fn the_screen_record_prompt_says_what_is_being_consented_to() {
+        // The generic arm would render "Perform action: screen_record", which
+        // asks someone to approve a function name. For this one in particular
+        // the prompt has to say what happens and who sees it.
+        let text = describe_tool_action("screen_record", "share this screen live");
+        assert!(text.contains("screen"), "{text}");
+        assert!(text.to_lowercase().contains("live"), "{text}");
+        assert!(!text.contains("Perform action"), "{text}");
+        assert!(!text.contains("  "), "double space in the prompt: {text:?}");
+    }
+
+    #[test]
+    fn an_unclassified_tool_still_falls_back_rather_than_panicking() {
+        assert_eq!(
+            describe_tool_action("some_future_tool", "{}"),
+            "Perform action: some_future_tool"
+        );
     }
 }

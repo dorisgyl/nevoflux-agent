@@ -142,10 +142,14 @@ services:
   # whole into the portal on your phone. Serves NO HTTP: the relay socket is
   # the only outward face, so there is nothing to publish and no port to guard.
   #
-  #   THE PAIRING CODE IS THE ONLY SECRET. Whoever has it drives this container
-  #   with whatever NEVOFLUX_REMOTE_MODE / NEVOFLUX_REMOTE_EXECUTION_TIER grant
-  #   is set below. Read it out of `docker compose logs remote` once, and keep
-  #   it the way you would keep a password.
+  #   THE PAIRING CODE IS A SECRET, AND NOT THE ONLY ONE. Whoever has it drives
+  #   this container with whatever NEVOFLUX_REMOTE_MODE /
+  #   NEVOFLUX_REMOTE_EXECUTION_TIER grant is set below — but only from the
+  #   account this container signed in as. The relay binds a channel to the
+  #   first account that opens it and turns away any other, so a leaked code on
+  #   its own does not reach this head. Read it out of
+  #   `docker compose logs remote` once, and keep it the way you would keep a
+  #   password anyway.
   remote:
     profiles: ["remote"]
     image: nevoflux/agent:latest

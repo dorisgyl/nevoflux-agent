@@ -34,10 +34,119 @@ pub enum WireMessage {
     Resync,
 }
 
-/// Retain at most this many sent frames for resume. A `resume{from}` reaching
-/// further back than the buffer holds cannot be honored incrementally and must
-/// escalate to a `Resync`.
-const SEND_BUFFER_CAP: usize = 512;
+/// How many other ends are on the channel, if this text is the relay saying so.
+///
+/// The relay volunteers this — to a socket as it joins, to the survivors when
+/// one leaves, and to a sender whose message reached nobody. It holds no
+/// channel key, so these notices arrive as plaintext on a channel that is
+/// otherwise ciphertext and none of them is a [`WireMessage`].
+///
+/// It is also the only evidence this end ever gets that somebody is listening.
+/// The relay keeps nothing for a channel with no one attached, so a frame sent
+/// into an empty channel is not delivered late — it is not delivered at all,
+/// and the sender is told so by an `n` of zero. Anything that only makes sense
+/// to send when there is an audience has to wait for this to say there is one.
+pub fn peer_count(text: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    (v.get("k")?.as_str()? == "peers").then(|| v.get("n")?.as_u64())?
+}
+
+/// Upper bound on retained entries. A ceiling on the deque itself, not the
+/// memory policy — [`SEND_BUFFER_BYTES`] is what actually decides how far back
+/// resume reaches. A `resume{from}` older than what the buffer still holds
+/// cannot be honored incrementally and must escalate to a `Resync`.
+const SEND_BUFFER_CAP: usize = 4096;
+
+/// How many bytes of sent frames to retain.
+///
+/// The buffer used to be bounded by frame count alone, which reads as a memory
+/// bound only if every frame is about the same size. Media broke that
+/// assumption twice over: an `asset_data` frame carries a base64 chunk of ~342
+/// KB, so 512 of them retained ~175 MB — and because eviction counted frames,
+/// a few hundred of them also pushed every chat frame out of the window, so
+/// reconnecting during playback could not resume incrementally and fell back to
+/// a full transcript reload. Media no longer costs its bytes here (see
+/// [`Retained::Media`]), and what remains is bounded by an honest byte budget.
+const SEND_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// The frame kind whose bytes are re-readable, so the buffer need not hold them.
+const MEDIA_FRAME_KIND: &str = "asset_data";
+
+/// Roughly what a [`Retained::Media`] stub costs: an id, three numbers, and the
+/// deque slot. Not measured — it only has to be non-zero so a flood of media
+/// still eventually ages out of the window.
+const MEDIA_STUB_COST: usize = 96;
+
+/// What the buffer keeps so a frame can be sent again.
+#[derive(Debug, Clone)]
+enum Retained {
+    /// The frame itself. Chat deltas, asset offers, errors — all small.
+    Frame(Value),
+    /// A media range, kept as the values that can rebuild it.
+    ///
+    /// The bytes are still on disk in the `AssetStore` and are read back on
+    /// demand, so retaining the encoded body would be keeping a second, far
+    /// more expensive copy of something already durable.
+    Media {
+        id: String,
+        offset: u64,
+        len: usize,
+        /// Which encoding this went out as. A resend has to match: the portal
+        /// that asked for bytes is decoding bytes, and one that asked for
+        /// base64 would not recognise a binary frame.
+        binary: bool,
+    },
+}
+
+/// One frame to resend, and whether the caller still has to fetch its bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resend {
+    /// Ready to encode as-is.
+    Ready(WireMessage),
+    /// A media range whose bytes must be read back before it can go out. The
+    /// caller owns the store, so it does the reading.
+    Media {
+        seq: u64,
+        id: String,
+        offset: u64,
+        len: usize,
+        /// Re-encode the way it first went out; see [`Retained::Media`].
+        binary: bool,
+    },
+}
+
+/// Source length of a padded standard-base64 string.
+///
+/// Exact rather than an estimate: the resent frame has to cover the same range
+/// as the original, or the portal — which matches replies by id and offset —
+/// would splice a differently-sized chunk into the file it is reassembling.
+fn base64_source_len(s: &str) -> usize {
+    let pad = s.bytes().rev().take_while(|&b| b == b'=').count();
+    (s.len() / 4).saturating_mul(3).saturating_sub(pad)
+}
+
+/// What a frame that must not be replayed leaves behind in its place.
+///
+/// A signalling frame is only meaningful at the moment it is sent. Replaying an
+/// offer from ten seconds ago tells the portal to tear down the connection it
+/// has and answer a negotiation that no longer exists — which it dutifully
+/// does, sending an answer for an offer this end has forgotten. One reconnect
+/// replayed every offer the session had ever sent, the portal answered each,
+/// and the log filled with thousands of `an answer with no outstanding offer`
+/// while the conversation stopped being delivered.
+///
+/// The sequence number still has to be spent, though: the portal asks for a
+/// resume whenever it sees a gap, so skipping one entirely trades this loop for
+/// a resume loop. So the slot is kept and something inert goes in it.
+///
+/// A candidate with an empty string is that inert thing, and deliberately not a
+/// new frame kind: the portal already routes `rtc_candidate` out of the
+/// conversation before any reducer sees it, and an empty candidate is the
+/// end-of-candidates marker every implementation ignores. A kind the portal did
+/// not know would reach the chat instead.
+fn spent_signal() -> Value {
+    serde_json::json!({ "kind": "rtc_candidate", "candidate": "" })
+}
 
 /// Assigns monotonic `seq` to downlink frames and retains them for resume
 /// (design Y2). Send-side only; the receive-side gap tracker lives in the
@@ -45,7 +154,10 @@ const SEND_BUFFER_CAP: usize = 512;
 #[derive(Debug, Default)]
 pub struct SendSequencer {
     next: u64,
-    buffer: std::collections::VecDeque<(u64, Value)>,
+    buffer: std::collections::VecDeque<(u64, Retained, usize)>,
+    /// Running sum of the third tuple element, so eviction does not have to
+    /// walk the deque on every tag.
+    bytes: usize,
 }
 
 impl SendSequencer {
@@ -58,14 +170,86 @@ impl SendSequencer {
     pub fn tag(&mut self, frame: Value) -> WireMessage {
         let seq = self.next;
         self.next += 1;
-        self.buffer.push_back((seq, frame.clone()));
-        while self.buffer.len() > SEND_BUFFER_CAP {
-            self.buffer.pop_front();
-        }
+
+        let (retained, cost) = match media_stub(&frame) {
+            Some(stub) => (stub, MEDIA_STUB_COST),
+            // Serializing to measure costs one small allocation per frame.
+            // Affordable precisely because the one frame kind that is *not*
+            // small never reaches this arm.
+            None => {
+                let cost = serde_json::to_string(&frame).map(|s| s.len()).unwrap_or(0);
+                (Retained::Frame(frame.clone()), cost)
+            }
+        };
+
+        self.buffer.push_back((seq, retained, cost));
+        self.bytes = self.bytes.saturating_add(cost);
+        self.evict();
+
         WireMessage::Frame {
             seq: Some(seq),
             frame,
         }
+    }
+
+    /// Tag a frame that is worth sending once and never again.
+    ///
+    /// Sent as given; what is kept for a resume is [`spent_signal`], so the
+    /// sequence stays whole and the replay says nothing.
+    pub fn tag_transient(&mut self, frame: Value) -> WireMessage {
+        let seq = self.next;
+        self.next += 1;
+
+        let placeholder = spent_signal();
+        let cost = serde_json::to_string(&placeholder)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        self.buffer
+            .push_back((seq, Retained::Frame(placeholder), cost));
+        self.bytes = self.bytes.saturating_add(cost);
+        self.evict();
+
+        WireMessage::Frame {
+            seq: Some(seq),
+            frame,
+        }
+    }
+
+    /// Drop the oldest entries until the buffer is back inside its budget.
+    ///
+    /// Always keeps the newest entry, however large: dropping the frame just
+    /// taken would make resume permanently unable to reach the present.
+    fn evict(&mut self) {
+        while self.buffer.len() > 1
+            && (self.bytes > SEND_BUFFER_BYTES || self.buffer.len() > SEND_BUFFER_CAP)
+        {
+            if let Some((_, _, dropped)) = self.buffer.pop_front() {
+                self.bytes = self.bytes.saturating_sub(dropped);
+            }
+        }
+    }
+
+    /// Claim a seq for a media range going out as bytes.
+    ///
+    /// The binary path has no JSON frame for [`tag`](Self::tag) to inspect, so
+    /// it says outright what that one has to infer. Retention is identical —
+    /// a range and a format, never the payload.
+    pub fn tag_media(&mut self, id: &str, offset: u64, len: usize) -> u64 {
+        let seq = self.next;
+        self.next += 1;
+        self.buffer.push_back((
+            seq,
+            Retained::Media {
+                id: id.to_string(),
+                offset,
+                len,
+                binary: true,
+            },
+            MEDIA_STUB_COST,
+        ));
+        self.bytes = self.bytes.saturating_add(MEDIA_STUB_COST);
+        self.evict();
+        seq
     }
 
     /// The next seq that will be assigned.
@@ -73,21 +257,41 @@ impl SendSequencer {
         self.next
     }
 
-    /// Resend everything from `from` (inclusive). Returns the wire messages to
-    /// send, or `None` when `from` is older than the buffer still holds — the
-    /// caller must then send a [`WireMessage::Resync`] and [`reset`](Self::reset).
-    pub fn resend_from(&self, from: u64) -> Option<Vec<WireMessage>> {
+    /// Bytes currently retained for resume. Diagnostics and tests: the whole
+    /// point of the stub is that this stays flat while media streams.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Resend everything from `from` (inclusive). Returns the resend plan, or
+    /// `None` when `from` is older than the buffer still holds — the caller must
+    /// then send a [`WireMessage::Resync`] and [`reset`](Self::reset).
+    pub fn resend_from(&self, from: u64) -> Option<Vec<Resend>> {
         if from >= self.next {
             return Some(Vec::new()); // already caught up
         }
-        match self.buffer.front().map(|(s, _)| *s) {
+        match self.buffer.front().map(|(s, _, _)| *s) {
             Some(oldest) if from >= oldest => Some(
                 self.buffer
                     .iter()
-                    .filter(|(s, _)| *s >= from)
-                    .map(|(s, f)| WireMessage::Frame {
-                        seq: Some(*s),
-                        frame: f.clone(),
+                    .filter(|(s, _, _)| *s >= from)
+                    .map(|(s, r, _)| match r {
+                        Retained::Frame(f) => Resend::Ready(WireMessage::Frame {
+                            seq: Some(*s),
+                            frame: f.clone(),
+                        }),
+                        Retained::Media {
+                            id,
+                            offset,
+                            len,
+                            binary,
+                        } => Resend::Media {
+                            seq: *s,
+                            id: id.clone(),
+                            offset: *offset,
+                            len: *len,
+                            binary: *binary,
+                        },
                     })
                     .collect(),
             ),
@@ -100,7 +304,27 @@ impl SendSequencer {
     pub fn reset(&mut self) {
         self.next = 0;
         self.buffer.clear();
+        self.bytes = 0;
     }
+}
+
+/// Recognize a media data frame and reduce it to what can rebuild it.
+///
+/// A frame missing any of the three fields is *not* treated as media — it would
+/// be unrebuildable, and retaining it whole is the safe reading.
+fn media_stub(frame: &Value) -> Option<Retained> {
+    if frame.get("kind").and_then(Value::as_str)? != MEDIA_FRAME_KIND {
+        return None;
+    }
+    let id = frame.get("id").and_then(Value::as_str)?.to_string();
+    let offset = frame.get("offset").and_then(Value::as_u64)?;
+    let len = base64_source_len(frame.get("data").and_then(Value::as_str)?);
+    Some(Retained::Media {
+        id,
+        offset,
+        len,
+        binary: false,
+    })
 }
 
 #[cfg(test)]
@@ -163,6 +387,24 @@ mod tests {
         assert_eq!(seq.next_seq(), 3);
     }
 
+    /// An `asset_data` frame the size the gateway really sends: a 256 KB chunk
+    /// base64-encoded to ~342 KB.
+    fn media_frame(id: &str, offset: u64, source_bytes: usize) -> Value {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![7u8; source_bytes]);
+        json!({ "kind": "asset_data", "id": id, "offset": offset, "data": data, "eof": false })
+    }
+
+    fn resent_seqs(out: &[Resend]) -> Vec<u64> {
+        out.iter()
+            .map(|r| match r {
+                Resend::Ready(WireMessage::Frame { seq: Some(n), .. }) => *n,
+                Resend::Media { seq, .. } => *seq,
+                other => panic!("unexpected resend item {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn resend_from_returns_buffered_tail() {
         let mut seq = SendSequencer::new();
@@ -170,15 +412,7 @@ mod tests {
             seq.tag(frame("s"));
         }
         // resume from 1 → frames 1 and 2.
-        let out = seq.resend_from(1).unwrap();
-        let seqs: Vec<u64> = out
-            .iter()
-            .map(|w| match w {
-                WireMessage::Frame { seq: Some(n), .. } => *n,
-                _ => panic!("expected Frame"),
-            })
-            .collect();
-        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(resent_seqs(&seq.resend_from(1).unwrap()), vec![1, 2]);
         // already caught up → empty.
         assert!(seq.resend_from(3).unwrap().is_empty());
     }
@@ -186,14 +420,165 @@ mod tests {
     #[test]
     fn resend_from_too_old_returns_none_for_resync() {
         let mut seq = SendSequencer::new();
-        for _ in 0..(SEND_BUFFER_CAP as u64 + 10) {
-            seq.tag(frame("s"));
+        // Big enough frames that the byte budget, not the entry cap, is what
+        // evicts — the same thing that happens in a long session.
+        let big = json!({ "kind": "stream_delta", "delta": "x".repeat(4096) });
+        while seq.retained_bytes() + 8192 < SEND_BUFFER_BYTES {
+            seq.tag(big.clone());
         }
-        // seq 0 was evicted → cannot resume from 0.
+        for _ in 0..64 {
+            seq.tag(big.clone());
+        }
         assert!(
             seq.resend_from(0).is_none(),
             "gap older than buffer must force resync"
         );
+    }
+
+    #[test]
+    fn a_media_frame_is_retained_as_a_stub_not_as_its_bytes() {
+        // The defect this guards: one 256 KB chunk used to be retained as ~342 KB
+        // of base64, and 512 of them came to ~175 MB of live memory.
+        let mut seq = SendSequencer::new();
+        seq.tag(media_frame("asset-1", 0, 256 * 1024));
+        assert!(
+            seq.retained_bytes() < 1024,
+            "a media frame must not retain its payload, retained {} bytes",
+            seq.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn streaming_media_does_not_grow_the_buffer() {
+        let mut seq = SendSequencer::new();
+        for i in 0..2_000u64 {
+            seq.tag(media_frame("asset-1", i * 256 * 1024, 256 * 1024));
+        }
+        assert!(
+            seq.retained_bytes() <= SEND_BUFFER_BYTES,
+            "retained {} bytes",
+            seq.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn media_does_not_evict_the_chat_around_it() {
+        // The second half of the defect, and the user-visible one. Eviction
+        // counted frames, so a few hundred chunks pushed every chat frame out of
+        // the window and a reconnect mid-playback could only full-reload the
+        // transcript. Playing a file is not a reason to lose the conversation.
+        let mut seq = SendSequencer::new();
+        seq.tag(frame("chat-before"));
+        for i in 0..1_000u64 {
+            seq.tag(media_frame("asset-1", i * 256 * 1024, 256 * 1024));
+        }
+        seq.tag(frame("chat-after"));
+
+        let out = seq
+            .resend_from(0)
+            .expect("the chat frame at seq 0 must still be reachable");
+        assert_eq!(out.len(), 1002);
+        assert!(
+            matches!(
+                &out[0],
+                Resend::Ready(WireMessage::Frame { seq: Some(0), .. })
+            ),
+            "seq 0 should still be the chat frame, got {:?}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn a_media_frame_resends_as_a_request_for_its_bytes() {
+        let mut seq = SendSequencer::new();
+        seq.tag(media_frame("asset-7", 512, 1000));
+        let out = seq.resend_from(0).unwrap();
+        assert_eq!(
+            out,
+            vec![Resend::Media {
+                seq: 0,
+                id: "asset-7".into(),
+                offset: 512,
+                len: 1000,
+                binary: false,
+            }],
+            "the range has to come back exactly, or the portal splices a \
+             differently-sized chunk into the file it is reassembling"
+        );
+    }
+
+    #[test]
+    fn a_binary_media_range_resends_as_binary() {
+        // Format has to survive into the resend. The portal that asked for
+        // bytes is decoding bytes; base64 would be a frame it cannot read, on
+        // the one seq it is blocked waiting for.
+        let mut seq = SendSequencer::new();
+        seq.tag_media("asset-9", 8192, 4096);
+        assert_eq!(
+            seq.resend_from(0).unwrap(),
+            vec![Resend::Media {
+                seq: 0,
+                id: "asset-9".into(),
+                offset: 8192,
+                len: 4096,
+                binary: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_binary_media_range_is_no_more_expensive_to_retain() {
+        let mut seq = SendSequencer::new();
+        for i in 0..2_000u64 {
+            seq.tag_media("asset-9", i * 256 * 1024, 256 * 1024);
+        }
+        assert!(
+            seq.retained_bytes() <= SEND_BUFFER_BYTES,
+            "retained {} bytes",
+            seq.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn the_two_media_paths_share_one_seq_space() {
+        // They go out the same socket, so the portal orders them together. Two
+        // counters would hand it duplicate seqs and stall its tracker.
+        let mut seq = SendSequencer::new();
+        seq.tag(frame("chat"));
+        seq.tag_media("a", 0, 10);
+        seq.tag(media_frame("b", 0, 10));
+        assert_eq!(resent_seqs(&seq.resend_from(0).unwrap()), vec![0, 1, 2]);
+        assert_eq!(seq.next_seq(), 3);
+    }
+
+    #[test]
+    fn base64_source_len_is_exact_across_padding_cases() {
+        use base64::Engine;
+        for n in 0..16usize {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(vec![1u8; n]);
+            assert_eq!(base64_source_len(&encoded), n, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_media_frame_is_retained_whole() {
+        // Missing `data` means nothing could rebuild it, so treating it as media
+        // would make it permanently unresendable. Keeping it is the safe reading.
+        let mut seq = SendSequencer::new();
+        seq.tag(json!({ "kind": "asset_data", "id": "x", "offset": 0 }));
+        assert!(matches!(
+            seq.resend_from(0).unwrap().as_slice(),
+            [Resend::Ready(_)]
+        ));
+    }
+
+    #[test]
+    fn the_newest_frame_survives_even_when_it_alone_busts_the_budget() {
+        // Otherwise the buffer could evict the frame it just took, and resume
+        // would have no way back to the present.
+        let mut seq = SendSequencer::new();
+        seq.tag(json!({ "kind": "stream_delta", "delta": "x".repeat(SEND_BUFFER_BYTES * 2) }));
+        assert_eq!(seq.resend_from(0).map(|v| v.len()), Some(1));
     }
 
     #[test]
@@ -207,5 +592,91 @@ mod tests {
             WireMessage::Frame { seq: Some(0), .. } => {}
             other => panic!("after reset seq restarts at 0, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_relays_presence_notice_is_recognised() {
+        // This is the only thing that tells the head a portal is listening, and
+        // the head sends nothing worth sending until it hears it.
+        assert_eq!(peer_count(r#"{"k":"peers","n":0}"#), Some(0));
+        assert_eq!(peer_count(r#"{"k":"peers","n":1}"#), Some(1));
+        assert_eq!(peer_count(r#"{"n":2,"k":"peers"}"#), Some(2));
+    }
+
+    #[test]
+    fn nothing_else_is_mistaken_for_one() {
+        // Read before decryption, so it sees ciphertext, chat and control
+        // frames alike. Anything it claims is a presence notice is a frame that
+        // never reaches the conversation.
+        for not_a_notice in [
+            r#"{"k":"frame","frame":{"kind":"user_message"}}"#,
+            r#"{"k":"resume","from":3}"#,
+            r#"{"k":"peers"}"#,
+            r#"{"k":"peers","n":"1"}"#,
+            r#"{"k":"peers","n":-1}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(peer_count(not_a_notice), None, "{not_a_notice}");
+        }
+    }
+
+    #[test]
+    fn a_signalling_frame_is_sent_once_and_replayed_as_nothing() {
+        // Replaying an offer tells the portal to tear down the connection it
+        // has and answer a negotiation this end has forgotten. One reconnect
+        // replayed every offer the session had sent, the portal answered each,
+        // and the conversation stopped being delivered while the log filled
+        // with thousands of "an answer with no outstanding offer".
+        let mut s = SendSequencer::new();
+        let offer = json!({ "kind": "rtc_offer", "sdp": "v=0
+real offer
+" });
+        let sent = s.tag_transient(offer.clone());
+        match &sent {
+            WireMessage::Frame { seq, frame } => {
+                assert_eq!(*seq, Some(0));
+                assert_eq!(frame, &offer, "the portal must get the real offer once");
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+
+        let again = s.resend_from(0).expect("still buffered");
+        assert_eq!(again.len(), 1, "the slot must still be there");
+        match &again[0] {
+            Resend::Ready(WireMessage::Frame { seq, frame }) => {
+                assert_eq!(*seq, Some(0));
+                assert_ne!(frame, &offer, "the offer was replayed");
+                assert_eq!(frame["kind"], "rtc_candidate");
+                assert_eq!(frame["candidate"], "");
+            }
+            other => panic!("expected a ready frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_transient_frame_still_spends_its_sequence_number() {
+        // Skipping one instead would leave a hole, and the portal asks for a
+        // resume whenever it sees a hole — trading one loop for another.
+        let mut s = SendSequencer::new();
+        s.tag(json!({ "kind": "stream_delta", "delta": "a" }));
+        s.tag_transient(json!({ "kind": "rtc_offer", "sdp": "v=0
+" }));
+        let after = s.tag(json!({ "kind": "stream_delta", "delta": "b" }));
+        match after {
+            WireMessage::Frame { seq: Some(2), .. } => {}
+            other => panic!("the sequence skipped: {other:?}"),
+        }
+        // And a resume covers every one of them, with no gap to chase.
+        let seqs: Vec<u64> = s
+            .resend_from(0)
+            .expect("still buffered")
+            .iter()
+            .filter_map(|r| match r {
+                Resend::Ready(WireMessage::Frame { seq, .. }) => *seq,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
     }
 }

@@ -28,8 +28,9 @@ pub fn render(id: &ControlIdentity, portal_base: &str, mode: &str, tier: &str) -
          This head answers in `{mode}` mode with Agent execution `{tier}`.\n\
          Both are fixed at startup and cannot be changed from the phone.\n\
          \n\
-         The code is shown once and kept in the data volume. Whoever has it\n\
-         drives this container.\n\
+         The code is shown once and kept in the data volume. It has to be\n\
+         entered from the same account this head signed in as; the relay\n\
+         turns away anyone else, code or no code.\n\
          ────────────────────────────────────────────────────────────\n",
         base = base,
         channel = id.channel_id,

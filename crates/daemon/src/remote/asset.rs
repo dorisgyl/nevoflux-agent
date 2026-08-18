@@ -36,10 +36,42 @@ pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 /// film fits under this.
 pub const MAX_ADOPTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// The most one `asset_data` frame may carry, in source bytes. Base64 inflates
-/// by a third — 342 KB — which stays under the relay's ~900 KB frame ceiling
-/// with room for the envelope. Matches the phone's upload chunking.
-pub const CHUNK_BYTES: usize = 256 * 1024;
+/// The most one range may carry, in source bytes — and what the portal is told
+/// to plan on, since asking for exactly what will be served is what keeps a
+/// pull from ever coming back short.
+///
+/// Sized for the relay, because that is what carries a film. The relay bills a
+/// Durable Object request per message, so the request count for a file is its
+/// size over this number and nothing else: 89 MB costs 342 requests at 256 KiB
+/// and 171 at 512 KiB. Bytes are bytes either way; only the count moves.
+///
+/// The ceiling is the relay's frame limit. Binary framing costs 86 bytes on top
+/// of the payload; a peer that predates it is answered in base64, which inflates
+/// by a third — 683 KB here — and still clears the ~900 KB the relay will take.
+///
+/// Deliberately larger than [`super::portal_gateway::PEER_FRAME_LIMIT`]. A range
+/// this size cannot travel the data channel, and sizing it down until it could
+/// was tried: str0m buffers 128 KiB across all streams, so video would have to
+/// drop to a quarter of this and pay four times the requests to use a path that,
+/// on a network where ICE settles on a TURN relay, is neither cheaper in bytes
+/// nor steadier than the socket. Small assets still fit and still take it.
+pub const CHUNK_BYTES: usize = 512 * 1024;
+
+/// The downlink frame carrying one range of an asset.
+///
+/// Shared by the pull path and the resume path rather than written out at each,
+/// so the two cannot drift. The portal matches a reply by id and offset; a
+/// resent frame differing in shape would be an answer it could not use.
+pub fn data_frame(id: &str, offset: u64, bytes: &[u8], eof: bool) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "kind": "asset_data",
+        "id": id,
+        "offset": offset,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "eof": eof,
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
@@ -84,6 +116,15 @@ pub struct AssetOffer {
     /// and nothing else, so absence costs only the label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub of: Option<u32>,
+    /// How large a range to ask for. See [`CHUNK_BYTES`].
+    ///
+    /// The two ends used to hold this as a constant apiece, which is a contract
+    /// only while they agree — and nothing made them. Absent means this head has
+    /// no preference and the portal's own default stands, which is what a portal
+    /// that predates the field does anyway; that portal asks for its 256 KiB and
+    /// is served 256 KiB, because this is a ceiling and never a floor.
+    #[serde(rename = "chunkBytes", skip_serializing_if = "Option::is_none")]
+    pub chunk_bytes: Option<usize>,
 }
 
 struct Asset {
@@ -201,6 +242,7 @@ impl AssetStore {
             group: None,
             seq: None,
             of: None,
+            chunk_bytes: Some(CHUNK_BYTES),
         };
         self.pending.push(offer.clone());
         self.assets.insert(
@@ -274,6 +316,7 @@ impl AssetStore {
             group: group.or_else(|| seq.map(|_| id.clone())),
             seq,
             of,
+            chunk_bytes: Some(CHUNK_BYTES),
         };
         self.used += size;
         // An ungrouped asset waits for the next outgoing text to be announced.
@@ -309,6 +352,7 @@ impl AssetStore {
             group: a.group.clone(),
             seq: a.seq,
             of: a.of,
+            chunk_bytes: Some(CHUNK_BYTES),
         })
     }
 
@@ -316,6 +360,16 @@ impl AssetStore {
     /// happen once.
     pub fn take_pending(&mut self) -> Vec<AssetOffer> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// What is stored but not yet announced, without taking it.
+    ///
+    /// [`take_pending`](Self::take_pending) is the announcement path and has to
+    /// empty the list. This is for asking what the turn has produced while it
+    /// is still being written — which is what a body reference naming nothing
+    /// could have meant.
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.pending.iter().map(|o| o.id.clone()).collect()
     }
 
     pub fn contains(&self, id: &str) -> bool {

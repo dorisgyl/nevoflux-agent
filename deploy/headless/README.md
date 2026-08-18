@@ -222,11 +222,17 @@ docker compose --profile remote up remote
 docker compose --profile remote logs remote | head -40
 ```
 
-**The pairing code is the only secret.** The channel id is unguessable but not
-confidential: someone who has it can attach to the relay and receive
-ciphertext, and without the code they can neither read it nor inject anything
-(a forged frame fails AES-GCM and is dropped). Someone who has the *code*
-drives this container.
+**The pairing code is the secret, and the account is the second lock.** Two
+things have to be true to reach this head: the code, and the account it signed
+in as. The relay binds a channel to the first account that opens it and answers
+any other with 403, so a leaked code alone reaches nothing — and someone signed
+in as you still cannot read a word without it, since the channel key is derived
+from the code and the relay never holds one (a forged frame fails AES-GCM and
+is dropped).
+
+The channel id is unguessable but not confidential, and it no longer has to be:
+knowing it used to be enough to take up one of the two places on a channel,
+which put a working head off the air.
 
 **`remote-data` must be a real volume, never a tmpfs.** It holds
 `remote-control.json` — the channel and its pairing code — plus the browser
