@@ -8330,6 +8330,13 @@ async fn handle_chat_message(
                 // install_gbrain -> init_brain. cancel aborts any
                 // in-flight step. Progress streams on the EventBus
                 // topic `system:kb-wizard:progress`.
+                // Speech model weights (P0.5). `download` returns as soon as it
+                // has started; progress streams on `system:models:progress`.
+                // Nothing here runs unasked — the daemon still fetches nothing
+                // on its own, which is the rule `just fetch-asr-models` states.
+                "models.status" => crate::models::rpc::handle_status(&params).await,
+                "models.download" => crate::models::rpc::handle_download(&params).await,
+                "models.cancel" => crate::models::rpc::handle_cancel(&params).await,
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {
