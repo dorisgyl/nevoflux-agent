@@ -3030,6 +3030,200 @@ pub async fn start_server(
                 continue;
             }
 
+            // ---------------------------------------------------------------
+            // Model weights (P0.5).
+            //
+            // Nothing here runs on its own. `just fetch-asr-models` states the
+            // rule this keeps: a native-messaging host expected to start in
+            // under a second has no business doing network work, and none
+            // pulling hundreds of megabytes at a moment nobody chose. What that
+            // rules out is *implicit* fetching — every entry point below is a
+            // request someone made. The recipe cannot serve users who have no
+            // checkout, which is the only reason this exists.
+            // ---------------------------------------------------------------
+            if let Some(rest) = msg_type.strip_prefix("models_") {
+                let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
+                let tier = payload
+                    .get("tier")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::models::Tier::parse);
+                let dir = crate::models::models_dir();
+
+                match rest {
+                    "status" => {
+                        let body = match &dir {
+                            Some(d) => serde_json::json!({
+                                "dir": d.display().to_string(),
+                                "assets": crate::models::status(d),
+                                "tiers": [
+                                    crate::models::tier_report(crate::models::Tier::Transcribe, d),
+                                    crate::models::tier_report(crate::models::Tier::Speak, d),
+                                ],
+                            }),
+                            None => serde_json::json!({
+                                "error": "this system has no cache directory to download into",
+                            }),
+                        };
+                        let env = DaemonEnvelope::new(
+                            &proxy_id,
+                            channel,
+                            serde_json::json!({ "type": "models_status_response", "payload": body }),
+                        );
+                        let _ = process_response_tx.send((identity.clone(), env)).await;
+                    }
+                    "cancel" => {
+                        if let Some(t) = tier {
+                            let was_running = crate::models::downloads().cancel(t);
+                            debug!("models: cancel {} (running: {})", t.id(), was_running);
+                        }
+                    }
+                    "download" => {
+                        let (Some(t), Some(dir)) = (tier, dir) else {
+                            warn!("models_download: unknown tier or no cache directory");
+                            continue;
+                        };
+                        let tx = process_response_tx.clone();
+                        let ident = identity.clone();
+                        let pid = proxy_id.clone();
+                        // Spawned, and deliberately not tied to this connection:
+                        // closing the sidebar during a 240 MB download should not
+                        // abandon it. The registry is process-level for the same
+                        // reason.
+                        tokio::spawn(async move {
+                            let say = |kind: &'static str, body: serde_json::Value| {
+                                let env = DaemonEnvelope::new(
+                                    &pid,
+                                    channel,
+                                    serde_json::json!({ "type": kind, "payload": body }),
+                                );
+                                let tx = tx.clone();
+                                let ident = ident.clone();
+                                async move {
+                                    let _ = tx.send((ident, env)).await;
+                                }
+                            };
+
+                            let Some((run, cancel)) = crate::models::downloads().begin(t) else {
+                                // A second click, not a second download.
+                                say("models_busy", serde_json::json!({ "tier": t.id() })).await;
+                                return;
+                            };
+
+                            let total = crate::models::catalog::tier_bytes(t);
+                            let client = crate::models::http_client();
+
+                            // The progress callback is synchronous and cannot
+                            // await, so it hands updates to a forwarding task —
+                            // the same shape the speech uplink uses. Collecting
+                            // them and flushing at the end would deliver the
+                            // whole progress history at the moment progress stops
+                            // being interesting.
+                            let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel();
+                            let ftx = tx.clone();
+                            let fident = ident.clone();
+                            let fpid = pid.clone();
+                            let forwarder = tokio::spawn(async move {
+                                while let Some(body) = prx.recv().await {
+                                    let env = DaemonEnvelope::new(
+                                        &fpid,
+                                        channel,
+                                        serde_json::json!({
+                                            "type": "models_progress",
+                                            "payload": body,
+                                        }),
+                                    );
+                                    if ftx.send((fident.clone(), env)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            let mut base = 0u64;
+                            let mut last_at = std::time::Instant::now();
+                            let mut last_done = 0u64;
+
+                            let result = crate::models::download_tier(
+                                &client,
+                                t,
+                                &dir,
+                                &cancel,
+                                &mut |asset, done, asset_total| {
+                                    let tier_done = base + done;
+                                    if done >= asset_total {
+                                        base += asset_total;
+                                    }
+                                    // Tens of thousands of chunks arrive for a
+                                    // 229 MB file; forwarding each would put more
+                                    // traffic on the channel than the conversation.
+                                    if crate::models::should_emit(
+                                        tier_done,
+                                        total,
+                                        last_done,
+                                        last_at.elapsed(),
+                                    ) {
+                                        last_at = std::time::Instant::now();
+                                        last_done = tier_done;
+                                        let _ = ptx.send(serde_json::json!({
+                                            "tier": t.id(),
+                                            "asset": asset.id,
+                                            "asset_done": done,
+                                            "asset_total": asset_total,
+                                            "done": tier_done,
+                                            "total": total,
+                                        }));
+                                    }
+                                },
+                            )
+                            .await;
+
+                            // Dropping the sender ends the forwarder, and waiting
+                            // for it keeps the terminal message behind the last
+                            // progress update rather than racing it.
+                            drop(ptx);
+                            let _ = forwarder.await;
+
+                            crate::models::downloads().finish(t, run);
+
+                            match result {
+                                Ok(()) => {
+                                    say(
+                                        "models_done",
+                                        serde_json::json!({ "tier": t.id(), "total": total }),
+                                    )
+                                    .await;
+                                    info!("models: {} is ready", t.id());
+                                }
+                                Err(crate::models::ModelError::Cancelled) => {
+                                    // Not a failure: what was fetched is still on
+                                    // disk and a later run resumes from it.
+                                    say(
+                                        "models_cancelled",
+                                        serde_json::json!({
+                                            "tier": t.id(),
+                                            "remaining": crate::models::tier_remaining(t, &dir),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    warn!("models: {} failed: {}", t.id(), e);
+                                    say(
+                                        "models_failed",
+                                        serde_json::json!({
+                                            "tier": t.id(),
+                                            "message": e.to_string(),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+                    }
+                    other => warn!("models: unknown message models_{}", other),
+                }
+                continue;
+            }
+
             // Handle loop_cancel_command from sidebar (/loop skill spec §8.3).
             // force=true is the second-click hard-cancel; false is the soft cancel
             // that lets the current iteration finish.
