@@ -197,6 +197,42 @@ pub fn classify(event: Event) -> Option<DriverEvent> {
     }
 }
 
+/// Whether a read error means the socket is finished, or only that one
+/// datagram was.
+///
+/// A UDP socket has no connection to lose, so most errors it reports are about
+/// a single packet. Windows makes that easy to get wrong: when an earlier send
+/// draws an ICMP port-unreachable, the *next* `recv` fails with
+/// `ConnectionReset` — 10054, "the remote host forcibly closed an existing
+/// connection", about a protocol that has none.
+///
+/// ICE spends its whole life sending to addresses that may not answer, so that
+/// ICMP is routine rather than exceptional. Treating it as fatal ended the
+/// driver, and a peer connection died six tenths of a second after its relay
+/// channel was bound, reporting a closed connection that had never been open.
+///
+/// Only the errors that say the socket itself is gone end the loop.
+///
+/// Lives outside `tokio_driver` although only that module calls it: it is a
+/// classification of `io::ErrorKind` with no runtime in it, and its test is the
+/// record of a bug that cost a working connection. Left inside the gated
+/// module, that test only compiles when `tokio-driver` is on — which is not the
+/// default, so it would run nowhere by default.
+#[cfg(any(feature = "tokio-driver", test))]
+pub(crate) fn fatal_read(e: &std::io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
 #[cfg(feature = "tokio-driver")]
 pub use tokio_driver::run;
 
@@ -207,36 +243,6 @@ mod tokio_driver {
     use std::sync::Arc;
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
-
-    /// Whether a read error means the socket is finished, or only that one
-    /// datagram was.
-    ///
-    /// A UDP socket has no connection to lose, so most errors it reports are
-    /// about a single packet. Windows makes that easy to get wrong: when an
-    /// earlier send draws an ICMP port-unreachable, the *next* `recv` fails
-    /// with `ConnectionReset` — 10054, "the remote host forcibly closed an
-    /// existing connection", about a protocol that has none.
-    ///
-    /// ICE spends its whole life sending to addresses that may not answer, so
-    /// that ICMP is routine rather than exceptional. Treating it as fatal ended
-    /// the driver, and a peer connection died six tenths of a second after its
-    /// relay channel was bound, reporting a closed connection that had never
-    /// been open.
-    ///
-    /// Only the errors that say the socket itself is gone end the loop.
-    pub(crate) fn fatal_read(e: &std::io::Error) -> bool {
-        !matches!(
-            e.kind(),
-            std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::HostUnreachable
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::TimedOut
-        )
-    }
 
     /// How long to wait when the connection asks for a deadline already past.
     ///
@@ -599,7 +605,7 @@ pub fn send_video(
 mod video_tests {
     #[test]
     fn one_unreachable_datagram_does_not_end_the_connection() {
-        use crate::driver::tokio_driver::fatal_read;
+        use crate::driver::fatal_read;
         use std::io::{Error, ErrorKind};
 
         // Windows reports an earlier send's ICMP port-unreachable as a
