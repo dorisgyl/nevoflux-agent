@@ -336,10 +336,14 @@ fn resolve(configured: Option<&str>, filename: &str) -> Option<std::path::PathBu
 
 #[cfg(any(feature = "asr-sensevoice", feature = "asr-whisper"))]
 fn missing(what: &str, filename: &str) -> TtsError {
+    // Named in this order on purpose: most people who hit this have no
+    // checkout, and telling them to run a `just` recipe is telling them to
+    // install a build system to use a browser feature.
     TtsError::ConfigMissing(format!(
-        "SenseVoice {what} not found ({filename}). Run `just fetch-asr-models` to \
-         download it into ~/.cache/nevoflux/models/, or set `[tts.sensevoice] \
-         model_path` / `tokens_path` in ~/.config/nevoflux/config.toml."
+        "SenseVoice {what} not found ({filename}). Download it from Settings → \
+         General → Speech Models, or run `just fetch-asr-models` from a checkout, \
+         or set `[tts.sensevoice] model_path` / `tokens_path` in \
+         ~/.config/nevoflux/config.toml."
     ))
 }
 
