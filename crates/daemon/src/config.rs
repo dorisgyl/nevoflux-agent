@@ -70,6 +70,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tts: TtsConfig,
 
+    /// Voice conversation. Everything here is either measured by the daemon or
+    /// a tuning knob — user preferences live in the settings store instead,
+    /// because they belong to a person rather than to a machine.
+    #[serde(default)]
+    pub speech: SpeechConfig,
+
     /// Headless remote-control service (`--remote-control`).
     #[serde(default)]
     pub remote_control: RemoteControlConfig,
@@ -193,6 +199,83 @@ pub struct TtsConfig {
     /// SenseVoice local ONNX config — the default transcription engine.
     #[serde(default)]
     pub sensevoice: SenseVoiceConfig,
+    /// MOSS-TTS-Nano — the multilingual voice. Kokoro stays as the fallback.
+    #[serde(default)]
+    pub moss: MossConfig,
+}
+
+/// Voice conversation settings that are not user preferences.
+///
+/// `[speech]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [speech]
+/// measured_rtf = 0.64   # written by the daemon, not by hand
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechConfig {
+    /// How long MOSS took to speak, as a fraction of the audio it produced,
+    /// measured on this machine.
+    ///
+    /// Written by the daemon after a real synthesis rather than by a probe at
+    /// startup: a probe spends three seconds of someone's first reply measuring
+    /// something the next sentence would have told us anyway, and it measures
+    /// an idle machine rather than a working one.
+    #[serde(default)]
+    pub measured_rtf: Option<f32>,
+    /// Above this, the multilingual engine is too slow to hold a conversation
+    /// on this machine and the fallback takes over.
+    ///
+    /// 0.85 rather than 1.0: at exactly real time the reply finishes as it is
+    /// spoken, leaving nothing for the model that generated it, the
+    /// transcription of the next question, or the rest of the machine.
+    #[serde(default = "default_rtf_budget")]
+    pub rtf_budget: f32,
+}
+
+fn default_rtf_budget() -> f32 {
+    0.85
+}
+
+/// Written by hand, not derived.
+///
+/// `#[serde(default = "...")]` only runs when a field is *deserialized*. A
+/// derived `Default` would give `rtf_budget: 0.0` — and since a config.toml
+/// with no `[speech]` section constructs this struct through `Default` rather
+/// than through serde, the fallback-when-slow rule would silently never fire
+/// on the majority of installs.
+impl Default for SpeechConfig {
+    fn default() -> Self {
+        SpeechConfig {
+            measured_rtf: None,
+            rtf_budget: default_rtf_budget(),
+        }
+    }
+}
+
+/// MOSS-TTS-Nano local config.
+///
+/// `[tts.moss]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.moss]
+/// model_dir = "~/.cache/nevoflux/models"
+/// default_voice = "Junhao"
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MossConfig {
+    /// Where the eight MOSS files live. None → `~/.cache/nevoflux/models`.
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// Which built-in voice to use when a caller does not name one.
+    #[serde(default)]
+    pub default_voice: Option<String>,
+    /// ONNX intra-op width. None → the shared default.
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// Set `false` to keep the fallback engine even when MOSS is installed.
+    /// Absent means enabled: having downloaded 717 MB is consent enough.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Kokoro local TTS config.

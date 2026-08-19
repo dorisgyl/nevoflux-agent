@@ -2354,6 +2354,9 @@ pub async fn start_server(
     let process_router = router.clone();
     let process_response_tx = response_tx.clone();
     let process_config = agent_config.clone();
+    // A machine already judged too slow for MOSS should not have to prove it
+    // again on the user's first reply of the session.
+    crate::tts::moss::prime_rtf(&process_config.read().unwrap().clone());
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
     let process_available_browsers = available_browsers.clone();
@@ -2817,9 +2820,14 @@ pub async fn start_server(
                     .get("voice")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let kokoro_cfg = process_config.read().unwrap().tts.kokoro.clone();
-                match crate::tts::kokoro::conversation_synthesizer(&kokoro_cfg) {
-                    Ok(synth) => {
+                // MOSS 优先,不行才回落 Kokoro —— 而且一定带上原因:
+                // 对中文用户,回落不是「换个音色」,是从有声变没声。
+                let voice_cfg = process_config.read().unwrap().clone();
+                match crate::tts::moss::conversation_voice(&voice_cfg) {
+                    Ok((synth, choice)) => {
+                        if let Some(why) = choice.reason.as_deref() {
+                            warn!("voice: speaking with {} — {}", choice.engine, why);
+                        }
                         let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
                         let tx = process_response_tx.clone();
                         let ident = identity.clone();
@@ -2855,10 +2863,12 @@ pub async fn start_server(
                             voice,
                             synth,
                             vtx,
-                        );
+                        )
+                        .with_engine(choice.engine, choice.reason.clone());
                         process_voice_registry
                             .begin(&session_id, &turn_id, turn.canceller())
                             .await;
+                        let rtf_cfg = process_config.clone();
 
                         let registry = process_voice_registry.clone();
                         let sid = session_id.clone();
@@ -2878,6 +2888,10 @@ pub async fn start_server(
                             }
                             turn.finish();
                             registry.end(&sid, &tid).await;
+                            // The turn just measured how fast this machine
+                            // speaks; write it down so the next session does
+                            // not have to find out again.
+                            crate::tts::moss::persist_measurement(&rtf_cfg);
                         });
                     }
                     Err(e) => {
@@ -6490,9 +6504,11 @@ async fn handle_chat_message_streaming(
     // 影响文字回答的转发,那是产品里最承重的一条。
     let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> =
         if crate::speech::conversation().voice_mode(&session_id).await {
-            let kokoro_cfg = config.tts.kokoro.clone();
-            match crate::tts::kokoro::conversation_synthesizer(&kokoro_cfg) {
-                Ok(synth) => {
+            match crate::tts::moss::conversation_voice(config) {
+                Ok((synth, choice)) => {
+                    if let Some(why) = choice.reason.as_deref() {
+                        warn!("voice: speaking with {} — {}", choice.engine, why);
+                    }
                     let (ttx, mut trx) = tokio::sync::mpsc::unbounded_channel::<String>();
                     let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
                     let turn_id = format!("vt_{}", uuid::Uuid::new_v4());
@@ -6537,7 +6553,8 @@ async fn handle_chat_message_streaming(
                             None,
                             synth,
                             vtx,
-                        );
+                        )
+                        .with_engine(choice.engine, choice.reason.clone());
                         crate::speech::conversation()
                             .turns
                             .begin(&sid2, &tid, turn.canceller())

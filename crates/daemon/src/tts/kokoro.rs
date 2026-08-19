@@ -61,6 +61,11 @@ fn default_model_dir() -> Option<PathBuf> {
 }
 
 /// Expand a leading `~/` — config files are hand-edited and people write it.
+/// Shared with the MOSS loader: one `~/` expansion, not two that drift.
+pub fn expand_home_public(p: &str) -> String {
+    expand_home(p)
+}
+
 fn expand_home(p: &str) -> String {
     match p.strip_prefix("~/") {
         Some(rest) => match dirs::home_dir() {

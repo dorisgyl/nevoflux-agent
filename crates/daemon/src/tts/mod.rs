@@ -24,6 +24,9 @@ pub mod asr;
 pub mod elevenlabs;
 pub mod error;
 pub mod kokoro;
+/// Engine selection for voice conversation: MOSS if it is installed and fast
+/// enough here, Kokoro otherwise — and always with the reason attached.
+pub mod moss;
 
 use crate::config::ElevenLabsConfig;
 use error::TtsError;
