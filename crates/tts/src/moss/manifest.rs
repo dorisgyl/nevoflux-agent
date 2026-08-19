@@ -167,6 +167,22 @@ impl Manifest {
         RequestRows { rows }
     }
 
+    /// Ids that frame a request rather than say anything.
+    ///
+    /// Handed to the tokenizer so text can never produce one. A reply that
+    /// happens to contain `<|im_end|>` should be read aloud, not treated as the
+    /// end of the turn.
+    pub fn reserved_token_ids(&self) -> Vec<i32> {
+        let c = &self.tts_config;
+        vec![
+            c.audio_pad_token_id,
+            c.audio_start_token_id,
+            c.audio_end_token_id,
+            c.audio_user_slot_token_id,
+            c.audio_assistant_slot_token_id,
+        ]
+    }
+
     /// The row fed back after a generated frame.
     pub fn generated_row(&self, frame: &[i32]) -> Vec<i32> {
         self.audio_row(frame, self.tts_config.audio_assistant_slot_token_id)
@@ -287,6 +303,14 @@ mod tests {
             m.generated_row(&[4, 5, 6])[0],
             m.tts_config.audio_user_slot_token_id
         );
+    }
+
+    #[test]
+    fn the_structural_ids_are_reported_for_exclusion() {
+        let r = fixture().reserved_token_ids();
+        for id in [99, 6, 7, 8, 9] {
+            assert!(r.contains(&id), "{id} is missing from {r:?}");
+        }
     }
 
     #[test]
