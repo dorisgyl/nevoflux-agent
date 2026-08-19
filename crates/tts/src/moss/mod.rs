@@ -34,6 +34,7 @@
 //! randomness comes from here, so a fixed seed makes a run reproducible.
 
 pub mod manifest;
+pub mod tokenizer;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -44,6 +45,7 @@ use ort::value::Value;
 use crate::error::TtsError;
 use crate::model::load_session;
 pub use manifest::{BuiltinVoice, Manifest};
+pub use tokenizer::SpBpe;
 
 /// Graph and manifest filenames, upstream's own.
 const F_MANIFEST: &str = "browser_poc_manifest.json";
@@ -51,6 +53,7 @@ const F_PREFILL: &str = "moss_tts_prefill.onnx";
 const F_DECODE: &str = "moss_tts_decode_step.onnx";
 const F_FRAME: &str = "moss_tts_local_fixed_sampled_frame.onnx";
 const F_CODEC: &str = "moss_audio_tokenizer_decode_full.onnx";
+const F_TOKENIZER: &str = "tokenizer.model";
 
 /// Attention layers in the global transformer, hence 24 KV tensors.
 const GLOBAL_LAYERS: usize = 12;
@@ -165,6 +168,7 @@ impl Rng {
 
 pub struct MossEngine {
     manifest: Manifest,
+    tokenizer: SpBpe,
     prefill: Mutex<Session>,
     decode: Mutex<Session>,
     frame: Mutex<Session>,
@@ -204,8 +208,14 @@ impl MossEngine {
             .map_err(|e| TtsError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
         let manifest = Manifest::parse(&bytes)?;
 
+        let tok_bytes = std::fs::read(dir.join(F_TOKENIZER)).map_err(|e| {
+            TtsError::ModelNotFound(format!("{}: {e}", dir.join(F_TOKENIZER).display()))
+        })?;
+        let tokenizer = SpBpe::parse(&tok_bytes, &manifest.reserved_token_ids())?;
+
         Ok(MossEngine {
             manifest,
+            tokenizer,
             prefill: Mutex::new(load_session(&dir.join(F_PREFILL), threads)?),
             decode: Mutex::new(load_session(&dir.join(F_DECODE), threads)?),
             frame: Mutex::new(load_session(&dir.join(F_FRAME), threads)?),
@@ -403,6 +413,19 @@ impl MossEngine {
         })
     }
 
+    /// Text in, audio out — the entry point everything else should use.
+    pub fn speak(&self, voice: &str, text: &str, seed: u64) -> Result<Audio, TtsError> {
+        let ids = self.tokenizer.encode(text);
+        if ids.is_empty() {
+            return Err(fail("text", "nothing to say"));
+        }
+        self.speak_tokens(voice, &ids, seed)
+    }
+
+    pub fn tokenizer(&self) -> &SpBpe {
+        &self.tokenizer
+    }
+
     /// The whole path, for callers that already have token ids.
     pub fn speak_tokens(
         &self,
@@ -554,9 +577,66 @@ mod tests {
 mod real {
     use super::*;
 
-    fn engine() -> MossEngine {
-        let dir = crate::model::default_model_dir().expect("a cache directory");
-        MossEngine::load(&dir, crate::model::default_threads()).expect("MOSS should load")
+    /// The one engine, held for the duration of a test.
+    ///
+    /// Serialised deliberately. `cargo test` runs tests in parallel, and the
+    /// first attempt measured RTF 1.749 — not because anything was slow, but
+    /// because three tests were doing transformer inference on the same cores
+    /// at once. A timing assertion that any neighbouring test can fail is worse
+    /// than no timing assertion. Loading once also keeps 717 MB from being
+    /// mapped three times.
+    fn engine() -> std::sync::MutexGuard<'static, MossEngine> {
+        static ENGINE: std::sync::OnceLock<std::sync::Mutex<MossEngine>> =
+            std::sync::OnceLock::new();
+        ENGINE
+            .get_or_init(|| {
+                let dir = crate::model::default_model_dir().expect("a cache directory");
+                std::sync::Mutex::new(
+                    MossEngine::load(&dir, crate::model::default_threads()).expect("MOSS loads"),
+                )
+            })
+            .lock()
+            .expect("another test panicked while holding the engine")
+    }
+
+    /// Text this model has never been handed by us before, through the whole
+    /// path: tokenizer, both transformers, codec.
+    ///
+    /// The gate test above uses the manifest's worked example, which proves the
+    /// graphs but says nothing about the tokenizer. This one is the pair to it.
+    #[test]
+    #[ignore = "needs the 717 MB MOSS weights"]
+    fn moss_real_speaks_a_sentence_of_its_own() {
+        let e = engine();
+        let voice = e.voices()[0].voice.clone();
+        let text = "你好,我是 NevoFlux 的语音助手,现在可以说中文了。";
+
+        let audio = e.speak(&voice, text, 7).expect("speaking should work");
+        let mono = audio.mono();
+        let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+        println!("text {text}\n  {:.2}s  rms {rms:.4}", audio.seconds());
+
+        assert!(rms > 0.005, "silent (rms {rms:.5})");
+        // Roughly a syllable per 0.2 s: shorter than a second for this much
+        // text would mean it gave up, longer than thirty means it ran away.
+        assert!(
+            audio.seconds() > 1.0 && audio.seconds() < 30.0,
+            "{:.2}s for {} characters",
+            audio.seconds(),
+            text.chars().count()
+        );
+
+        let wav = std::env::temp_dir().join("moss-own.wav");
+        std::fs::write(&wav, crate::wav::encode(&mono, SAMPLE_RATE)).ok();
+        println!("wrote {}", wav.display());
+    }
+
+    #[test]
+    #[ignore = "needs the 717 MB MOSS weights"]
+    fn moss_real_refuses_empty_text_instead_of_synthesising_silence() {
+        let e = engine();
+        let voice = e.voices()[0].voice.clone();
+        assert!(e.speak(&voice, "   \n ", 1).is_err());
     }
 
     #[test]
