@@ -6,6 +6,9 @@
 pub mod error;
 pub mod g2p;
 pub mod model;
+/// MOSS-TTS-Nano: the multilingual engine. Kokoro cannot speak Chinese at all,
+/// so for those users this is not an upgrade but the whole feature.
+pub mod moss;
 pub mod split;
 pub mod synth;
 pub mod vocab;

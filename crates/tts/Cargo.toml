@@ -24,6 +24,10 @@ misaki-rs = { version = "0.3.0", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 thiserror = { workspace = true }
 dirs = "5.0"
+# The MOSS manifest carries the prompt templates and the built-in voices;
+# without it the graphs have no way to be addressed.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

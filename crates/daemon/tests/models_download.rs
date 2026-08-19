@@ -271,3 +271,46 @@ async fn cancelling_keeps_what_was_downloaded() {
     );
     assert!(part.metadata().unwrap().len() > 0);
 }
+
+/// Fetch the multilingual voice into the real model cache.
+///
+/// Not a test of anything — a developer entry point that happens to be
+/// expressible as one, so that getting 717 MB of MOSS onto a machine uses the
+/// same code path the product uses rather than a second `curl` recipe that can
+/// drift from it. Resumes if interrupted, and costs nothing once complete.
+///
+/// ```text
+/// cargo test -p nevoflux-daemon --test models_download -- --ignored \
+///     fetch_the_multilingual_voice --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "downloads 717 MB into ~/.cache/nevoflux/models"]
+async fn fetch_the_multilingual_voice() {
+    let dir = nevoflux_daemon::models::models_dir().expect("a cache directory");
+    let mut last = 0u64;
+    nevoflux_daemon::models::download_tier(
+        &http_client(),
+        catalog::Tier::SpeakMultilingual,
+        &dir,
+        &CancellationToken::new(),
+        &mut |asset, done, total| {
+            // One line per 25 MB; a progress bar in a test log is noise.
+            //
+            // `saturating_sub` because `done` restarts at zero on every asset
+            // while `last` still holds the previous one's tail — plain
+            // subtraction panics there, which is how this first ran.
+            if done == total || done.saturating_sub(last) > 25 * 1024 * 1024 || done < last {
+                last = done;
+                println!(
+                    "  {:<40} {:>6.1} / {:.1} MB",
+                    asset.id,
+                    done as f64 / 1048576.0,
+                    total as f64 / 1048576.0
+                );
+            }
+        },
+    )
+    .await
+    .expect("the multilingual voice should download");
+    println!("MOSS is in {}", dir.display());
+}

@@ -244,7 +244,10 @@ mod tests {
             .expect("reading should succeed");
 
         assert!(kept.len() > 1, "one chunk would prove nothing");
-        assert_eq!(streamed, kept, "the parts must not depend on keeping the join");
+        assert_eq!(
+            streamed, kept,
+            "the parts must not depend on keeping the join"
+        );
         assert_eq!(
             whole.pcm.len(),
             kept.iter().map(Vec::len).sum::<usize>(),
