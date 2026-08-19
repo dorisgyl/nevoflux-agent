@@ -58,10 +58,10 @@ pub async fn handle_status(params: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "dir": dir.display().to_string(),
             "assets": status(&dir),
-            "tiers": [
-                tier_report(Tier::Transcribe, &dir),
-                tier_report(Tier::Speak, &dir),
-            ],
+            // Every tier, from the one list of them: a hand-written pair here
+            // would silently stop reporting the day a third was added, and the
+            // panel would offer a download the daemon never mentions.
+            "tiers": Tier::ALL.iter().map(|t| tier_report(*t, &dir)).collect::<Vec<_>>(),
         }),
     )
 }
@@ -74,7 +74,14 @@ pub async fn handle_download(params: &serde_json::Value) -> serde_json::Value {
             &id,
             "models.download",
             "BAD_TIER",
-            "expected tier \"transcribe\" or \"speak\"",
+            &format!(
+                "expected one of {}",
+                Tier::ALL
+                    .iter()
+                    .map(|t| t.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         );
     };
     let Some(dir) = models_dir() else {
@@ -206,7 +213,14 @@ pub async fn handle_cancel(params: &serde_json::Value) -> serde_json::Value {
             &id,
             "models.cancel",
             "BAD_TIER",
-            "expected tier \"transcribe\" or \"speak\"",
+            &format!(
+                "expected one of {}",
+                Tier::ALL
+                    .iter()
+                    .map(|t| t.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         );
     };
     let was_running = downloads().cancel(tier);
@@ -254,7 +268,7 @@ mod tests {
         let v = handle_status(&serde_json::json!({ "request_id": "r1" })).await;
         assert!(ok(&v), "{v}");
         let data = payload(&v).get("data").unwrap();
-        assert_eq!(data["tiers"].as_array().unwrap().len(), 2);
+        assert_eq!(data["tiers"].as_array().unwrap().len(), Tier::ALL.len());
         assert_eq!(
             data["assets"].as_array().unwrap().len(),
             catalog::ASSETS.len()

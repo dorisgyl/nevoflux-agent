@@ -35,13 +35,27 @@ pub enum Tier {
     Transcribe,
     /// Text out, speech back.
     Speak,
+    /// The voice people actually want: multilingual, natural, and 717 MB.
+    ///
+    /// Its own tier rather than part of `Speak` because the two are
+    /// alternatives, not companions — Kokoro is the fallback that runs when
+    /// this is missing or too slow, and 120 MB of fallback should not be
+    /// withheld until 717 MB of primary has arrived.
+    SpeakMultilingual,
 }
 
 impl Tier {
+    /// Every tier. `id()` below is an exhaustive match, so the compiler stops
+    /// a new variant from being added without being named — but nothing forces
+    /// it into this list, which is why the test that walks it also checks that
+    /// every asset was reached.
+    pub const ALL: &'static [Tier] = &[Tier::Transcribe, Tier::Speak, Tier::SpeakMultilingual];
+
     pub fn id(self) -> &'static str {
         match self {
             Tier::Transcribe => "transcribe",
             Tier::Speak => "speak",
+            Tier::SpeakMultilingual => "speak-multilingual",
         }
     }
 
@@ -49,6 +63,7 @@ impl Tier {
         match s {
             "transcribe" => Some(Tier::Transcribe),
             "speak" => Some(Tier::Speak),
+            "speak-multilingual" => Some(Tier::SpeakMultilingual),
             _ => None,
         }
     }
@@ -85,6 +100,34 @@ pub struct Asset {
 
 const SENSEVOICE_REPO: &str = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 const KOKORO_RELEASE: &str = "thewh1teagle/kokoro-onnx @ model-files-v1.0";
+
+const MOSS_TTS: &str = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX";
+const MOSS_CODEC: &str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX";
+
+/// Build one MOSS entry. The two repositories are laid out identically, and
+/// writing ten of these by hand invites exactly one typo in exactly one URL.
+macro_rules! moss {
+    ($id:literal, $repo:expr, $mirror:literal, $file:literal, $bytes:literal, $sha:literal) => {
+        Asset {
+            id: $id,
+            tier: Tier::SpeakMultilingual,
+            file: $file,
+            bytes: $bytes,
+            sha256: $sha,
+            sources: &[
+                concat!("https://hf-mirror.com/", $mirror, "/resolve/main/", $file),
+                concat!("https://huggingface.co/", $mirror, "/resolve/main/", $file),
+            ],
+            // ADR-0005. The upstream root LICENSE has since been published as
+            // Apache-2.0, which is the condition the model card's clause names
+            // — but the card still carries the clause, and pointing at someone
+            // else's URL costs nothing while hosting the bytes cannot be undone.
+            // Flip this only as a decision, never as a convenience.
+            self_hosting_allowed: false,
+            upstream: $repo,
+        }
+    };
+}
 
 pub const ASSETS: &[Asset] = &[
     Asset {
@@ -158,6 +201,87 @@ pub const ASSETS: &[Asset] = &[
         self_hosting_allowed: true,
         upstream: KOKORO_RELEASE,
     },
+    // ── MOSS-TTS-Nano (P1) ───────────────────────────────────────────────
+    //
+    // Filenames are upstream's and must stay that way: the `.onnx` graphs
+    // reference their `.data` blobs **by name** through ONNX external data, so
+    // a tidier local name would load a model with no weights in it.
+    //
+    // The streaming decoder, the encoder (voice cloning), and the per-channel
+    // sampling path are all deliberately absent — 43 MB and 42 MB of files this
+    // does not call yet. They can be added the day something uses them.
+    moss!(
+        "moss-manifest",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "browser_poc_manifest.json",
+        503_354,
+        "097d80e993dc29f0bae427590b4f77084a161cb578b50d82c29f455d5faa9eee"
+    ),
+    moss!(
+        "moss-tts-prefill",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "moss_tts_prefill.onnx",
+        283_305,
+        "d56126dcd0574c2f15d98fc6b35eda68d0386b5bd9c5e38e28548d6f2ea8f3db"
+    ),
+    moss!(
+        "moss-tts-decode-step",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "moss_tts_decode_step.onnx",
+        291_483,
+        "698cbc2fc1c2feca16e5895614ed52bbb32ded10f236c076f477b2e69abf32d8"
+    ),
+    moss!(
+        "moss-tts-sampled-frame",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "moss_tts_local_fixed_sampled_frame.onnx",
+        471_262,
+        "40cdb00efc171c450cf91468e01429caa41b0252222cd308e978f58fe354afa8"
+    ),
+    moss!(
+        "moss-tts-global-weights",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "moss_tts_global_shared.data",
+        440_813_568,
+        "bce8312c3df6a44545302cae229b61054fe0672e0b252ba59cba47adeed831dc"
+    ),
+    moss!(
+        "moss-tts-local-weights",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "moss_tts_local_shared.data",
+        229_678_080,
+        "bae7782032c0fb12490ab42afe009f87ae6c75a0f0596fc7b5c08e4d5ee93916"
+    ),
+    moss!(
+        "moss-tts-tokenizer",
+        MOSS_TTS,
+        "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        "tokenizer.model",
+        470_897,
+        "c353ee1479b536bf414c1b247f5542b6607fb8ae91320e5af1781fee200fddff"
+    ),
+    moss!(
+        "moss-codec-decode",
+        MOSS_CODEC,
+        "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX",
+        "moss_audio_tokenizer_decode_full.onnx",
+        681_902,
+        "0fbbafe3fd4afa2a019af5c5ced204af6e2d1db044fa40f021525d2aee95b4ac"
+    ),
+    moss!(
+        "moss-codec-weights",
+        MOSS_CODEC,
+        "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX",
+        "moss_audio_tokenizer_decode_shared.data",
+        44_198_912,
+        "e69d52e0f4e84ca27850557ee54face46632d3a5a16c89bd246c7c408466dcad"
+    ),
 ];
 
 /// Hosts NevoFlux controls. Anything here counts as us serving the bytes.
@@ -308,11 +432,62 @@ mod tests {
     fn lookup_by_id_and_by_tier_agree_with_the_table() {
         assert!(by_id("sensevoice-model").is_some());
         assert!(by_id("no-such-asset").is_none());
+        let reached: usize = Tier::ALL.iter().map(|t| of_tier(*t).count()).sum();
         assert_eq!(
-            of_tier(Tier::Speak).count() + of_tier(Tier::Transcribe).count(),
+            reached,
             ASSETS.len(),
-            "an asset belongs to no tier"
+            "an asset belongs to a tier that Tier::ALL does not list"
         );
+    }
+
+    #[test]
+    fn every_tier_has_something_in_it() {
+        // An empty tier reaches the UI as a row offering a 0 MB download.
+        for t in Tier::ALL {
+            assert!(of_tier(*t).count() > 0, "{} is empty", t.id());
+            assert!(tier_bytes(*t) > 0, "{} costs nothing", t.id());
+        }
+    }
+
+    #[test]
+    fn the_multilingual_voice_is_not_bundled_into_the_fallback_tier() {
+        // They are alternatives: Kokoro runs when MOSS is missing or too slow.
+        // Merging them would withhold 120 MB of working fallback until 717 MB
+        // of primary had arrived.
+        assert!(tier_bytes(Tier::SpeakMultilingual) > tier_bytes(Tier::Speak));
+        for a in of_tier(Tier::Speak) {
+            assert!(
+                !a.id.starts_with("moss-"),
+                "{} is in the fallback tier",
+                a.id
+            );
+        }
+    }
+
+    #[test]
+    fn moss_is_never_served_from_our_own_hosts() {
+        // The general rule is enforced above; this pins the specific case the
+        // rule exists for, so that deleting the flag on these entries fails
+        // here by name rather than silently passing a vacuous loop.
+        let moss: Vec<_> = ASSETS
+            .iter()
+            .filter(|a| a.id.starts_with("moss-"))
+            .collect();
+        assert_eq!(moss.len(), 9, "the MOSS asset set changed");
+        for a in moss {
+            assert!(!a.self_hosting_allowed, "{} may not be self-hosted", a.id);
+        }
+    }
+
+    #[test]
+    fn moss_keeps_upstream_filenames() {
+        // The `.onnx` graphs reference their `.data` blobs by name through ONNX
+        // external data. A tidier local name loads a model with no weights in
+        // it — and reports nothing until inference produces silence.
+        for a in ASSETS.iter().filter(|a| a.id.starts_with("moss-")) {
+            let remote = a.sources[0].rsplit('/').next().unwrap();
+            assert_eq!(a.file, remote, "{} is renamed on the way in", a.id);
+        }
     }
 
     #[test]
