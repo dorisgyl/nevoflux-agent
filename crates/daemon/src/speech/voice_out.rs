@@ -40,6 +40,42 @@ pub trait SpeechSynth: Send + Sync {
     fn speak(&self, text: &str, voice: Option<&str>) -> Result<(Vec<f32>, u32), DaemonError>;
 }
 
+/// MOSS speaks 48 kHz stereo; the conversation path is mono, so the two
+/// channels are averaged rather than one being dropped.
+///
+/// The synthesis is timed here because this is the only place that sees both
+/// the clock and the length of what came out — and that measurement is what
+/// decides, on the next reply, whether this machine can keep using MOSS at all.
+#[cfg(feature = "tts-local")]
+impl SpeechSynth for nevoflux_tts::moss::MossEngine {
+    fn speak(&self, text: &str, voice: Option<&str>) -> Result<(Vec<f32>, u32), DaemonError> {
+        let name = match voice.filter(|v| !v.is_empty()) {
+            Some(v) => v.to_string(),
+            // The first built-in voice rather than a hardcoded name: the
+            // manifest owns that list, and a name pinned here would break the
+            // day upstream reorders it.
+            None => self
+                .voices()
+                .first()
+                .map(|v| v.voice.clone())
+                .ok_or_else(|| DaemonError::InternalError("moss: no built-in voices".into()))?,
+        };
+        // A seed derived from the text: the same sentence sounds the same
+        // twice, which makes a re-read of a reply match what was heard, while
+        // different sentences still vary.
+        let seed = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+
+        let started = std::time::Instant::now();
+        let audio = self
+            .speak(&name, text, seed)
+            .map_err(|e| DaemonError::InternalError(format!("moss: {e}")))?;
+        crate::tts::moss::record_rtf(started.elapsed(), audio.seconds());
+        Ok((audio.mono(), audio.sample_rate))
+    }
+}
+
 #[cfg(feature = "tts-local")]
 impl SpeechSynth for nevoflux_tts::Synthesizer {
     fn speak(&self, text: &str, voice: Option<&str>) -> Result<(Vec<f32>, u32), DaemonError> {
@@ -70,6 +106,8 @@ pub struct VoiceTurn {
     out: mpsc::UnboundedSender<VoiceOut>,
     cancelled: Arc<AtomicBool>,
     seq: u32,
+    /// 谁在发声、为什么是它。随 `VoiceDone` 一起报给界面。
+    engine: Option<(String, Option<String>)>,
 }
 
 impl VoiceTurn {
@@ -88,7 +126,14 @@ impl VoiceTurn {
             out,
             cancelled: Arc::new(AtomicBool::new(false)),
             seq: 0,
+            engine: None,
         }
+    }
+
+    /// 记下发声引擎与回落原因,随这一轮的 `VoiceDone` 报出去。
+    pub fn with_engine(mut self, engine: &str, reason: Option<String>) -> Self {
+        self.engine = Some((engine.to_string(), reason));
+        self
     }
 
     /// 打断用的开关。
@@ -149,10 +194,16 @@ impl VoiceTurn {
 
     /// 收尾。`spoken` 是实际推出去的句数。
     pub fn finish(self) {
+        let (engine, engine_reason) = match self.engine {
+            Some((e, r)) => (Some(e), r),
+            None => (None, None),
+        };
         let _ = self.out.send(VoiceOut::Done(VoiceDone {
             session_id: self.session_id,
             turn_id: self.turn_id,
             spoken: self.seq,
+            engine,
+            engine_reason,
         }));
     }
 }

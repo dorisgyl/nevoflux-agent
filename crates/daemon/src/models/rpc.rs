@@ -68,6 +68,20 @@ pub async fn handle_status(params: &serde_json::Value) -> serde_json::Value {
 
 /// Start fetching a tier. Returns immediately; watch [`PROGRESS_TOPIC`].
 pub async fn handle_download(params: &serde_json::Value) -> serde_json::Value {
+    download_with(params, CURRENT_EVENT_BUS.get().cloned()).await
+}
+
+/// The bus is a parameter rather than a global lookup so that a test can say
+/// which case it is testing.
+///
+/// Found the hard way: with the lookup inside, whether this refused or started
+/// depended on whether some *other* test had initialised the global bus first
+/// — and in the full suite it had, so the test that meant to check the refusal
+/// quietly kicked off a 240 MB download instead.
+async fn download_with(
+    params: &serde_json::Value,
+    bus: Option<Arc<EventBus>>,
+) -> serde_json::Value {
     let id = request_id(params);
     let Some(tier) = tier_of(params) else {
         return err_response(
@@ -92,7 +106,7 @@ pub async fn handle_download(params: &serde_json::Value) -> serde_json::Value {
             "this system has no cache directory to download into",
         );
     };
-    let Some(bus) = CURRENT_EVENT_BUS.get().cloned() else {
+    let Some(bus) = bus else {
         // Refused rather than started silently: a download nobody can see the
         // progress of looks exactly like one that is not running.
         return err_response(
@@ -283,7 +297,7 @@ mod tests {
             serde_json::json!({ "request_id": "r", "tier": "everything" }),
             serde_json::json!({ "request_id": "r", "tier": 3 }),
         ] {
-            let v = handle_download(&bad).await;
+            let v = download_with(&bad, None).await;
             assert!(!ok(&v), "{v}");
             assert_eq!(payload(&v)["error"]["code"], "BAD_TIER");
             let v = handle_cancel(&bad).await;
@@ -296,10 +310,10 @@ mod tests {
         // In tests CURRENT_EVENT_BUS is unset, which is exactly the condition
         // being asserted: a download whose progress nobody can see is
         // indistinguishable from one that never started.
-        let v = handle_download(&serde_json::json!({
-            "request_id": "r",
-            "tier": "transcribe",
-        }))
+        let v = download_with(
+            &serde_json::json!({ "request_id": "r", "tier": "transcribe" }),
+            None,
+        )
         .await;
         assert!(!ok(&v), "{v}");
         assert_eq!(payload(&v)["error"]["code"], "NO_EVENT_BUS");

@@ -139,6 +139,15 @@ pub struct VoiceDone {
     /// 投递注记要拿它与播放端实际播出的句数对账(ADR-0004):模型以为自己说完了
     /// 整段而用户只听到前三分之一,是 cascaded S2S 最隐蔽的 bug。
     pub spoken: u32,
+    /// 实际发声的引擎(`moss` / `kokoro`)。
+    ///
+    /// 与下面的 `engine_reason` 一起送到界面。回落对英文用户是「换个声音」,
+    /// 对中文用户是**从有声变没声** —— 这件事绝不能悄悄发生。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// 为什么不是主引擎。主引擎在跑时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
