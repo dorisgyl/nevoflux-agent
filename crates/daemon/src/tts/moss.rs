@@ -306,3 +306,101 @@ mod tests {
         assert!(AgentConfig::default().speech.rtf_budget > 0.5);
     }
 }
+
+/// The voice the user picked, from the settings the browser writes.
+///
+/// Read fresh rather than cached: the dropdown is in a page that may be open
+/// right now, and a voice change that only takes effect after a daemon restart
+/// reads as a setting that does not work.
+pub fn preferred_voice(db: &nevoflux_storage::Database) -> Option<String> {
+    use nevoflux_storage::ConfigRepository;
+    ConfigRepository::new(db)
+        .get("config:settings")
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.get("general")
+                .and_then(|g| g.get("speechVoice"))
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// What the settings page needs to offer a voice: which engine will speak,
+/// why that one, and the voices it actually has.
+///
+/// The list is the *active* engine's. Offering MOSS's eighteen while Kokoro is
+/// the one speaking would let someone pick a voice that silently does nothing.
+#[cfg(feature = "tts-local")]
+pub fn voice_catalog(cfg: &AgentConfig) -> serde_json::Value {
+    let (engine, reason) = match conversation_voice(cfg) {
+        Ok((_, choice)) => (choice.engine, choice.reason),
+        Err(e) => ("none", Some(e.to_string())),
+    };
+
+    let voices: Vec<serde_json::Value> = if engine == "moss" {
+        engine_voices(&cfg.tts.moss)
+    } else if engine == "kokoro" {
+        kokoro_voices(cfg)
+    } else {
+        Vec::new()
+    };
+
+    serde_json::json!({
+        "engine": engine,
+        "reason": reason,
+        "measured_rtf": measured_rtf(),
+        "rtf_budget": cfg.speech.rtf_budget,
+        "voices": voices,
+    })
+}
+
+#[cfg(feature = "tts-local")]
+fn engine_voices(cfg: &MossConfig) -> Vec<serde_json::Value> {
+    match engine(cfg) {
+        Ok(e) => e
+            .voices()
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "id": v.voice,
+                    "name": v.display_name,
+                    "group": v.group,
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Kokoro's voices, read from the loaded bank rather than a list written here.
+///
+/// A hardcoded copy would drift the moment the voice file changes, and offering
+/// a voice the bank does not have produces a synthesis error at the one moment
+/// someone wanted to hear something.
+#[cfg(feature = "tts-local")]
+fn kokoro_voices(cfg: &AgentConfig) -> Vec<serde_json::Value> {
+    match crate::tts::kokoro::conversation_synthesizer(&cfg.tts.kokoro) {
+        Ok(s) => s
+            .voices()
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "name": id, "group": "English" }))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(feature = "tts-local"))]
+pub fn voice_catalog(_cfg: &AgentConfig) -> serde_json::Value {
+    serde_json::json!({ "engine": "none", "reason": "built without `tts-local`", "voices": [] })
+}
+
+/// `speech.voices` — what the settings page calls to build its dropdown.
+pub async fn handle_voices(params: &serde_json::Value, cfg: &AgentConfig) -> serde_json::Value {
+    let id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    crate::kb_wizard::ok_response(id, "speech.voices", voice_catalog(cfg))
+}

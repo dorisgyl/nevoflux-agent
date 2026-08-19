@@ -6504,6 +6504,9 @@ async fn handle_chat_message_streaming(
     // 影响文字回答的转发,那是产品里最承重的一条。
     let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> =
         if crate::speech::conversation().voice_mode(&session_id).await {
+            // 用户在设置里选的音色。在 spawn 之前读:`services` 借的是这个函数的栈,
+            // 活不到那个任务里。读不到就交给引擎自己的默认,而不是硬写一个名字。
+            let chosen_voice = crate::tts::moss::preferred_voice(&services.database);
             match crate::tts::moss::conversation_voice(config) {
                 Ok((synth, choice)) => {
                     if let Some(why) = choice.reason.as_deref() {
@@ -6550,7 +6553,7 @@ async fn handle_chat_message_streaming(
                         let mut turn = crate::speech::VoiceTurn::new(
                             sid2.clone(),
                             tid.clone(),
-                            None,
+                            chosen_voice.clone(),
                             synth,
                             vtx,
                         )
@@ -8351,6 +8354,16 @@ async fn handle_chat_message(
                 // has started; progress streams on `system:models:progress`.
                 // Nothing here runs unasked — the daemon still fetches nothing
                 // on its own, which is the rule `just fetch-asr-models` states.
+                // Which voices the engine that will actually speak has, plus
+                // which engine that is and why. The settings page builds its
+                // dropdown from this rather than from a list of its own.
+                "speech.voices" => {
+                    // Loaded here rather than taken from the process handle:
+                    // this dispatch has no access to it, and the answer is a
+                    // snapshot for one panel refresh either way.
+                    let cfg = AgentConfig::load().unwrap_or_default();
+                    crate::tts::moss::handle_voices(&params, &cfg).await
+                }
                 "models.status" => crate::models::rpc::handle_status(&params).await,
                 "models.download" => crate::models::rpc::handle_download(&params).await,
                 "models.cancel" => crate::models::rpc::handle_cancel(&params).await,
