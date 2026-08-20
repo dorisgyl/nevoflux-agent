@@ -50,34 +50,115 @@ impl Choice {
     }
 }
 
-/// The last measured real-time factor, in thousandths.
+/// How many recent measurements the verdict is drawn from.
 ///
-/// Process-level because it describes the machine rather than a session, and
-/// `u32` because an atomic is enough: it is written after a synthesis and read
-/// before the next one, and a torn read of a performance figure is not worth a
-/// lock.
+/// Five: enough that one bad sample cannot decide, few enough that a machine
+/// which genuinely changed — a laptop unplugged, a build finished — is judged
+/// on how it behaves now rather than last week.
+const RECENT: usize = 5;
+
+/// The decided real-time factor, in thousandths. Derived from [`SAMPLES`].
 static MEASURED_RTF: AtomicU32 = AtomicU32::new(0);
+
+/// What this process last wrote to disk, in thousandths.
+///
+/// The write-if-it-moved check compares against this rather than against the
+/// shared config handle. That handle can be stale — after a reset it still
+/// holds the old verdict — and comparing against a stale value is how a
+/// measurement silently stops being persisted.
+static LAST_PERSISTED: AtomicU32 = AtomicU32::new(0);
+
+/// Recent measurements, newest last.
+///
+/// Behind a lock rather than an atomic because the verdict is a median and
+/// medians need the whole set. Process-level because it describes the machine,
+/// not a session.
+static SAMPLES: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+
+/// The middle of a set of measurements.
+///
+/// The median rather than the last value, because one measurement taken while
+/// the machine was busy would otherwise be the final word — and that is not
+/// hypothetical: a run measured 2.07x with transcription going at the same
+/// time, against 0.87x for the same work a minute later.
+///
+/// And rather than the minimum, which fails the other way: a single lucky
+/// sample would pin the fast engine on a machine that cannot sustain it, and
+/// the user would hear every reply stutter.
+pub fn median(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v: Vec<f32> = values.iter().copied().filter(|x| *x > 0.0).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+fn publish_verdict(samples: &[f32]) {
+    let value = median(samples).unwrap_or(0.0);
+    MEASURED_RTF.store((value * 1000.0).round().max(0.0) as u32, Ordering::Relaxed);
+}
 
 /// Record what a synthesis cost. `audio_seconds` of speech took `elapsed`.
 pub fn record_rtf(elapsed: std::time::Duration, audio_seconds: f64) {
-    if audio_seconds <= 0.0 {
-        return;
-    }
-    let rtf = elapsed.as_secs_f64() / audio_seconds;
     // A run this short is dominated by fixed costs and says nothing about
     // sustained throughput.
     if audio_seconds < 0.5 {
         return;
     }
-    MEASURED_RTF.store((rtf * 1000.0).round().max(0.0) as u32, Ordering::Relaxed);
+    let rtf = (elapsed.as_secs_f64() / audio_seconds) as f32;
+    if let Ok(mut s) = SAMPLES.lock() {
+        s.push(rtf);
+        let len = s.len();
+        if len > RECENT {
+            s.drain(..len - RECENT);
+        }
+        publish_verdict(&s);
+    }
 }
 
-/// What the last synthesis measured, if there has been one.
+/// The verdict: the median of recent measurements, if there have been any.
 pub fn measured_rtf() -> Option<f32> {
     match MEASURED_RTF.load(Ordering::Relaxed) {
         0 => None,
         v => Some(v as f32 / 1000.0),
     }
+}
+
+/// Every sample behind the verdict, oldest first.
+pub fn recent_samples() -> Vec<f32> {
+    SAMPLES.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Forget what this process measured. Split out from [`reset_rtf`] so the
+/// in-memory half can be tested without touching the user's config file.
+pub fn clear_measurements() {
+    if let Ok(mut s) = SAMPLES.lock() {
+        s.clear();
+    }
+    MEASURED_RTF.store(0, Ordering::Relaxed);
+    LAST_PERSISTED.store(0, Ordering::Relaxed);
+}
+
+/// Forget everything measured here, on disk as well.
+///
+/// The escape hatch. Without it a machine judged too slow once never runs the
+/// primary engine again, so it never measures again either — and the only way
+/// out was to hand-edit `config.toml`, which is not something a user should
+/// have to know.
+pub fn reset_rtf() -> Result<(), String> {
+    clear_measurements();
+
+    // Read from disk rather than from the shared handle: this runs on the
+    // command dispatch, which does not hold one, and the file is the thing
+    // that has to end up clean.
+    let mut c = AgentConfig::load().map_err(|e| e.to_string())?;
+    c.speech.measured_rtf = None;
+    c.speech.recent_rtf.clear();
+    c.save().map_err(|e| e.to_string())
 }
 
 /// Write the measurement back to `config.toml`, if it has moved.
@@ -90,8 +171,12 @@ pub fn measured_rtf() -> Option<f32> {
 /// and rewriting a config file after every sentence is a lot of disk for noise.
 pub fn persist_measurement(cfg: &std::sync::RwLock<Arc<AgentConfig>>) {
     let Some(now) = measured_rtf() else { return };
-    let stored = cfg.read().ok().and_then(|c| c.speech.measured_rtf);
-    if stored.is_some_and(|s| (s - now).abs() < 0.05) {
+    let samples = recent_samples();
+    let last = match LAST_PERSISTED.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v as f32 / 1000.0),
+    };
+    if last.is_some_and(|s| (s - now).abs() < 0.05) {
         return;
     }
     if let Ok(mut slot) = cfg.write() {
@@ -100,11 +185,13 @@ pub fn persist_measurement(cfg: &std::sync::RwLock<Arc<AgentConfig>>) {
         // snapshot instead of seeing half of this change.
         let mut c = (**slot).clone();
         c.speech.measured_rtf = Some(now);
+        c.speech.recent_rtf = samples;
         if let Err(e) = c.save() {
             // Not fatal: the measurement still governs this process, it just
             // will not survive a restart.
             tracing::warn!(target: "speech", error = %e, "could not persist measured RTF");
         } else {
+            LAST_PERSISTED.store((now * 1000.0).round() as u32, Ordering::Relaxed);
             tracing::info!(target: "speech", rtf = now, "recorded speech RTF");
         }
         *slot = Arc::new(c);
@@ -114,11 +201,26 @@ pub fn persist_measurement(cfg: &std::sync::RwLock<Arc<AgentConfig>>) {
 /// Seed the measurement from config at startup, so a machine that was already
 /// judged too slow does not have to prove it again on the user's first reply.
 pub fn prime_rtf(cfg: &AgentConfig) {
-    if let Some(rtf) = cfg.speech.measured_rtf {
-        if rtf > 0.0 {
-            MEASURED_RTF.store((rtf * 1000.0).round() as u32, Ordering::Relaxed);
-        }
+    let mut seed: Vec<f32> = cfg
+        .speech
+        .recent_rtf
+        .iter()
+        .copied()
+        .filter(|v| *v > 0.0)
+        .collect();
+    // A config written before samples were kept has only the verdict. One
+    // sample is a weak basis, but it is what that machine knew.
+    if seed.is_empty() {
+        seed.extend(cfg.speech.measured_rtf.filter(|v| *v > 0.0));
     }
+    if seed.is_empty() {
+        return;
+    }
+    if let Ok(mut s) = SAMPLES.lock() {
+        *s = seed;
+        publish_verdict(&s);
+    }
+    LAST_PERSISTED.store(MEASURED_RTF.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 #[cfg(feature = "tts-local")]
@@ -234,7 +336,10 @@ mod tests {
     /// crate down.
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SAMPLES.lock().unwrap().clear();
+        MEASURED_RTF.store(0, Ordering::Relaxed);
+        g
     }
 
     fn cfg_with(rtf: Option<f32>, budget: f32) -> AgentConfig {
@@ -245,11 +350,107 @@ mod tests {
     }
 
     #[test]
+    fn one_heavy_moment_does_not_decide() {
+        // The case this exists for, with the real numbers: two ordinary runs
+        // and one taken while transcription was going at the same time.
+        let _g = exclusive();
+        for (elapsed, audio) in [(4_872, 5.6), (4_900, 5.6), (11_592, 5.6)] {
+            record_rtf(std::time::Duration::from_millis(elapsed), audio);
+        }
+        let got = measured_rtf().expect("measured");
+        assert!(got < 0.9, "the outlier decided: {got}");
+        assert_eq!(recent_samples().len(), 3);
+    }
+
+    #[test]
+    fn a_machine_that_is_genuinely_slow_is_still_judged_slow() {
+        // The median must not become a way of ignoring bad news.
+        let _g = exclusive();
+        for _ in 0..3 {
+            record_rtf(std::time::Duration::from_millis(11_592), 5.6);
+        }
+        assert!(measured_rtf().unwrap() > 2.0);
+    }
+
+    #[test]
+    fn one_lucky_sample_does_not_pin_the_fast_engine_either() {
+        // Why the median and not the minimum: with the minimum, this machine
+        // would run the primary engine forever and stutter on every reply.
+        let _g = exclusive();
+        record_rtf(std::time::Duration::from_millis(3_000), 5.6); // 0.54
+        for _ in 0..3 {
+            record_rtf(std::time::Duration::from_millis(11_592), 5.6); // 2.07
+        }
+        assert!(measured_rtf().unwrap() > 1.0, "the lucky sample won");
+    }
+
+    #[test]
+    fn only_the_recent_samples_count() {
+        // A machine that changed — unplugged, or a build finished — is judged
+        // on how it behaves now.
+        let _g = exclusive();
+        for _ in 0..RECENT {
+            record_rtf(std::time::Duration::from_millis(11_592), 5.6);
+        }
+        for _ in 0..RECENT {
+            record_rtf(std::time::Duration::from_millis(4_872), 5.6);
+        }
+        assert_eq!(recent_samples().len(), RECENT);
+        assert!(
+            measured_rtf().unwrap() < 0.9,
+            "the old samples still decide"
+        );
+    }
+
+    #[test]
+    fn clearing_lets_the_engine_prove_itself_again() {
+        // The stickiness this exists for, reproduced: a machine judged slow
+        // stops running the engine, so it stops measuring, so the verdict
+        // never moves. Clearing is what breaks that loop.
+        let _g = exclusive();
+        for _ in 0..3 {
+            record_rtf(std::time::Duration::from_millis(11_592), 5.6);
+        }
+        assert!(measured_rtf().unwrap() > 2.0);
+
+        clear_measurements();
+        assert_eq!(measured_rtf(), None, "the verdict survived the reset");
+        assert!(recent_samples().is_empty(), "samples survived the reset");
+
+        // And a fresh measurement is believed immediately, rather than being
+        // averaged against the ones that were just discarded.
+        record_rtf(std::time::Duration::from_millis(4_872), 5.6);
+        assert!(measured_rtf().unwrap() < 0.9);
+    }
+
+    #[test]
+    fn the_median_ignores_nonsense_values() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[0.0, 0.0]), None);
+        assert_eq!(median(&[1.0]), Some(1.0));
+        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+    }
+
+    #[test]
     fn a_measurement_survives_a_restart() {
         let _guard = exclusive();
-        MEASURED_RTF.store(0, Ordering::Relaxed);
         prime_rtf(&cfg_with(Some(1.4), 0.85));
         assert_eq!(measured_rtf(), Some(1.4));
+        // A config written before samples were kept carries only the verdict;
+        // it still has to seed something rather than start blank.
+        assert_eq!(recent_samples(), vec![1.4]);
+    }
+
+    #[test]
+    fn the_samples_survive_a_restart_too() {
+        // Otherwise the first measurement after every restart is the whole
+        // basis again, and one heavy moment decides after all.
+        let _guard = exclusive();
+        let mut c = cfg_with(Some(0.87), 0.85);
+        c.speech.recent_rtf = vec![0.86, 0.87, 2.07];
+        prime_rtf(&c);
+        assert_eq!(recent_samples().len(), 3);
+        assert!(measured_rtf().unwrap() < 0.9);
     }
 
     #[test]
@@ -263,7 +464,6 @@ mod tests {
     #[test]
     fn recording_a_run_stores_its_ratio() {
         let _guard = exclusive();
-        MEASURED_RTF.store(0, Ordering::Relaxed);
         record_rtf(std::time::Duration::from_millis(3200), 5.6);
         let got = measured_rtf().expect("recorded");
         assert!((got - 0.571).abs() < 0.002, "{got}");
@@ -281,7 +481,6 @@ mod tests {
     #[test]
     fn a_zero_length_result_does_not_divide_by_it() {
         let _guard = exclusive();
-        MEASURED_RTF.store(0, Ordering::Relaxed);
         record_rtf(std::time::Duration::from_millis(500), 0.0);
         assert_eq!(measured_rtf(), None);
     }
@@ -396,11 +595,38 @@ pub fn voice_catalog(_cfg: &AgentConfig) -> serde_json::Value {
     serde_json::json!({ "engine": "none", "reason": "built without `tts-local`", "voices": [] })
 }
 
+/// `speech.reset_rtf` — forget the speed verdict and let the primary engine
+/// prove itself again.
+///
+/// The button behind this is the only way out of a bad measurement that does
+/// not involve editing a config file: once the verdict says too slow, the
+/// engine never runs, so it never measures, so the verdict never changes.
+pub async fn handle_reset_rtf(params: &serde_json::Value) -> serde_json::Value {
+    let id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match reset_rtf() {
+        Ok(()) => crate::kb_wizard::ok_response(
+            id,
+            "speech.reset_rtf",
+            serde_json::json!({ "cleared": true }),
+        ),
+        Err(e) => crate::kb_wizard::err_response(id, "speech.reset_rtf", "SAVE_FAILED", e),
+    }
+}
+
 /// `speech.voices` — what the settings page calls to build its dropdown.
 pub async fn handle_voices(params: &serde_json::Value, cfg: &AgentConfig) -> serde_json::Value {
     let id = params
         .get("request_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    crate::kb_wizard::ok_response(id, "speech.voices", voice_catalog(cfg))
+    let mut out = voice_catalog(cfg);
+    // The samples behind the verdict, so the panel can say "0.87 (median of
+    // 0.86, 0.87, 2.07)" rather than a bare number nobody can question.
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("recent_rtf".into(), serde_json::json!(recent_samples()));
+    }
+    crate::kb_wizard::ok_response(id, "speech.voices", out)
 }
