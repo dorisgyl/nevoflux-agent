@@ -8357,6 +8357,7 @@ async fn handle_chat_message(
                 // Which voices the engine that will actually speak has, plus
                 // which engine that is and why. The settings page builds its
                 // dropdown from this rather than from a list of its own.
+                "speech.reset_rtf" => crate::tts::moss::handle_reset_rtf(&params).await,
                 "speech.voices" => {
                     // Loaded here rather than taken from the process handle:
                     // this dispatch has no access to it, and the answer is a

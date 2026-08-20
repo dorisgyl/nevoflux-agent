@@ -222,6 +222,13 @@ pub struct SpeechConfig {
     /// an idle machine rather than a working one.
     #[serde(default)]
     pub measured_rtf: Option<f32>,
+    /// 最近几次实测,决定值取它们的中位数。
+    ///
+    /// 存一串而不是一个:一次在重负载下的测量(实测见过 2.07x,当时 daemon 正
+    /// 同时在跑转写)不该成为终审。而中位数比最小值稳妥——最小值会让一次偶然
+    /// 的快样本把常年跑不动的机器永久钉在主引擎上,用户每一轮都听卡顿。
+    #[serde(default)]
+    pub recent_rtf: Vec<f32>,
     /// Above this, the multilingual engine is too slow to hold a conversation
     /// on this machine and the fallback takes over.
     ///
@@ -247,6 +254,7 @@ impl Default for SpeechConfig {
     fn default() -> Self {
         SpeechConfig {
             measured_rtf: None,
+            recent_rtf: Vec::new(),
             rtf_budget: default_rtf_budget(),
         }
     }
