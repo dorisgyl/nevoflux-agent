@@ -21,15 +21,40 @@ use std::path::PathBuf;
 /// against 3.36x on an i7-7700K — for output that matches on peak and RMS to
 /// three decimals. int8 stays last so existing installs keep working, and
 /// `model_path` overrides all of it.
-const MODEL_FILES: [&str; 3] = [
-    "kokoro-v1.0.onnx",
-    "kokoro-v1.0.fp32.onnx",
-    "kokoro-v1.0.int8.onnx",
+/// 一个发行版:模型文件的候选,加上与之**配套**的音色。
+///
+/// 成对而不是各自解析,因为两者必须同源:v1.1-zh 的模型配 v1.0 的音色,风格向量
+/// 指向的是另一组说话人 —— 出来的声音不报错,只是不对。这种错听得出来但查不出来。
+struct Release {
+    /// 按优先级排列;取第一个**存在**的。
+    models: &'static [&'static str],
+    /// 音色:v1.0 是一个 zip,v1.1-zh 是一个目录。`VoiceBank` 两种都认。
+    voices: &'static str,
+}
+
+/// v1.1-zh 排在前面:同样 82M、同样一次前向,但**会说中文**。
+///
+/// 它带的英文音色只有 Maple / Sol / Vale(v1.0 那些被上游砍了),所以 v1.0 留在
+/// 后面 —— 装了它的机器行为不变。
+const RELEASES: [Release; 2] = [
+    Release {
+        models: &["kokoro-v1.1-zh.onnx", "kokoro-v1.1-zh.fp32.onnx"],
+        voices: "kokoro-voices-v1.1-zh",
+    },
+    Release {
+        models: &[
+            "kokoro-v1.0.onnx",
+            "kokoro-v1.0.fp32.onnx",
+            "kokoro-v1.0.int8.onnx",
+        ],
+        voices: "kokoro-voices-v1.0.bin",
+    },
 ];
-const VOICES_FILE: &str = "kokoro-voices-v1.0.bin";
+
+const VOICES_FILE: &str = RELEASES[1].voices;
 
 /// A name for the model in errors, when we cannot say which file was meant.
-const MODEL_FILE: &str = MODEL_FILES[0];
+const MODEL_FILE: &str = RELEASES[0].models[0];
 
 /// Config path if given, else the default cache dir.
 fn resolve(configured: Option<&str>, filename: &str) -> Option<PathBuf> {
@@ -39,20 +64,22 @@ fn resolve(configured: Option<&str>, filename: &str) -> Option<PathBuf> {
     default_model_dir().map(|d| d.join(filename))
 }
 
-/// The model to load: config if set, else the best candidate present.
+/// 选一个发行版:**模型与音色都在**的第一个。
 ///
-/// Returns the first *existing* candidate rather than the first name, so a
-/// machine with only the int8 weights still works.
-fn resolve_model(configured: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = configured.filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(expand_home(p)));
+/// 只看模型存不存在是不够的 —— 模型在、配套音色不在,会拿另一个发行版的音色去
+/// 配,而那是一组不同的说话人。宁可退到下一个发行版。
+fn resolve_release(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    for r in &RELEASES {
+        let voices = dir.join(r.voices);
+        if !voices.exists() {
+            continue;
+        }
+        if let Some(model) = r.models.iter().map(|f| dir.join(f)).find(|p| p.exists()) {
+            return (model, voices);
+        }
     }
-    let dir = default_model_dir()?;
-    MODEL_FILES
-        .iter()
-        .map(|f| dir.join(f))
-        .find(|p| p.exists())
-        .or_else(|| Some(dir.join(MODEL_FILE)))
+    // 一个都没装齐:报默认那一对,错误信息里说的就是它。
+    (dir.join(MODEL_FILE), dir.join(RELEASES[0].voices))
 }
 
 /// `~/.cache/nevoflux/models` — where the download instructions point.
@@ -74,6 +101,29 @@ fn expand_home(p: &str) -> String {
         },
         None => p.to_string(),
     }
+}
+
+/// 模型与音色的最终路径。
+///
+/// 配置写死时各自听配置(排障要能单独换其中一个);都没写死时按发行版**成对**取,
+/// 免得 v1.1-zh 的模型配上 v1.0 的音色 —— 那不会报错,只会让声音不是那个人。
+fn paths(cfg: &KokoroConfig) -> Result<(PathBuf, PathBuf), TtsError> {
+    let paired = default_model_dir().map(|d| resolve_release(&d));
+    let model = match cfg.model_path.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => PathBuf::from(expand_home(p)),
+        None => paired
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .ok_or_else(|| missing("model", MODEL_FILE))?,
+    };
+    let voices = match cfg.voices_path.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => PathBuf::from(expand_home(p)),
+        None => paired
+            .as_ref()
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| missing("voice bank", VOICES_FILE))?,
+    };
+    Ok((model, voices))
 }
 
 fn missing(what: &str, filename: &str) -> TtsError {
@@ -103,10 +153,7 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
         )));
     }
 
-    let model_path = resolve(cfg.model_path.as_deref(), MODEL_FILE)
-        .ok_or_else(|| missing("model", MODEL_FILE))?;
-    let voices_path = resolve(cfg.voices_path.as_deref(), VOICES_FILE)
-        .ok_or_else(|| missing("voice bank", VOICES_FILE))?;
+    let (model_path, voices_path) = paths(cfg)?;
     if !model_path.exists() {
         return Err(missing("model", MODEL_FILE));
     }
@@ -131,10 +178,7 @@ fn prepare(cfg: &KokoroConfig, req: &SynthesizeRequest) -> Result<(PathBuf, Path
 pub fn conversation_synthesizer(
     cfg: &KokoroConfig,
 ) -> Result<std::sync::Arc<nevoflux_tts::Synthesizer>, TtsError> {
-    let model_path = resolve(cfg.model_path.as_deref(), MODEL_FILE)
-        .ok_or_else(|| missing("model", MODEL_FILE))?;
-    let voices_path = resolve(cfg.voices_path.as_deref(), VOICES_FILE)
-        .ok_or_else(|| missing("voice bank", VOICES_FILE))?;
+    let (model_path, voices_path) = paths(cfg)?;
     if !model_path.exists() {
         return Err(missing("model", MODEL_FILE));
     }
@@ -189,7 +233,16 @@ fn synthesizer(
         "loading Kokoro; first call pays the model load, later ones do not"
     );
     let built =
-        nevoflux_tts::Synthesizer::new(model_path, voices_path, threads).map_err(map_err)?;
+        // 用探测选出来的那个后端。Kokoro 不自己探:同一台机器同一个运行时,
+        // 两个引擎各得一个结论只会让「到底用没用 GPU」更难回答。探测还没跑过
+        // 时是 CPU —— 那正是这条回落路径的常态(MOSS 缺失或太慢)。
+        nevoflux_tts::Synthesizer::new(
+            model_path,
+            voices_path,
+            threads,
+            crate::tts::backend::chosen_ep(),
+        )
+        .map_err(map_err)?;
     let arc = Arc::new(built);
     // A concurrent first call may have won the race; either Arc is equally
     // usable, so take whichever landed.
@@ -528,6 +581,28 @@ pub fn describe(id: &str) -> nevoflux_protocol::tts::Voice {
 
 #[cfg(test)]
 mod tests {
+    /// 发行版必须成对:模型在、配套音色不在,要退到下一个发行版,而不是
+    /// 拿另一版的音色去配 —— 那不会报错,只会让声音不是那个人。
+    #[test]
+    fn a_release_needs_both_halves_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // 只有 v1.1-zh 的模型,没有它的音色 -> 不该选中它
+        std::fs::write(d.join("kokoro-v1.1-zh.onnx"), b"x").unwrap();
+        std::fs::write(d.join("kokoro-voices-v1.0.bin"), b"x").unwrap();
+        std::fs::write(d.join("kokoro-v1.0.onnx"), b"x").unwrap();
+        let (m, v) = resolve_release(d);
+        assert!(m.ends_with("kokoro-v1.0.onnx"), "{m:?}");
+        assert!(v.ends_with("kokoro-voices-v1.0.bin"), "{v:?}");
+
+        // 两半都齐了 -> v1.1-zh 优先(它会说中文)
+        std::fs::create_dir_all(d.join("kokoro-voices-v1.1-zh")).unwrap();
+        let (m, v) = resolve_release(d);
+        assert!(m.ends_with("kokoro-v1.1-zh.onnx"), "{m:?}");
+        assert!(v.ends_with("kokoro-voices-v1.1-zh"), "{v:?}");
+    }
+
     use super::*;
 
     fn req(text: &str) -> SynthesizeRequest {
@@ -612,16 +687,20 @@ mod tests {
 
     #[test]
     fn configured_model_path_wins_over_every_candidate() {
-        let p = resolve_model(Some("/custom/my-kokoro.onnx")).unwrap();
+        let cfg = KokoroConfig {
+            model_path: Some("/custom/my-kokoro.onnx".into()),
+            ..Default::default()
+        };
+        let (p, _) = paths(&cfg).unwrap();
         assert_eq!(p, PathBuf::from("/custom/my-kokoro.onnx"));
     }
 
     #[test]
     fn unconfigured_model_lands_on_a_known_candidate() {
-        let p = resolve_model(None).unwrap();
+        let (p, _) = paths(&KokoroConfig::default()).unwrap();
         let name = p.file_name().unwrap().to_str().unwrap();
         assert!(
-            MODEL_FILES.contains(&name),
+            RELEASES.iter().any(|r| r.models.contains(&name)),
             "{name} is not one of the candidates"
         );
     }
@@ -630,11 +709,24 @@ mod tests {
     fn fp32_is_preferred_over_int8() {
         // The ordering is the whole point: int8 is slower without VNNI, so a
         // machine holding both weights must not quietly pick the slow one.
-        let fp32 = MODEL_FILES.iter().position(|f| !f.contains("int8"));
-        let int8 = MODEL_FILES.iter().position(|f| f.contains("int8"));
+        for r in &RELEASES {
+            let fp32 = r.models.iter().position(|f| !f.contains("int8"));
+            let int8 = r.models.iter().position(|f| f.contains("int8"));
+            assert!(
+                int8.is_none() || fp32 < int8,
+                "fp32 candidates must come first: {:?}",
+                r.models
+            );
+        }
+    }
+
+    /// 会说中文的那一版排在前面 —— 这正是引进它的理由。
+    #[test]
+    fn the_chinese_capable_release_is_tried_first() {
         assert!(
-            fp32 < int8,
-            "fp32 candidates must come first: {MODEL_FILES:?}"
+            RELEASES[0].models[0].contains("v1.1-zh"),
+            "{:?}",
+            RELEASES[0].models
         );
     }
 
