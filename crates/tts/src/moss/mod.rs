@@ -203,6 +203,24 @@ impl MossEngine {
     ///
     /// The `.onnx` graphs reference their weights through ONNX external data by
     /// filename, so all of it has to sit together and keep upstream's names.
+    /// 这个目录里有没有 MOSS 的全套文件。
+    ///
+    /// 调用方要区分「没装」和「装了但坏了」:前者是常态(MOSS 是可选的几百兆
+    /// 下载),后者是意外。这两件事在用户那里的表现完全一样 —— 都是没用上 MOSS
+    /// —— 所以只能在这里问,不能靠 `load` 的错误文本去猜。
+    pub fn files_present(dir: &Path) -> bool {
+        [
+            F_MANIFEST,
+            F_PREFILL,
+            F_DECODE,
+            F_FRAME,
+            F_CODEC,
+            F_TOKENIZER,
+        ]
+        .iter()
+        .all(|f| dir.join(f).exists())
+    }
+
     pub fn load(dir: &Path, threads: usize, ep: Ep) -> Result<MossEngine, TtsError> {
         let manifest_path = dir.join(F_MANIFEST);
         let bytes = std::fs::read(&manifest_path)
