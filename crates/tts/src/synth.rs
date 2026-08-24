@@ -42,9 +42,10 @@ impl Synthesizer {
         model_path: &Path,
         voices_path: &Path,
         threads: usize,
+        ep: crate::ep::Ep,
     ) -> Result<Synthesizer, TtsError> {
         Ok(Synthesizer {
-            session: Mutex::new(model::load_session(model_path, threads)?),
+            session: Mutex::new(model::load_session(model_path, threads, ep)?),
             voices: VoiceBank::load(voices_path)?,
             g2p: EnglishG2p::new(),
         })
@@ -193,7 +194,7 @@ mod tests {
     fn speaks_english_end_to_end() {
         let (m, v) = real_paths();
         let synth =
-            Synthesizer::new(&m, &v, model::default_threads()).expect("synthesizer should build");
+            Synthesizer::new(&m, &v, model::default_threads(), crate::ep::Ep::Cpu).expect("synthesizer should build");
         let audio = synth
             .synthesize(
                 "Hello from NevoFlux. Local speech works.",
@@ -223,7 +224,7 @@ mod tests {
     fn reading_without_keeping_gives_the_same_parts() {
         let (m, v) = real_paths();
         let synth =
-            Synthesizer::new(&m, &v, model::default_threads()).expect("synthesizer should build");
+            Synthesizer::new(&m, &v, model::default_threads(), crate::ep::Ep::Cpu).expect("synthesizer should build");
         // Long enough to pack into several chunks: the budget works out to
         // roughly 370 characters apiece, so a handful of sentences is one
         // chunk and proves nothing about the seams.
@@ -262,7 +263,7 @@ mod tests {
     #[ignore]
     fn whole_equals_parts_joined() {
         let (m, v) = real_paths();
-        let synth = Synthesizer::new(&m, &v, 1).unwrap();
+        let synth = Synthesizer::new(&m, &v, 1, crate::ep::Ep::Cpu).unwrap();
         let mut parts: Vec<f32> = Vec::new();
         let mut seen: Vec<(usize, usize)> = Vec::new();
         let full = synth
@@ -291,7 +292,7 @@ mod tests {
     #[ignore]
     fn one_sentence_is_one_chunk() {
         let (m, v) = real_paths();
-        let synth = Synthesizer::new(&m, &v, 1).unwrap();
+        let synth = Synthesizer::new(&m, &v, 1, crate::ep::Ep::Cpu).unwrap();
         let mut count = 0;
         synth
             .synthesize_each("Hello.", Some("af_heart"), 1.0, |_, i| {
@@ -306,7 +307,7 @@ mod tests {
     #[ignore]
     fn refuses_chinese_voices() {
         let (m, v) = real_paths();
-        let synth = Synthesizer::new(&m, &v, 1).unwrap();
+        let synth = Synthesizer::new(&m, &v, 1, crate::ep::Ep::Cpu).unwrap();
         let err = synth
             .synthesize("你好", Some("zf_xiaoxiao"), 1.0)
             .unwrap_err();

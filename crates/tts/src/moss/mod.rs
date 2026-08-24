@@ -42,6 +42,7 @@ use std::sync::Mutex;
 use ort::session::Session;
 use ort::value::Value;
 
+use crate::ep::Ep;
 use crate::error::TtsError;
 use crate::model::load_session;
 pub use manifest::{BuiltinVoice, Manifest};
@@ -202,7 +203,7 @@ impl MossEngine {
     ///
     /// The `.onnx` graphs reference their weights through ONNX external data by
     /// filename, so all of it has to sit together and keep upstream's names.
-    pub fn load(dir: &Path, threads: usize) -> Result<MossEngine, TtsError> {
+    pub fn load(dir: &Path, threads: usize, ep: Ep) -> Result<MossEngine, TtsError> {
         let manifest_path = dir.join(F_MANIFEST);
         let bytes = std::fs::read(&manifest_path)
             .map_err(|e| TtsError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
@@ -216,10 +217,10 @@ impl MossEngine {
         Ok(MossEngine {
             manifest,
             tokenizer,
-            prefill: Mutex::new(load_session(&dir.join(F_PREFILL), threads)?),
-            decode: Mutex::new(load_session(&dir.join(F_DECODE), threads)?),
-            frame: Mutex::new(load_session(&dir.join(F_FRAME), threads)?),
-            codec: Mutex::new(load_session(&dir.join(F_CODEC), threads)?),
+            prefill: Mutex::new(load_session(&dir.join(F_PREFILL), threads, ep)?),
+            decode: Mutex::new(load_session(&dir.join(F_DECODE), threads, ep)?),
+            frame: Mutex::new(load_session(&dir.join(F_FRAME), threads, ep)?),
+            codec: Mutex::new(load_session(&dir.join(F_CODEC), threads, ep)?),
         })
     }
 
@@ -592,7 +593,8 @@ mod real {
             .get_or_init(|| {
                 let dir = crate::model::default_model_dir().expect("a cache directory");
                 std::sync::Mutex::new(
-                    MossEngine::load(&dir, crate::model::default_threads()).expect("MOSS loads"),
+                    MossEngine::load(&dir, crate::model::default_threads(), Ep::Cpu)
+                        .expect("MOSS loads"),
                 )
             })
             .lock()

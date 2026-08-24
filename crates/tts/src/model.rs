@@ -1,6 +1,8 @@
 //! ONNX session construction and model path resolution.
 
+use crate::ep::Ep;
 use crate::error::TtsError;
+use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -144,7 +146,10 @@ fn prepare_dylib() -> Result<(), TtsError> {
 /// curve past it slopes back down — measured on a 4-core/8-thread i7-7700K
 /// with the fp32 model: 1.45x realtime at one thread, 3.36x at four, then
 /// 2.66x at five. Hyperthreads are contention here, not capacity.
-pub fn load_session(path: &Path, threads: usize) -> Result<Session, TtsError> {
+/// `ep` is the execution provider to run on. Which one is *worth* running on is
+/// not decided here — see [`crate::ep`]; this function only attaches the one it
+/// is handed, and fails loudly when it cannot.
+pub fn load_session(path: &Path, threads: usize, ep: Ep) -> Result<Session, TtsError> {
     if !path.exists() {
         return Err(TtsError::ModelNotFound(path.display().to_string()));
     }
@@ -156,12 +161,56 @@ pub fn load_session(path: &Path, threads: usize) -> Result<Session, TtsError> {
     let builder = builder
         .with_intra_threads(threads.max(1))
         .map_err(|e| corrupt(e.to_string()))?;
-    let mut builder = builder
+    let builder = builder
         .with_inter_threads(1)
         .map_err(|e| corrupt(e.to_string()))?;
+    let mut builder = attach(builder, ep)?;
     builder
         .commit_from_file(path)
         .map_err(|e| corrupt(e.to_string()))
+}
+
+/// Attach an execution provider, or say why it could not be attached.
+///
+/// `error_on_failure` is the whole point. ort's default is to skip a provider
+/// that will not register and fall through to CPU **silently** — which is how
+/// you end up believing a machine has GPU acceleration while it quietly runs on
+/// four Ivy Bridge cores. The probe in [`crate::ep`] needs the failure, not the
+/// fallback: "no GPU here" and "GPU is here but slower" call for different fixes.
+fn attach(builder: SessionBuilder, ep: Ep) -> Result<SessionBuilder, TtsError> {
+    let refused = |e: String| TtsError::ModelCorrupt(format!("{ep}: {e}"));
+    match ep {
+        // The default provider. Nothing to attach; every build has it.
+        Ep::Cpu => Ok(builder),
+        #[cfg(feature = "ort-cuda")]
+        Ep::Cuda => builder
+            .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+            .map_err(|e| refused(e.to_string())),
+        // `DeviceFilter::Any` 而不是默认的 `Gpu`。
+        //
+        // 默认那个筛的是 DXCore 里的**图形**适配器,而计算卡不是图形适配器 ——
+        // 实测一张 Tesla T4:ORT 自己的设备枚举把它报成 `vendor=NVIDIA
+        // gpu=true ep=DmlExecutionProvider`,DML 的工厂却回 "No devices detected
+        // that match the filter criteria"。用 `Gpu` 等于把整类推理卡排除在外。
+        //
+        // 放宽到 `Any` 会把 NPU 和 WARP 这类软件适配器也放进来,而那些可能比
+        // CPU 还慢 —— 但这里不需要担心:选谁由实测决定(`crate::ep`),慢的会
+        // 在裁判那一层输给 CPU。宁可多量一个,不要少看一张卡。
+        #[cfg(feature = "ort-directml")]
+        Ep::DirectMl => builder
+            .with_execution_providers([ort::ep::DirectML::default()
+                .with_device_filter(ort::ep::directml::DeviceFilter::Any)
+                .build()
+                .error_on_failure()])
+            .map_err(|e| refused(e.to_string())),
+        // Built without it. This is a real answer, not an omission: a build that
+        // cannot attach CUDA should say so rather than run on CPU and let the
+        // measurement take the blame.
+        #[cfg(not(feature = "ort-cuda"))]
+        Ep::Cuda => Err(refused("built without the ort-cuda feature".into())),
+        #[cfg(not(feature = "ort-directml"))]
+        Ep::DirectMl => Err(refused("built without the ort-directml feature".into())),
+    }
 }
 
 /// Intra-op width to use when config does not say.
@@ -192,7 +241,7 @@ mod tests {
 
     #[test]
     fn missing_model_reports_not_found() {
-        let err = load_session(Path::new("/nonexistent/kokoro.onnx"), 1).unwrap_err();
+        let err = load_session(Path::new("/nonexistent/kokoro.onnx"), 1, Ep::Cpu).unwrap_err();
         assert!(matches!(err, TtsError::ModelNotFound(_)), "got: {err}");
     }
 
@@ -200,7 +249,7 @@ mod tests {
     fn corrupt_model_reports_corrupt() {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), b"not an onnx file").unwrap();
-        let err = load_session(f.path(), 1).unwrap_err();
+        let err = load_session(f.path(), 1, Ep::Cpu).unwrap_err();
         assert!(matches!(err, TtsError::ModelCorrupt(_)), "got: {err}");
     }
 
@@ -249,7 +298,7 @@ mod tests {
     #[ignore]
     fn real_model_has_expected_signature() {
         let path = default_model_dir().unwrap().join("kokoro-v1.0.int8.onnx");
-        let session = load_session(&path, 1).expect("model should load");
+        let session = load_session(&path, 1, Ep::Cpu).expect("model should load");
         let inputs: Vec<_> = session
             .inputs()
             .iter()

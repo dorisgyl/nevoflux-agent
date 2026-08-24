@@ -16,6 +16,12 @@ default = []
 # the default there.
 ort-download-binaries = ["ort/download-binaries"]
 ort-load-dynamic = ["ort/load-dynamic"]
+# GPU execution providers. Enabling them costs nothing at link time under
+# `load-dynamic` -- they only add the API calls that attach a provider, and a
+# runtime that does not carry that provider simply refuses, which is exactly
+# the signal `crate::ep` selects on.
+ort-cuda = ["ort/cuda"]
+ort-directml = ["ort/directml"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "api-24"] }

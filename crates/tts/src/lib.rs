@@ -3,6 +3,7 @@
 //! The crate's whole public surface is [`Synthesizer::synthesize`]. It knows
 //! nothing about base64, artifacts, or MCP — those belong to the daemon.
 
+pub mod ep;
 pub mod error;
 pub mod g2p;
 pub mod model;

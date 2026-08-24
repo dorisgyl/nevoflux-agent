@@ -229,6 +229,16 @@ pub struct SpeechConfig {
     /// 的快样本把常年跑不动的机器永久钉在主引擎上,用户每一轮都听卡顿。
     #[serde(default)]
     pub recent_rtf: Vec<f32>,
+    /// 在哪个推理后端上合成:`auto`(默认)、`cpu`、`directml`、`cuda`。
+    ///
+    /// `auto` 的意思是**量出来**,不是猜:第一次要说话时,依次试运行时报告的
+    /// 那些设备,建不出 session 的淘汰,建得出的各跑一句量 RTF,最快的赢
+    /// (`nevoflux_tts::ep`)。CPU 永远在候选里,所以「GPU 反而更慢」会自动
+    /// 出局 —— 虚拟机里那块只报 DX12 却没算力的显示适配器就是这么被挡掉的。
+    ///
+    /// 写死一个值只为排障:把「自动选错了」和「这个后端本身有问题」分开。
+    #[serde(default)]
+    pub execution_provider: Option<String>,
     /// Above this, the multilingual engine is too slow to hold a conversation
     /// on this machine and the fallback takes over.
     ///
@@ -255,6 +265,7 @@ impl Default for SpeechConfig {
         SpeechConfig {
             measured_rtf: None,
             recent_rtf: Vec::new(),
+            execution_provider: None,
             rtf_budget: default_rtf_budget(),
         }
     }

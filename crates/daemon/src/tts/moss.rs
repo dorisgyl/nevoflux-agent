@@ -243,7 +243,11 @@ mod local {
     /// reply. `OnceLock<Result>` rather than retrying — a missing file will
     /// still be missing on the next sentence, and retrying turns one clear
     /// failure into one per sentence.
-    pub fn engine(cfg: &MossConfig) -> Result<Arc<MossEngine>, TtsError> {
+    pub fn engine(
+        cfg: &MossConfig,
+        setting: crate::tts::backend::Setting,
+        budget: f32,
+    ) -> Result<Arc<MossEngine>, TtsError> {
         static ENGINE: OnceLock<Result<Arc<MossEngine>, String>> = OnceLock::new();
         ENGINE
             .get_or_init(|| {
@@ -251,17 +255,29 @@ mod local {
                 let threads = cfg
                     .threads
                     .unwrap_or_else(nevoflux_tts::model::default_threads);
-                match MossEngine::load(&dir, threads) {
+                // 探测就发生在这里 —— 第一次真的要说话的那一刻,而不是 daemon
+                // 启动时:启动不该为一个多数会话用不到的功能付几秒。
+                let probed = crate::tts::backend::probe(&dir, threads, setting, budget);
+                crate::tts::backend::record(&probed.selection);
+                // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
+                // 而后者建出来的会带着真正的错误失败。
+                let loaded = match probed.engine {
+                    Some(e) => Ok(e),
+                    None => MossEngine::load(&dir, threads, probed.selection.ep)
+                        .map_err(|e| e.to_string()),
+                };
+                match loaded {
                     Ok(e) => {
                         tracing::info!(
                             target: "speech",
                             voices = e.voices().len(),
                             dir = %dir.display(),
+                            backend = %probed.selection.summary(),
                             "MOSS loaded"
                         );
                         Ok(Arc::new(e))
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 }
             })
             .clone()
@@ -299,7 +315,11 @@ pub fn conversation_voice(
         }
     }
 
-    match engine(&cfg.tts.moss) {
+    match engine(
+        &cfg.tts.moss,
+        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        budget,
+    ) {
         Ok(e) => Ok((
             e as Arc<dyn crate::speech::voice_out::SpeechSynth>,
             Choice::primary(),
@@ -539,7 +559,7 @@ pub fn voice_catalog(cfg: &AgentConfig) -> serde_json::Value {
     };
 
     let voices: Vec<serde_json::Value> = if engine == "moss" {
-        engine_voices(&cfg.tts.moss)
+        engine_voices(cfg)
     } else if engine == "kokoro" {
         kokoro_voices(cfg)
     } else {
@@ -556,8 +576,14 @@ pub fn voice_catalog(cfg: &AgentConfig) -> serde_json::Value {
 }
 
 #[cfg(feature = "tts-local")]
-fn engine_voices(cfg: &MossConfig) -> Vec<serde_json::Value> {
-    match engine(cfg) {
+fn engine_voices(cfg: &AgentConfig) -> Vec<serde_json::Value> {
+    // 走到这里时 `conversation_voice` 已经把引擎建好了(见 `voice_catalog`),
+    // 所以这不会额外触发一次探测。
+    match engine(
+        &cfg.tts.moss,
+        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        cfg.speech.rtf_budget,
+    ) {
         Ok(e) => e
             .voices()
             .iter()
