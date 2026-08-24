@@ -2753,6 +2753,37 @@ pub async fn start_server(
                     .set_voice_mode(&session_id, on)
                     .await;
                 debug!("voice mode {} for session {}", on, session_id);
+
+                // 有人开始听 —— 先把引擎加载起来。
+                //
+                // 引擎是几百兆权重、几秒钟加载,而它原本发生在**第一句回答要出声
+                // 的那一刻**,于是第一句话前面永远挂着几秒静默。侧栏挂上听众到
+                // 用户发第一条消息之间有的是时间,那几秒白白浪费了。
+                //
+                // 在后台做,不等:预热失败也只是回到原来的行为(第一句时再加载并
+                // 如常报错),绝不能让它挡住这条控制消息。
+                #[cfg(feature = "tts-local")]
+                if on {
+                    let cfg = process_config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let cfg = match cfg.read() {
+                            Ok(c) => c.clone(),
+                            Err(_) => return,
+                        };
+                        match crate::tts::moss::conversation_voice(&cfg) {
+                            Ok((_, choice)) => tracing::info!(
+                                target: "speech",
+                                engine = choice.engine,
+                                "voice engine warmed on listener attach"
+                            ),
+                            Err(e) => tracing::debug!(
+                                target: "speech",
+                                error = %e,
+                                "warm-up found no synthesizer; the first reply will report it"
+                            ),
+                        }
+                    });
+                }
                 continue;
             }
 
