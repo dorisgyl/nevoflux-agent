@@ -15,6 +15,7 @@ pub mod synth;
 pub mod vocab;
 pub mod voices;
 pub mod wav;
+pub mod zh;
 
 pub use error::TtsError;
 pub use synth::{Audio, ChunkInfo, Synthesizer};

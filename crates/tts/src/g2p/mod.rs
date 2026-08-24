@@ -3,6 +3,7 @@
 //! The trait is the seam Chinese support will slot into: a second impl plus
 //! a prefix-based route, with nothing outside this module changing.
 
+pub mod chinese;
 pub mod english;
 
 use crate::error::TtsError;
@@ -11,7 +12,13 @@ use crate::error::TtsError;
 pub const DEFAULT_VOICE: &str = "af_heart";
 
 /// Voice prefixes this build can actually pronounce.
-const SPEAKABLE_PREFIXES: [&str; 4] = ["af", "am", "bf", "bm"];
+/// Voice prefixes this build has a grapheme-to-phoneme stage for.
+///
+/// `zf`/`zm` joined the list when the Chinese G2P landed (`crate::zh`). The list
+/// is the honest statement of what can be spoken: a voice whose language has no
+/// G2P produces phonemes the model has never seen, which comes out as noise
+/// rather than as an error -- so the check happens here, before anything runs.
+const SPEAKABLE_PREFIXES: [&str; 6] = ["af", "am", "bf", "bm", "zf", "zm"];
 
 pub trait G2p: Send + Sync {
     /// Phonemes for one sentence, in Kokoro's symbol set.
@@ -93,17 +100,21 @@ mod tests {
     }
 
     #[test]
-    fn chinese_voices_are_refused_with_a_reason() {
-        // Speaking Chinese through the English G2P produces gibberish, which
-        // is worse than an error the model can act on.
-        let avail = ["af_heart", "zf_xiaoxiao"];
-        let err = resolve_voice(Some("zf_xiaoxiao"), &avail).unwrap_err();
+    fn chinese_voices_are_speakable_now() {
+        // 中文 G2P 落地之前,zf/zm 是被拒的 —— 用英文 G2P 念中文出来的是噪音,
+        // 而噪音比一个明确的错误更糟。现在有了 `crate::zh`,这道门要放行。
+        let avail = ["af_heart", "zf_001"];
+        assert_eq!(resolve_voice(Some("zf_001"), &avail).unwrap(), "zf_001");
+    }
+
+    /// 没有 G2P 的语言仍然要被挡住,并且说清楚是哪一种语言。
+    #[test]
+    fn a_language_without_a_g2p_is_still_refused_with_a_reason() {
+        let avail = ["af_heart", "jf_alpha"];
+        let err = resolve_voice(Some("jf_alpha"), &avail).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, TtsError::UnsupportedVoice(_)), "got: {msg}");
-        assert!(
-            msg.contains("Chinese"),
-            "error should name the reason: {msg}"
-        );
+        assert!(msg.contains("Japanese"), "要点名是哪种语言:{msg}");
     }
 
     #[test]
