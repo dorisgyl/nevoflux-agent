@@ -5,6 +5,7 @@
 //! simply a position. Reordering any of the four groups silently changes
 //! every id after it, which is why the golden-vector test exists.
 
+use crate::error::TtsError;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -30,12 +31,80 @@ fn table() -> &'static HashMap<char, i64> {
 /// Characters absent from the table are dropped rather than substituted:
 /// a wrong phoneme is audible, a missing one usually is not.
 pub fn tokenize(phonemes: &str) -> Vec<i64> {
-    let t = table();
+    tokenize_with(table(), phonemes)
+}
+
+fn tokenize_with(t: &HashMap<char, i64>, phonemes: &str) -> Vec<i64> {
     let mut out = Vec::with_capacity(phonemes.chars().count() + 2);
     out.push(0); // '$'
     out.extend(phonemes.chars().filter_map(|c| t.get(&c).copied()));
     out.push(0);
     out
+}
+
+/// 一个发行版的音素表。
+///
+/// **必须与模型配套**,而且配不上是**静默**的:v1.1-zh 的词表把字母重新编了号,
+/// 用 v1.0 的表去编码,注音符号全部落空、字母全部错位 —— 出来的不是报错,是一段
+/// 半秒钟的杂音。实测就是这么发现的:39 个字和 7 个字都只合成出 0.5 秒。
+pub struct Vocab {
+    table: HashMap<char, i64>,
+}
+
+impl Vocab {
+    /// 内置的 v1.0 英文表。
+    pub fn builtin() -> Vocab {
+        Vocab {
+            table: table().clone(),
+        }
+    }
+
+    /// 从模型自带的 `tokenizer.json` 读。
+    ///
+    /// 让模型带着自己的词表,比在代码里为每个发行版维护一张表可靠 —— 后者迟早
+    /// 会漏掉一个新发行版,而漏掉的表现是杂音,不是编译错误。
+    pub fn from_tokenizer_json(path: &std::path::Path) -> Result<Vocab, TtsError> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| TtsError::ModelCorrupt(format!("{}: {e}", path.display())))?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| TtsError::ModelCorrupt(format!("{}: {e}", path.display())))?;
+        let map = parsed
+            .get("model")
+            .and_then(|m| m.get("vocab"))
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                TtsError::ModelCorrupt(format!("{}: 没有 model.vocab", path.display()))
+            })?;
+        let mut table = HashMap::with_capacity(map.len());
+        for (k, v) in map {
+            let mut chars = k.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                continue; // 多字符条目不是音素
+            };
+            if let Some(id) = v.as_i64() {
+                table.insert(c, id);
+            }
+        }
+        if table.is_empty() {
+            return Err(TtsError::ModelCorrupt(format!(
+                "{}: 词表里一个单字符音素都没有",
+                path.display()
+            )));
+        }
+        Ok(Vocab { table })
+    }
+
+    pub fn tokenize(&self, phonemes: &str) -> Vec<i64> {
+        tokenize_with(&self.table, phonemes)
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
 }
 
 #[cfg(test)]

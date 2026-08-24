@@ -1,22 +1,34 @@
 //! Choosing a voice engine, and living with the one that is available.
 //!
-//! Two engines, and they are not interchangeable: MOSS speaks twenty languages
-//! and Kokoro speaks English. For a Chinese-speaking user "fall back to Kokoro"
-//! does not mean a worse voice, it means no voice — so which one is running,
-//! and why, is something the user has to be able to find out. Every path
-//! through here produces a [`Choice`] carrying its reason.
+//! Two engines, and they are not interchangeable: MOSS speaks twenty languages,
+//! Kokoro speaks what its release carries — v1.0 English only, v1.1-zh Chinese
+//! and English. Which one is running, and why, is something the user has to be
+//! able to find out, so every path here produces a [`Choice`].
 //!
 //! ## When the fallback takes over
 //!
 //! Exactly two conditions, both measured rather than assumed:
 //!
-//! 1. MOSS is not installed, or its files fail to load.
+//! 1. MOSS is installed but its files fail to load.
 //! 2. MOSS is too slow **on this machine** — the measured real-time factor is
 //!    over the budget.
 //!
 //! Never by language. MOSS handles Chinese and English both, and routing by
-//! language would send English through a second engine for no reason while
-//! leaving Chinese with nothing when MOSS is absent.
+//! language would send English through a second engine for no reason.
+//!
+//! ## A fallback is not the same as a configuration
+//!
+//! MOSS is an optional several-hundred-megabyte download, so on most machines
+//! it is simply absent — and being absent is not a failure to report. The
+//! reason attached to a [`Choice`] rides out with every reply, so it has to
+//! mean "something went wrong", not "this is how you set it up". Otherwise
+//! someone who never installed MOSS is told, once per sentence, about an
+//! engine they never asked for.
+//!
+//! What this used to cost: with the Chinese-capable Kokoro release in place,
+//! falling back stopped being the disaster it was written for — a Chinese
+//! speaker now gets a voice either way — while the warning text stayed as
+//! loud as when it meant silence.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -42,10 +54,29 @@ impl Choice {
         }
     }
 
+    /// 退而求其次,并说明为什么。
+    ///
+    /// `reason` 会一路报到界面上,所以它只该在**本来想用 MOSS 却用不上**时出现
+    /// —— 那是用户需要知道的意外。
     fn fallback(reason: impl Into<String>) -> Choice {
         Choice {
             engine: "kokoro",
             reason: Some(reason.into()),
+        }
+    }
+
+    /// 这台机器上本来就是这么配的:MOSS 没装,或者被关掉了。
+    ///
+    /// 与 [`Self::fallback`] 的区别是**没有 reason**。区别不是措辞洁癖:
+    /// `reason` 每一轮都会随 `voice_done` 报给界面,而 MOSS 是一个 684 MB 的
+    /// 可选下载 —— 对从没装过它的人,每说一句话都告诉他「已改用 Kokoro,因为
+    /// MOSS 不可用」,是在报告一件他从没要求过的事。
+    ///
+    /// 意外要吵,常态要静。
+    fn configured() -> Choice {
+        Choice {
+            engine: "kokoro",
+            reason: None,
         }
     }
 }
@@ -228,7 +259,7 @@ mod local {
     use super::*;
     use nevoflux_tts::moss::MossEngine;
 
-    fn model_dir(cfg: &MossConfig) -> std::path::PathBuf {
+    pub(super) fn model_dir(cfg: &MossConfig) -> std::path::PathBuf {
         cfg.model_dir
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -243,7 +274,11 @@ mod local {
     /// reply. `OnceLock<Result>` rather than retrying — a missing file will
     /// still be missing on the next sentence, and retrying turns one clear
     /// failure into one per sentence.
-    pub fn engine(cfg: &MossConfig) -> Result<Arc<MossEngine>, TtsError> {
+    pub fn engine(
+        cfg: &MossConfig,
+        setting: crate::tts::backend::Setting,
+        budget: f32,
+    ) -> Result<Arc<MossEngine>, TtsError> {
         static ENGINE: OnceLock<Result<Arc<MossEngine>, String>> = OnceLock::new();
         ENGINE
             .get_or_init(|| {
@@ -251,17 +286,29 @@ mod local {
                 let threads = cfg
                     .threads
                     .unwrap_or_else(nevoflux_tts::model::default_threads);
-                match MossEngine::load(&dir, threads) {
+                // 探测就发生在这里 —— 第一次真的要说话的那一刻,而不是 daemon
+                // 启动时:启动不该为一个多数会话用不到的功能付几秒。
+                let probed = crate::tts::backend::probe(&dir, threads, setting, budget);
+                crate::tts::backend::record(&probed.selection);
+                // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
+                // 而后者建出来的会带着真正的错误失败。
+                let loaded = match probed.engine {
+                    Some(e) => Ok(e),
+                    None => MossEngine::load(&dir, threads, probed.selection.ep)
+                        .map_err(|e| e.to_string()),
+                };
+                match loaded {
                     Ok(e) => {
                         tracing::info!(
                             target: "speech",
                             voices = e.voices().len(),
                             dir = %dir.display(),
+                            backend = %probed.selection.summary(),
                             "MOSS loaded"
                         );
                         Ok(Arc::new(e))
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e),
                 }
             })
             .clone()
@@ -280,8 +327,9 @@ pub fn conversation_voice(
     let kokoro = || crate::tts::kokoro::conversation_synthesizer(&cfg.tts.kokoro);
 
     if cfg.tts.moss.enabled == Some(false) {
+        // 关掉是一个决定,不是一次失败。
         let k = kokoro()?;
-        return Ok((k, Choice::fallback("MOSS is switched off in config.toml")));
+        return Ok((k, Choice::configured()));
     }
 
     // Slow beats absent: check the measurement first, so a machine that cannot
@@ -299,7 +347,11 @@ pub fn conversation_voice(
         }
     }
 
-    match engine(&cfg.tts.moss) {
+    match engine(
+        &cfg.tts.moss,
+        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        budget,
+    ) {
         Ok(e) => Ok((
             e as Arc<dyn crate::speech::voice_out::SpeechSynth>,
             Choice::primary(),
@@ -307,8 +359,15 @@ pub fn conversation_voice(
         Err(e) => {
             // Name what failed. "Falling back" with no reason is how a
             // 717 MB download nobody notices is missing gets shipped.
+            //
+            // 但「没下载过」不算失败:MOSS 是可选的 684 MB,多数机器上它本来就
+            // 不在。那是常态,报出来只会变成每一句话后面的一行噪音。真正要吵的
+            // 是「装了却用不了」—— 权重损坏、版本对不上,那种才是意外。
             let why = format!("MOSS is unavailable: {e}");
+            let installed =
+                nevoflux_tts::moss::MossEngine::files_present(&local::model_dir(&cfg.tts.moss));
             match kokoro() {
+                Ok(k) if !installed => Ok((k, Choice::configured())),
                 Ok(k) => Ok((k, Choice::fallback(why))),
                 Err(k_err) => Err(TtsError::ConfigMissing(format!(
                     "no speech engine available. {why}. Kokoro: {k_err}"
@@ -329,6 +388,21 @@ pub fn conversation_voice(
 
 #[cfg(test)]
 mod tests {
+    /// 常态要静,意外要吵。
+    ///
+    /// `reason` 每一轮都随 `voice_done` 报到界面上,所以「MOSS 没装」不能带
+    /// reason —— 那是绝大多数机器的常态,而不是一次失败。带上它的后果是:从没
+    /// 装过 MOSS 的人,每说一句话都被告知一次他从没要求过的引擎不可用。
+    #[test]
+    fn a_configuration_is_not_a_fallback() {
+        assert_eq!(Choice::configured().reason, None, "常态不该带原因");
+        assert_eq!(Choice::configured().engine, "kokoro");
+
+        // 而真正的意外要说清楚是什么意外。
+        let f = Choice::fallback("MOSS runs at 1.17x real time");
+        assert!(f.reason.is_some_and(|r| r.contains("1.17x")));
+    }
+
     use super::*;
 
     /// These tests share one process-level measurement, so they cannot run at
@@ -539,7 +613,7 @@ pub fn voice_catalog(cfg: &AgentConfig) -> serde_json::Value {
     };
 
     let voices: Vec<serde_json::Value> = if engine == "moss" {
-        engine_voices(&cfg.tts.moss)
+        engine_voices(cfg)
     } else if engine == "kokoro" {
         kokoro_voices(cfg)
     } else {
@@ -556,8 +630,14 @@ pub fn voice_catalog(cfg: &AgentConfig) -> serde_json::Value {
 }
 
 #[cfg(feature = "tts-local")]
-fn engine_voices(cfg: &MossConfig) -> Vec<serde_json::Value> {
-    match engine(cfg) {
+fn engine_voices(cfg: &AgentConfig) -> Vec<serde_json::Value> {
+    // 走到这里时 `conversation_voice` 已经把引擎建好了(见 `voice_catalog`),
+    // 所以这不会额外触发一次探测。
+    match engine(
+        &cfg.tts.moss,
+        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        cfg.speech.rtf_budget,
+    ) {
         Ok(e) => e
             .voices()
             .iter()

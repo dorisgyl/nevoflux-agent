@@ -18,10 +18,71 @@ pub struct VoiceBank {
 }
 
 impl VoiceBank {
+    /// Load a bank from either layout.
+    ///
+    /// v1.0 ships one zip of `.npy`; v1.1-zh ships a directory of raw `.bin`,
+    /// one file per voice, no header. Dispatching on what is actually there
+    /// beats making every caller know which release it is holding.
     pub fn load(path: &Path) -> Result<VoiceBank, TtsError> {
         if !path.exists() {
             return Err(TtsError::ModelNotFound(path.display().to_string()));
         }
+        if path.is_dir() {
+            return Self::load_dir(path);
+        }
+        Self::load_zip(path)
+    }
+
+    /// A directory of raw `<voice>.bin`, each `(510, 1, 256)` little-endian f32.
+    ///
+    /// No header to check, so the length is the only guard: a file that is not
+    /// an exact multiple of the row size is a truncated download, not something
+    /// to read as far as it goes. Reading a truncated bank produces a voice that
+    /// works for short sentences and fails for long ones -- the worst shape a
+    /// bug can have here.
+    pub fn load_dir(dir: &Path) -> Result<VoiceBank, TtsError> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| TtsError::ModelNotFound(format!("{}: {e}", dir.display())))?;
+        let mut voices = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".bin"))
+            else {
+                continue;
+            };
+            let bytes = std::fs::read(&path)
+                .map_err(|e| TtsError::ModelCorrupt(format!("{}: {e}", path.display())))?;
+            let row_bytes = STYLE_DIM * 4;
+            if bytes.is_empty() || bytes.len() % row_bytes != 0 {
+                return Err(TtsError::ModelCorrupt(format!(
+                    "{}: {} bytes is not a whole number of {STYLE_DIM}-float rows",
+                    path.display(),
+                    bytes.len()
+                )));
+            }
+            let rows = bytes
+                .chunks_exact(row_bytes)
+                .map(|row| {
+                    row.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect()
+                })
+                .collect();
+            voices.insert(id.to_string(), rows);
+        }
+        if voices.is_empty() {
+            return Err(TtsError::ModelCorrupt(format!(
+                "{}: no .bin voices in this directory",
+                dir.display()
+            )));
+        }
+        Ok(VoiceBank { voices })
+    }
+
+    fn load_zip(path: &Path) -> Result<VoiceBank, TtsError> {
         let file = std::fs::File::open(path)
             .map_err(|e| TtsError::ModelNotFound(format!("{}: {e}", path.display())))?;
         let mut zip = zip::ZipArchive::new(file)
@@ -115,6 +176,46 @@ fn parse_npy(bytes: &[u8], name: &str) -> Result<Vec<Vec<f32>>, TtsError> {
 
 #[cfg(test)]
 mod tests {
+    /// v1.1-zh 的音色是一目录裸 f32,没有头,所以长度是唯一的守卫。
+    #[test]
+    fn a_directory_of_raw_voices_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = 3usize;
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            for c in 0..super::STYLE_DIM {
+                bytes.extend_from_slice(&((r * 1000 + c) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(dir.path().join("zf_001.bin"), &bytes).unwrap();
+        std::fs::write(dir.path().join("readme.txt"), b"ignored").unwrap();
+
+        let bank = VoiceBank::load(dir.path()).unwrap();
+        assert_eq!(bank.ids(), vec!["zf_001"]);
+        let style = bank.style("zf_001", 2).unwrap();
+        assert_eq!(style.len(), super::STYLE_DIM);
+        assert_eq!(style[0], 2000.0, "取的应该是第 2 行");
+    }
+
+    /// 截断的下载要当场报错。读一半的音色在短句上能用、长句上崩 ——
+    /// 这是排查起来最费劲的一种形状。
+    #[test]
+    fn a_truncated_voice_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zf_001.bin"), vec![0u8; 999]).unwrap();
+        // `unwrap_err` 要求 VoiceBank: Debug,而它没必要为了测试实现 Debug。
+        let Err(err) = VoiceBank::load(dir.path()) else {
+            panic!("截断的音色文件应当被拒绝");
+        };
+        assert!(format!("{err}").contains("rows"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_directory_is_an_error_not_an_empty_bank() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(VoiceBank::load(dir.path()), Err(_)));
+    }
+
     use super::*;
     use std::path::PathBuf;
 

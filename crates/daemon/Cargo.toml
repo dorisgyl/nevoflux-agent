@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Core daemon for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "tts-gpu", "asr-sensevoice", "asr-whisper"]
 # Peer-to-peer transport for remote sessions. Off by default: str0m pulls around
 # a hundred crates, and until a session can reach the peer path that cost buys
 # nothing. `remote::rtc` compiles either way and falls back to the relay.
@@ -53,6 +53,12 @@ ort-load-dynamic = [
     "nevoflux-tts?/ort-load-dynamic",
     "nevoflux-asr/ort-load-dynamic",
 ]
+# GPU execution providers for speech. On by default and costing nothing when
+# absent: under `load-dynamic` these only add the API calls that attach a
+# provider, and a runtime built without that provider refuses to attach it --
+# which is the signal the probe in `nevoflux_tts::ep` selects on. A machine with
+# no usable GPU measures CPU as the winner and nothing changes.
+tts-gpu = ["nevoflux-tts?/ort-cuda", "nevoflux-tts?/ort-directml"]
 
 [dependencies]
 # Internal crates

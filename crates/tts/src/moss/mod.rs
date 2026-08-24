@@ -42,6 +42,7 @@ use std::sync::Mutex;
 use ort::session::Session;
 use ort::value::Value;
 
+use crate::ep::Ep;
 use crate::error::TtsError;
 use crate::model::load_session;
 pub use manifest::{BuiltinVoice, Manifest};
@@ -202,7 +203,25 @@ impl MossEngine {
     ///
     /// The `.onnx` graphs reference their weights through ONNX external data by
     /// filename, so all of it has to sit together and keep upstream's names.
-    pub fn load(dir: &Path, threads: usize) -> Result<MossEngine, TtsError> {
+    /// 这个目录里有没有 MOSS 的全套文件。
+    ///
+    /// 调用方要区分「没装」和「装了但坏了」:前者是常态(MOSS 是可选的几百兆
+    /// 下载),后者是意外。这两件事在用户那里的表现完全一样 —— 都是没用上 MOSS
+    /// —— 所以只能在这里问,不能靠 `load` 的错误文本去猜。
+    pub fn files_present(dir: &Path) -> bool {
+        [
+            F_MANIFEST,
+            F_PREFILL,
+            F_DECODE,
+            F_FRAME,
+            F_CODEC,
+            F_TOKENIZER,
+        ]
+        .iter()
+        .all(|f| dir.join(f).exists())
+    }
+
+    pub fn load(dir: &Path, threads: usize, ep: Ep) -> Result<MossEngine, TtsError> {
         let manifest_path = dir.join(F_MANIFEST);
         let bytes = std::fs::read(&manifest_path)
             .map_err(|e| TtsError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
@@ -216,10 +235,10 @@ impl MossEngine {
         Ok(MossEngine {
             manifest,
             tokenizer,
-            prefill: Mutex::new(load_session(&dir.join(F_PREFILL), threads)?),
-            decode: Mutex::new(load_session(&dir.join(F_DECODE), threads)?),
-            frame: Mutex::new(load_session(&dir.join(F_FRAME), threads)?),
-            codec: Mutex::new(load_session(&dir.join(F_CODEC), threads)?),
+            prefill: Mutex::new(load_session(&dir.join(F_PREFILL), threads, ep)?),
+            decode: Mutex::new(load_session(&dir.join(F_DECODE), threads, ep)?),
+            frame: Mutex::new(load_session(&dir.join(F_FRAME), threads, ep)?),
+            codec: Mutex::new(load_session(&dir.join(F_CODEC), threads, ep)?),
         })
     }
 
@@ -592,7 +611,8 @@ mod real {
             .get_or_init(|| {
                 let dir = crate::model::default_model_dir().expect("a cache directory");
                 std::sync::Mutex::new(
-                    MossEngine::load(&dir, crate::model::default_threads()).expect("MOSS loads"),
+                    MossEngine::load(&dir, crate::model::default_threads(), Ep::Cpu)
+                        .expect("MOSS loads"),
                 )
             })
             .lock()

@@ -21,6 +21,8 @@
 //! - [`transcribe`]
 
 pub mod asr;
+#[cfg(feature = "tts-local")]
+pub mod backend;
 pub mod elevenlabs;
 pub mod error;
 pub mod kokoro;

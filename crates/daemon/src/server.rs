@@ -2753,6 +2753,37 @@ pub async fn start_server(
                     .set_voice_mode(&session_id, on)
                     .await;
                 debug!("voice mode {} for session {}", on, session_id);
+
+                // 有人开始听 —— 先把引擎加载起来。
+                //
+                // 引擎是几百兆权重、几秒钟加载,而它原本发生在**第一句回答要出声
+                // 的那一刻**,于是第一句话前面永远挂着几秒静默。侧栏挂上听众到
+                // 用户发第一条消息之间有的是时间,那几秒白白浪费了。
+                //
+                // 在后台做,不等:预热失败也只是回到原来的行为(第一句时再加载并
+                // 如常报错),绝不能让它挡住这条控制消息。
+                #[cfg(feature = "tts-local")]
+                if on {
+                    let cfg = process_config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let cfg = match cfg.read() {
+                            Ok(c) => c.clone(),
+                            Err(_) => return,
+                        };
+                        match crate::tts::moss::conversation_voice(&cfg) {
+                            Ok((_, choice)) => tracing::info!(
+                                target: "speech",
+                                engine = choice.engine,
+                                "voice engine warmed on listener attach"
+                            ),
+                            Err(e) => tracing::debug!(
+                                target: "speech",
+                                error = %e,
+                                "warm-up found no synthesizer; the first reply will report it"
+                            ),
+                        }
+                    });
+                }
                 continue;
             }
 
@@ -2874,17 +2905,15 @@ pub async fn start_server(
                         let sid = session_id.clone();
                         let tid = turn_id.clone();
                         tokio::spawn(async move {
-                            // The splitter is fed the whole answer here because
+                            // The filter is fed the whole answer here because
                             // `voice_say` carries one; on the streaming path it
                             // gets deltas instead, and its contract is that the
-                            // two produce the same pieces.
-                            let mut sp = crate::speech::SpeakSplitter::new(400);
-                            let mut pieces = sp.push(&text);
-                            pieces.extend(sp.finish());
-                            for p in pieces {
-                                if let crate::speech::Piece::Spoken(sentence) = p {
-                                    turn.say(&sentence).await;
-                                }
+                            // two produce the same sentences.
+                            let mut sp = crate::speech::Speakable::new();
+                            let mut sentences = sp.push(&text);
+                            sentences.extend(sp.finish());
+                            for sentence in sentences {
+                                turn.say(&sentence).await;
                             }
                             turn.finish();
                             registry.end(&sid, &tid).await;
@@ -6423,6 +6452,13 @@ async fn handle_chat_message_streaming(
     let extraction_database = services.database.clone();
     let extraction_user_message = message_content.to_string();
 
+    // 有没有人在听这条会话。
+    //
+    // 只影响要不要把流出的回答抄一份去合成 —— **回答本身不因为有人在听而改变**。
+    // 早先这里还会给模型加一段 prompt,要它在 `<speak>` 里另写一份口语稿;那等于
+    // 让语音去改写回答,而且模型不守格式时整轮无声。现在念的就是回答。
+    let voice_on = crate::speech::conversation().voice_mode(&session_id).await;
+
     // Create agent with host functions
     let agent = Agent::new(host);
 
@@ -6499,97 +6535,91 @@ async fn handle_chat_message_streaming(
     let stream_title = generated_title.clone();
     let forwarder_cancellation = cancellation_token.clone();
 
-    // 语音旁路:开了语音的 session,把正在流出的回答同时喂给拆流器,
-    // 逐句合成。**只发不等**,而且发失败也只是没有声音 —— 这条路径绝不能
-    // 影响文字回答的转发,那是产品里最承重的一条。
-    let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> =
-        if crate::speech::conversation().voice_mode(&session_id).await {
-            // 用户在设置里选的音色。在 spawn 之前读:`services` 借的是这个函数的栈,
-            // 活不到那个任务里。读不到就交给引擎自己的默认,而不是硬写一个名字。
-            let chosen_voice = crate::tts::moss::preferred_voice(&services.database);
-            match crate::tts::moss::conversation_voice(config) {
-                Ok((synth, choice)) => {
-                    if let Some(why) = choice.reason.as_deref() {
-                        warn!("voice: speaking with {} — {}", choice.engine, why);
+    // 语音旁路:开了语音的 session,把流出的回答逐句合成。**只发不等**,而且
+    // 发失败也只是没有声音 —— 这条路径绝不能影响文字回答的转发,那是产品里最
+    // 承重的一条。
+    //
+    // 过滤(跳过代码块与 markdown 记号、切成句子)在转发那一侧做,见 `voice_tee!`。
+    // 进来的每一条已经是一句可以直接合成的话。
+    //
+    // 谁在发声,「整轮没什么可念」那句要按它挑语言 —— Kokoro 只会英文。
+    let mut voice_engine: Option<&'static str> = None;
+    let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> = if voice_on {
+        // 用户在设置里选的音色。在 spawn 之前读:`services` 借的是这个函数的栈,
+        // 活不到那个任务里。读不到就交给引擎自己的默认,而不是硬写一个名字。
+        let chosen_voice = crate::tts::moss::preferred_voice(&services.database);
+        match crate::tts::moss::conversation_voice(config) {
+            Ok((synth, choice)) => {
+                if let Some(why) = choice.reason.as_deref() {
+                    warn!("voice: speaking with {} — {}", choice.engine, why);
+                }
+                let (ttx, mut trx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
+                let turn_id = format!("vt_{}", uuid::Uuid::new_v4());
+                let sid = session_id.clone();
+
+                // 出口:VoiceOut → envelope。听众是这条连接,显式传入(ADR-0001)。
+                let tx = response_tx.clone();
+                let ident = identity.clone();
+                let pid = proxy_id.clone();
+                let ch = channel;
+                tokio::spawn(async move {
+                    while let Some(out) = vrx.recv().await {
+                        let (kind, body) = match out {
+                            crate::speech::VoiceOut::Audio(a) => {
+                                ("voice_audio", serde_json::to_value(a).unwrap_or_default())
+                            }
+                            crate::speech::VoiceOut::Done(d) => {
+                                ("voice_done", serde_json::to_value(d).unwrap_or_default())
+                            }
+                            crate::speech::VoiceOut::Failed(f) => {
+                                ("voice_failed", serde_json::to_value(f).unwrap_or_default())
+                            }
+                        };
+                        let env = DaemonEnvelope::new(
+                            &pid,
+                            ch,
+                            serde_json::json!({ "type": kind, "payload": body }),
+                        );
+                        if tx.send((ident.clone(), env)).await.is_err() {
+                            break;
+                        }
                     }
-                    let (ttx, mut trx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                    let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel();
-                    let turn_id = format!("vt_{}", uuid::Uuid::new_v4());
-                    let sid = session_id.clone();
+                });
 
-                    // 出口:VoiceOut → envelope。听众是这条连接,显式传入(ADR-0001)。
-                    let tx = response_tx.clone();
-                    let ident = identity.clone();
-                    let pid = proxy_id.clone();
-                    let ch = channel;
-                    tokio::spawn(async move {
-                        while let Some(out) = vrx.recv().await {
-                            let (kind, body) = match out {
-                                crate::speech::VoiceOut::Audio(a) => {
-                                    ("voice_audio", serde_json::to_value(a).unwrap_or_default())
-                                }
-                                crate::speech::VoiceOut::Done(d) => {
-                                    ("voice_done", serde_json::to_value(d).unwrap_or_default())
-                                }
-                                crate::speech::VoiceOut::Failed(f) => {
-                                    ("voice_failed", serde_json::to_value(f).unwrap_or_default())
-                                }
-                            };
-                            let env = DaemonEnvelope::new(
-                                &pid,
-                                ch,
-                                serde_json::json!({ "type": kind, "payload": body }),
-                            );
-                            if tx.send((ident.clone(), env)).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    // 入口:delta → 拆流 → 逐句合成。
-                    let sid2 = sid.clone();
-                    let tid = turn_id.clone();
-                    tokio::spawn(async move {
-                        let mut turn = crate::speech::VoiceTurn::new(
-                            sid2.clone(),
-                            tid.clone(),
-                            chosen_voice.clone(),
-                            synth,
-                            vtx,
-                        )
-                        .with_engine(choice.engine, choice.reason.clone());
-                        crate::speech::conversation()
-                            .turns
-                            .begin(&sid2, &tid, turn.canceller())
-                            .await;
-                        // 400:Q50 的「等太久」判据 —— `<speak>` 先出,超过这么多
-                        // 正文字符仍未见开标签,这一轮就没有口语稿。
-                        let mut sp = crate::speech::SpeakSplitter::new(400);
-                        while let Some(delta) = trx.recv().await {
-                            for piece in sp.push(&delta) {
-                                if let crate::speech::Piece::Spoken(sentence) = piece {
-                                    turn.say(&sentence).await;
-                                }
-                            }
-                        }
-                        for piece in sp.finish() {
-                            if let crate::speech::Piece::Spoken(sentence) = piece {
-                                turn.say(&sentence).await;
-                            }
-                        }
-                        turn.finish();
-                        crate::speech::conversation().turns.end(&sid2, &tid).await;
-                    });
-                    Some(ttx)
-                }
-                Err(e) => {
-                    warn!("voice mode on but no synthesizer: {}", e);
-                    None
-                }
+                // 入口:一句口语稿 → 合成一片。
+                let sid2 = sid.clone();
+                let tid = turn_id.clone();
+                voice_engine = Some(choice.engine);
+                tokio::spawn(async move {
+                    let mut turn = crate::speech::VoiceTurn::new(
+                        sid2.clone(),
+                        tid.clone(),
+                        chosen_voice.clone(),
+                        synth,
+                        vtx,
+                    )
+                    .with_engine(choice.engine, choice.reason.clone());
+                    crate::speech::conversation()
+                        .turns
+                        .begin(&sid2, &tid, turn.canceller())
+                        .await;
+                    while let Some(sentence) = trx.recv().await {
+                        turn.say(&sentence).await;
+                    }
+                    turn.finish();
+                    crate::speech::conversation().turns.end(&sid2, &tid).await;
+                });
+                Some(ttx)
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                warn!("voice mode on but no synthesizer: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Spawn task to forward stream chunks to the sidebar
     // Uses 300ms batch throttle: text chunks are buffered and flushed on interval tick,
@@ -6638,6 +6668,48 @@ async fn handle_chat_message_streaming(
             }};
         }
 
+        // 念的就是回答本身。
+        //
+        // 所以这里**一个字节都不改**流出的文字:`voice_tee!` 把同一段文字抄一份
+        // 喂给合成器,然后原样返回。早先那一版要从正文里摘掉 `<speak>` 口语稿,
+        // 于是最承重的那条路(文字转发)要为语音让路;现在这个耦合没有了 ——
+        // 没人在听时 `speakable` 是 None,连抄那一份都不发生。
+        //
+        // 该跳过什么(围栏代码块、markdown 记号)在 `Speakable` 里,那里能被测到。
+        let mut speakable = voice_tap.as_ref().map(|_| crate::speech::Speakable::new());
+
+        // 把流出的文字抄一份去合成,返回原文。
+        //
+        // `$finish` 在流结束时传 true:收尾要吐出攒了一半的最后一句,并且「整轮
+        // 一句都念不出来」这个判定也只有到收尾才成立。
+        macro_rules! voice_tee {
+            ($raw:expr, $finish:expr) => {{
+                let raw: String = $raw;
+                if let (Some(sp), Some(tap)) = (speakable.as_mut(), voice_tap.as_ref()) {
+                    let mut sentences = sp.push(&raw);
+                    if $finish {
+                        sentences.extend(sp.finish());
+                        if !sp.said_anything() {
+                            // 回答通篇是代码。不出声与坏掉在用户耳朵里长得一样,
+                            // 所以说一句 —— 但绝不硬念那段代码。
+                            sentences.push(
+                                if voice_engine == Some("kokoro") || !sp.saw_cjk() {
+                                    crate::speech::NOTHING_TO_SAY_EN
+                                } else {
+                                    crate::speech::NOTHING_TO_SAY_ZH
+                                }
+                                .to_string(),
+                            );
+                        }
+                    }
+                    for sentence in sentences {
+                        let _ = tap.send(sentence);
+                    }
+                }
+                raw
+            }};
+        }
+
         // Flush buffered text to sidebar.
         // Returns true if text was sent (or nothing to send), false on send error.
         // Large payloads are split into chunks to stay under native messaging size limits (~1MB).
@@ -6645,15 +6717,9 @@ async fn handle_chat_message_streaming(
 
         macro_rules! flush_buffer {
             ($done:expr) => {{
-                let text = std::mem::take(&mut buffer);
+                let text = voice_tee!(std::mem::take(&mut buffer), $done);
                 let is_first_chunk = accumulated_text.is_empty();
                 accumulated_text.push_str(&text);
-                // 语音旁路。发不出去只意味着没有声音,文字照走。
-                if let Some(ref tap) = voice_tap {
-                    if !text.is_empty() {
-                        let _ = tap.send(text.clone());
-                    }
-                }
 
                 if !text.is_empty() {
                     if text.len() <= MAX_PROXY_CHUNK {
@@ -6746,9 +6812,10 @@ async fn handle_chat_message_streaming(
                                     }
                                 }
                                 // Send event chunk with any accompanying text
+                                let event_text = voice_tee!(chunk.text, chunk.done);
                                 let is_first = accumulated_text.is_empty();
-                                accumulated_text.push_str(&chunk.text);
-                                if let Err(e) = send_chunk!(chunk.text, chunk.done, chunk.event.as_ref(), chunk.thinking_event.as_ref(), is_first) {
+                                accumulated_text.push_str(&event_text);
+                                if let Err(e) = send_chunk!(event_text, chunk.done, chunk.event.as_ref(), chunk.thinking_event.as_ref(), is_first) {
                                     error!("Failed to send stream chunk: {}", e);
                                     break;
                                 }
@@ -6780,6 +6847,10 @@ async fn handle_chat_message_streaming(
                             if !buffer.is_empty() {
                                 let _ = flush_buffer!(false);
                             }
+                            // 流断在半路。拆流器里可能还压着最后一句口语稿,而
+                            // 「这一轮没有口语稿」的判定也只在收尾时才出得来。
+                            // 返回的正文最多是半个标签,丢掉无妨。
+                            let _ = voice_tee!(String::new(), true);
                             debug!("Stream channel closed");
                             break;
                         }
