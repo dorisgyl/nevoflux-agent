@@ -58,7 +58,11 @@ ort-load-dynamic = [
 # provider, and a runtime built without that provider refuses to attach it --
 # which is the signal the probe in `nevoflux_tts::ep` selects on. A machine with
 # no usable GPU measures CPU as the winner and nothing changes.
-tts-gpu = ["nevoflux-tts?/ort-cuda", "nevoflux-tts?/ort-directml"]
+tts-gpu = [
+    "nevoflux-tts?/ort-cuda",
+    "nevoflux-tts?/ort-directml",
+    "nevoflux-tts?/ort-coreml",
+]
 
 [dependencies]
 # Internal crates

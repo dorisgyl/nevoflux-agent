@@ -22,6 +22,10 @@ ort-load-dynamic = ["ort/load-dynamic"]
 # the signal `crate::ep` selects on.
 ort-cuda = ["ort/cuda"]
 ort-directml = ["ort/directml"]
+# Apple CoreML. Unlike the other two this needs no different runtime — the
+# official macOS build already carries the provider — so on a Mac this is a
+# GPU/neural-engine path that costs nothing to ship.
+ort-coreml = ["ort/coreml"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "api-24"] }
