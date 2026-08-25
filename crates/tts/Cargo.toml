@@ -32,6 +32,8 @@ pinyin = "0.10"
 misaki-rs = { version = "0.3.0", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 thiserror = { workspace = true }
+# 音色回落必须留下痕迹。静默地换一副嗓子,和静默地不出声,是同一类毛病。
+tracing = { workspace = true }
 dirs = "5.0"
 # The MOSS manifest carries the prompt templates and the built-in voices;
 # without it the graphs have no way to be addressed.

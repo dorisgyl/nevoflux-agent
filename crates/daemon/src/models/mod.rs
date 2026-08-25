@@ -308,6 +308,80 @@ mod tests {
         catalog::by_id(id).expect("known asset")
     }
 
+    /// The Chinese voice bank is the first asset that lands in a subdirectory,
+    /// and every path in this module was written when none did.
+    ///
+    /// Three things have to hold and none of them had a test: the destination
+    /// resolves through the separator on Windows too, the `.part` file lands
+    /// beside it rather than somewhere flat, and the parent gets created —
+    /// `fetch_to` opens the `.part` for writing, which fails outright if the
+    /// directory is not there. A miss here is 103 downloads that cannot start.
+    #[test]
+    fn an_asset_inside_a_subdirectory_resolves_and_gets_its_parent_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = catalog::ASSETS
+            .iter()
+            .find(|a| a.file.starts_with("kokoro-voices-v1.1-zh/"))
+            .expect("a voice entry");
+
+        let dest = dir.path().join(a.file);
+        assert_eq!(
+            dest.parent().unwrap(),
+            dir.path().join("kokoro-voices-v1.1-zh"),
+            "子目录没被当成路径"
+        );
+        // The part file has to share that parent, or resume writes elsewhere.
+        assert_eq!(fetch::part_path(&dest).parent(), dest.parent());
+
+        // Nothing there yet, and asking must not panic on the missing parent.
+        assert_eq!(state_of(a, dir.path()), AssetState::Missing);
+
+        // What `fetch_to` does before opening the file.
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, vec![0u8; a.bytes as usize]).unwrap();
+        assert_eq!(state_of(a, dir.path()), AssetState::Present);
+    }
+
+    /// The real thing, over the network, through the code that ships.
+    ///
+    /// `#[ignore]` because it downloads 522 KB from HuggingFace; run it with
+    /// `--ignored` when the catalog's Chinese entries change. Everything else
+    /// about those entries is checked against pinned data, which cannot catch
+    /// a URL that 404s, a digest harvested from the wrong header, or a mirror
+    /// that serves an HTML error page with a 200.
+    #[tokio::test]
+    #[ignore]
+    async fn a_voice_really_downloads_from_the_pinned_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = catalog::ASSETS
+            .iter()
+            .find(|a| a.file.ends_with("/zf_001.bin"))
+            .expect("zf_001");
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut seen = 0u64;
+        let mut progress = |_: &'static Asset, done: u64, _total: u64| seen = done;
+
+        download_asset(&client, a, dir.path(), &cancel, &mut progress)
+            .await
+            .expect("download should succeed");
+
+        // Present means the size matched; `fetch_to` refuses on a digest
+        // mismatch before it ever gets renamed into place.
+        assert_eq!(state_of(a, dir.path()), AssetState::Present);
+        assert_eq!(seen, a.bytes);
+        // And it landed in the bank directory, not flat beside it.
+        assert!(dir
+            .path()
+            .join("kokoro-voices-v1.1-zh")
+            .join("zf_001.bin")
+            .is_file());
+    }
+
     #[test]
     fn a_file_of_exactly_the_right_size_counts_as_present() {
         let dir = tempfile::tempdir().unwrap();

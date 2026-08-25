@@ -13,6 +13,16 @@ use std::sync::Mutex;
 /// speaker leaves between sentences anyway.
 const JOIN_SILENCE: usize = (SAMPLE_RATE as usize * 80) / 1000;
 
+/// What [`crate::vocab::tokenize`] adds around every sentence: one `0` at each
+/// end. A token list of exactly this length carries no phonemes at all — which
+/// is why "did the vocabulary understand anything?" is a length test against
+/// this number and not against zero.
+const PAD_TOKENS: usize = 2;
+
+/// How many distinct unrecognised symbols to name when reporting a vocabulary
+/// mismatch. Enough to identify the script at a glance, short enough to read.
+const UNKNOWN_SAMPLE: usize = 8;
+
 #[derive(Debug)]
 pub struct Audio {
     pub pcm: Vec<f32>,
@@ -54,6 +64,62 @@ fn is_han(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
+/// Which voice actually speaks, given what was asked for and what is installed.
+///
+/// Two layers, deliberately: [`resolve_voice`] stays strict and says no to a
+/// name this bank does not have, and the policy about what to do with that no
+/// lives here. Keeping them apart is what lets the answer be "fall back" for a
+/// spoken reply without also making `tts_voices` pretend a bad id was fine.
+///
+/// A free function rather than a method so it can be tested without a 324 MB
+/// model behind it — the behaviour worth pinning is entirely in this decision.
+fn choose_voice(
+    requested: Option<&str>,
+    text: &str,
+    available: &[&str],
+) -> Result<String, TtsError> {
+    if let Some(v) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        match resolve_voice(Some(v), available) {
+            Ok(id) => return Ok(id),
+            // 回落,而不是让整句哑掉。
+            //
+            // 一个音色名会过时:音色库换了发行版(v1.0 的 `af_heart` 在 v1.1-zh
+            // 里不存在),或者设置里存着一个早该消失的旧值 —— 这两件事都真的
+            // 发生过。让每一句话都不出声,是拿最重的惩罚去对付一次纯粹的配置
+            // 陈旧:用一副不是首选的嗓子说出来,仍然是说出来了。
+            //
+            // 但必须留下痕迹。静默替换会让「我明明选了 A」永远查不出来 ——
+            // 那正是这次要修掉的那类毛病,不该顺手再造一个。
+            Err(e) => tracing::warn!(
+                target: "tts",
+                requested = v,
+                error = %e,
+                "unknown voice; falling back to one this bank has"
+            ),
+        }
+    }
+    // 中文文本优先挑中文嗓子:英文嗓子念注音符号不是口音问题,是念不出来。
+    if text.chars().any(is_han) {
+        let mut zh: Vec<&str> = available
+            .iter()
+            .copied()
+            .filter(|v| v.starts_with("zf") || v.starts_with("zm"))
+            .collect();
+        zh.sort_unstable();
+        if let Some(v) = zh.first() {
+            return Ok((*v).to_string());
+        }
+    }
+    resolve_voice(None, available).or_else(|e| {
+        let mut all = available.to_vec();
+        all.sort_unstable();
+        match all.first() {
+            Some(v) => Ok((*v).to_string()),
+            None => Err(e),
+        }
+    })
+}
+
 impl Synthesizer {
     /// 按**文本**挑 G2P。
     ///
@@ -83,29 +149,7 @@ impl Synthesizer {
     /// 所以按文本挑:中文优先中文说话人(拿英文说话人的音质念中文,内容对但听着
     /// 别扭),否则默认音色,再否则库里第一个。
     fn pick_voice(&self, requested: Option<&str>, text: &str) -> Result<String, TtsError> {
-        let available = self.voices.ids();
-        if let Some(v) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-            return resolve_voice(Some(v), &available);
-        }
-        if text.chars().any(is_han) {
-            let mut zh: Vec<&str> = available
-                .iter()
-                .copied()
-                .filter(|v| v.starts_with("zf") || v.starts_with("zm"))
-                .collect();
-            zh.sort_unstable();
-            if let Some(v) = zh.first() {
-                return Ok((*v).to_string());
-            }
-        }
-        resolve_voice(None, &available).or_else(|e| {
-            let mut all = available.clone();
-            all.sort_unstable();
-            match all.first() {
-                Some(v) => Ok((*v).to_string()),
-                None => Err(e),
-            }
-        })
+        choose_voice(requested, text, &self.voices.ids())
     }
 
     /// Build a synthesizer. `threads` is the intra-op width; pass
@@ -165,12 +209,55 @@ impl Synthesizer {
         let voice = self.pick_voice(voice_id, text)?;
 
         let mut tokenized = Vec::new();
+        let mut phonemes_seen = 0usize;
+        let mut unknown: Vec<char> = Vec::new();
         for sentence in split::sentences(text) {
             let phonemes = self.g2p_for(&sentence).phonemize(&sentence)?;
+            phonemes_seen += phonemes.chars().count();
+            for c in self.vocab.unknown_chars(&phonemes, UNKNOWN_SAMPLE) {
+                if unknown.len() < UNKNOWN_SAMPLE && !unknown.contains(&c) {
+                    unknown.push(c);
+                }
+            }
             tokenized.push((sentence, self.vocab.tokenize(&phonemes)));
         }
         if tokenized.is_empty() {
             return Err(TtsError::TextTooLong("nothing to speak".into()));
+        }
+        // 词表吃下了多少音素。
+        //
+        // 这以前是**静默**的,而且静默得很有说服力。三重伪装:`tokenize` 两端各
+        // 补一个 0,所以丢光之后拿到的是 `[0, 0]` 而不是空表,上面那个 is_empty
+        // 拦不住;中文 G2P 产出的标点在英文表里是认识的,于是 token 数还大于零;
+        // 模型照跑,吐出一段时长像模像样、内容空空的音频。日志里一个字都没有,
+        // 所以它只能表现为"没有声音"。定位它花了两轮排查。
+        //
+        // 阈值不是拍的,是量的(见 `a_matched_vocabulary_keeps_everything`):
+        // 配对的词表精确保留 100%,v1.0 遇上中文只剩 5%(纯标点)。取"过半被
+        // 丢弃"作界,把这两种情形分得干干净净,而中英混排那种一半能念的
+        // (65%)留给警告 —— 它确实说得出话,只是说漏了。
+        let kept: usize = tokenized
+            .iter()
+            .map(|(_, t)| t.len().saturating_sub(PAD_TOKENS))
+            .sum();
+        if phonemes_seen > 0 && kept * 2 < phonemes_seen {
+            return Err(TtsError::VocabMismatch(format!(
+                "the vocabulary has no symbol for `{}` — {kept} of {phonemes_seen} \
+                 phonemes survived. Chinese needs the v1.1-zh model; v1.0 is \
+                 English only.",
+                unknown.iter().collect::<String>(),
+            )));
+        }
+        if kept < phonemes_seen {
+            // 说得出话,但说漏了一部分。「CUDA 比 CPU 慢两倍」丢掉中文那半之后
+            // 剩下的是「CUDA CPU」—— 不该报错让人听不到,也不该假装完好。
+            tracing::warn!(
+                target: "tts",
+                kept,
+                phonemes = phonemes_seen,
+                dropped = %unknown.iter().collect::<String>(),
+                "vocabulary dropped part of this text"
+            );
         }
         let chunks = split::pack(tokenized, MAX_TOKENS)?;
         let total = chunks.len();
@@ -281,12 +368,89 @@ mod tests {
             "前提变了:v1.1-zh 现在有 {} 了,这条测试要重写",
             crate::g2p::DEFAULT_VOICE
         );
-        // 显式指一个不存在的,仍然要报错 —— 不能悄悄换人说话。
+        // 解析这一层保持严格:库里没有就是没有,不在这里替人做主。
+        // 「那要不要换个嗓子说」是上一层的事,见 choose_voice。
         assert!(resolve_voice(Some("af_heart"), &zh_bank).is_err());
         // 而库里有的英文音色照常解析。
         assert_eq!(
             resolve_voice(Some("af_maple"), &zh_bank).unwrap(),
             "af_maple"
+        );
+    }
+
+    /// 回归:一个过时的音色名不该让**每一句话**都不出声。
+    ///
+    /// 真实经过:设置里存着 `zm_yunxi`(既不是 Kokoro 的也不是 MOSS 的,来源
+    /// 已不可考)。旧的挑选逻辑在显式指定时直接 return 解析结果,于是 MOSS 报
+    /// "no built-in voice named zm_yunxi",换成 Kokoro 报 "unknown voice" ——
+    /// 换引擎、换模型都绕不过去,因为坏的是那个存下来的字符串。
+    #[test]
+    fn a_stale_voice_name_falls_back_instead_of_silencing_the_reply() {
+        let bank = ["af_maple", "af_sol", "zf_001", "zm_010"];
+        let picked = choose_voice(Some("zm_yunxi"), "今天天气不错", &bank)
+            .expect("回落之后必须还能说话");
+        // 而且回落要挑对语言:中文文本落到中文嗓子上。
+        assert!(
+            picked.starts_with("zf") || picked.starts_with("zm"),
+            "中文回落到了 {picked}"
+        );
+    }
+
+    /// 回落不能变成「反正都一样」:库里有的名字必须原样生效。
+    #[test]
+    fn a_voice_the_bank_has_is_used_exactly_as_asked() {
+        let bank = ["af_maple", "zf_001", "zm_010"];
+        assert_eq!(
+            choose_voice(Some("zm_010"), "今天天气不错", &bank).unwrap(),
+            "zm_010"
+        );
+        // 英文文本、显式英文嗓子,同样原样。
+        assert_eq!(
+            choose_voice(Some("af_maple"), "hello", &bank).unwrap(),
+            "af_maple"
+        );
+    }
+
+    /// 库里一个中文嗓子都没有时,中文文本仍要拿到一个能用的音色 ——
+    /// 念不准是瑕疵,不出声是故障。（念得对不对由词表那条测试管。）
+    #[test]
+    fn chinese_text_still_gets_a_voice_from_an_english_only_bank() {
+        let bank = ["af_maple", "af_sol"];
+        let picked = choose_voice(None, "今天天气不错", &bank).expect("总得有人说");
+        assert!(bank.contains(&picked.as_str()));
+    }
+
+    /// 「过半被丢弃」这条界的两侧,都要有实测撑着。
+    ///
+    /// 这是 `read_each` 里那个判据的依据本身。不钉住的话,改动 G2P 或词表都可能
+    /// 悄悄把某一侧挪过界:阈值定得太松,中文继续静默;定得太紧,正常的英文
+    /// 合成开始报错 —— 两种都比现在坏。
+    #[test]
+    fn a_matched_vocabulary_keeps_everything_and_a_mismatched_one_keeps_almost_nothing() {
+        let vocab = crate::vocab::Vocab::builtin();
+        let kept = |ph: &str| {
+            let n = ph.chars().count();
+            let k = vocab.tokenize(ph).len().saturating_sub(PAD_TOKENS);
+            (k, n)
+        };
+
+        // 配对的一侧:内置表就是 v1.0 的表,英文音素一个不丢。
+        let en = EnglishG2p::new()
+            .phonemize("Hello from NevoFlux. Local speech works.")
+            .expect("english g2p");
+        let (k, n) = kept(&en);
+        assert_eq!(k, n, "配对的词表必须全收 ({k}/{n})");
+        assert!(k * 2 >= n, "英文合成不该被判成词表不匹配");
+
+        // 不配对的一侧:同一张表遇上注音符号,活下来的只有标点。
+        let zh = ChineseG2p::new()
+            .phonemize("这个方案我看了一下，整体思路是对的。")
+            .expect("chinese g2p");
+        let (k, n) = kept(&zh);
+        assert!(n > 0);
+        assert!(
+            k * 2 < n,
+            "v1.0 念中文竟保留了 {k}/{n} —— 判据要重新量"
         );
     }
 

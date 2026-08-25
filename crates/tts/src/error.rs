@@ -22,4 +22,13 @@ pub enum TtsError {
     /// A single sentence exceeded the model's hard token ceiling.
     #[error("text too long: {0}")]
     TextTooLong(String),
+    /// The model's vocabulary had nothing for any phoneme this text produced.
+    ///
+    /// Its own variant because it is neither a corrupt model nor a bad voice:
+    /// both halves are fine, they are just not a pair — Kokoro v1.0 carries no
+    /// Bopomofo, so every Chinese phoneme is dropped. Silence was the old
+    /// behaviour, and silence is indistinguishable from every other reason
+    /// audio does not arrive.
+    #[error("model cannot speak this text: {0}")]
+    VocabMismatch(String),
 }
