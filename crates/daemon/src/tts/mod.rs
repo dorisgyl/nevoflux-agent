@@ -89,6 +89,54 @@ pub fn strip_delivered_audio(resp: &mut serde_json::Value, wanted_by_composition
     }
 }
 
+/// Take the recording out of a tool result that is about to become part of
+/// our own conversation.
+///
+/// **Unconditional**, which is the whole difference from
+/// [`strip_delivered_audio`]. That one only fires once the reading has gone
+/// out part by part, and the condition it tests turns out to be the rare
+/// case, not the common one: the parts are only offered when a *remote portal*
+/// is attached (`offer_part` returns early otherwise), so on an ordinary
+/// desktop there is no `asset_group`, `wanted_whole` is true, and the entire
+/// reading came back as base64 and went into the history — where every later
+/// turn paid for it again. A ten-second answer is about 64 KB of base64,
+/// roughly sixteen thousand tokens, resent for the rest of the conversation.
+/// Measured in the wild at 2.8M tokens across a handful of spoken exchanges.
+///
+/// Nothing is lost by removing it. The model cannot play audio; the bytes
+/// reach the ear through the voice frames, the portal asset, or the
+/// composition's files map — all of which the daemon writes itself, before
+/// this runs. What the model can do with base64 in context is try to copy it
+/// back out, which never survives the trip.
+///
+/// The size is kept, because "there is a recording and it is 300 KB" is a
+/// fact the model may reasonably act on; the recording itself is not.
+pub fn withhold_audio_from_model(resp: &mut serde_json::Value) {
+    let Some(obj) = resp.as_object_mut() else {
+        return;
+    };
+    let Some(b64) = obj.remove("audio_b64") else {
+        return;
+    };
+    let n = b64.as_str().map(str::len).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    obj.insert(
+        "audio_b64_withheld_bytes".into(),
+        serde_json::Value::from(n),
+    );
+    obj.insert(
+        "note".into(),
+        serde_json::Value::from(
+            "The recording was produced and delivered; its base64 is withheld \
+             from this result because it would sit in the conversation for \
+             every later turn. Pass `composition_id` to have it written into \
+             an artifact's files map.",
+        ),
+    );
+}
+
 /// Synthesize speech via the ElevenLabs HTTP API. Returns audio bytes
 /// + metadata; caller decides whether to also write to a composition's
 /// files map (handled by the dispatch arm in agent_host / mcp_tool_executor).
@@ -182,6 +230,101 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归:桌面场景下整段朗读进了模型上下文。
+    ///
+    /// 旧的 `strip_delivered_audio` 认 `asset_group`,而它只有**远程 portal**
+    /// 接走分片时才有值 —— 普通桌面既没有 portal 也就没有 group,于是它一个
+    /// 字节都不删。这条测试用的正是那种响应形状。
+    #[test]
+    fn a_desktop_reading_does_not_reach_the_model() {
+        let mut resp = serde_json::json!({
+            "audio_b64": "UklGRiQAAABXQVZF",
+            "mime_type": "audio/wav",
+            "duration_sec": 3.2,
+            "voice_id": "zf_001",
+        });
+        // 旧行为:没有 asset_group,原样放行。这是当初的漏法。
+        let mut old = resp.clone();
+        strip_delivered_audio(&mut old, false);
+        assert!(
+            old.get("audio_b64").is_some(),
+            "前提变了:旧函数现在会删了,这条回归要重写"
+        );
+
+        withhold_audio_from_model(&mut resp);
+        assert!(resp.get("audio_b64").is_none(), "录音仍在结果里");
+        assert_eq!(resp["audio_b64_withheld_bytes"], 16);
+        // 说得出话的那些字段必须留着 —— 模型要据此回答"念完了,三秒"。
+        assert_eq!(resp["duration_sec"], 3.2);
+        assert_eq!(resp["voice_id"], "zf_001");
+    }
+
+    /// composition 那条也一样:文件早就由 daemon 写进 artifact 了,
+    /// 模型手里那份第二拷贝纯属付费。
+    #[test]
+    fn a_composition_reading_does_not_reach_the_model_either() {
+        let mut resp = serde_json::json!({
+            "audio_b64": "UklGRiQAAABXQVZF",
+            "wrote_to_files": "narration.wav",
+        });
+        withhold_audio_from_model(&mut resp);
+        assert!(resp.get("audio_b64").is_none());
+        assert_eq!(resp["wrote_to_files"], "narration.wav");
+    }
+
+    /// 把省下来的量钉住,而不是只说"省了很多"。
+    ///
+    /// 这条测试就是那次事故的账,算在真实形状上:一句十秒的朗读,24kHz/16bit
+    /// 的 WAV 是 480,000 字节,base64 之后 640,000。旧路径把它当作工具结果交出去,
+    /// 上游 `truncate_tool_result_if_needed` 在会话开头允许 250KB,于是 250KB 的
+    /// base64 落进历史并**再也不出来** —— 之后每一次请求都重付。
+    ///
+    /// 数字变了就该有人来看一眼:是模型换了采样率,还是有人把摘除改回了有条件的。
+    #[test]
+    fn the_saving_is_the_whole_recording_not_a_fraction_of_it() {
+        // 十秒 24kHz 单声道 16bit,再 base64。
+        let wav_bytes = 10 * 24_000 * 2;
+        let b64 = "A".repeat(wav_bytes * 4 / 3);
+        assert_eq!(b64.len(), 640_000);
+
+        let mut resp = serde_json::json!({
+            "audio_b64": b64,
+            "mime_type": "audio/wav",
+            "duration_sec": 10.0,
+            "voice_id": "zf_001",
+        });
+        let before = serde_json::to_string(&resp).unwrap().len();
+
+        withhold_audio_from_model(&mut resp);
+        let after = serde_json::to_string(&resp).unwrap().len();
+
+        assert!(before > 640_000, "前提变了:载荷只有 {before}");
+        assert!(
+            after < 1_000,
+            "摘除之后仍有 {after} 字节 —— 录音没被真正拿掉"
+        );
+
+        // 旧路径的实际代价:上游上限截到 250KB,而不是 640KB —— 更小,但同样
+        // 永久驻留。省下来的是这 250KB 乘以此后的每一次请求。
+        const OLD_CEILING: usize = 300 * 1024 - 50 * 1024;
+        let stuck_before = before.min(OLD_CEILING);
+        assert_eq!(stuck_before, 256_000);
+        assert!(
+            after * 250 < stuck_before,
+            "至少要小两个数量级:{after} vs {stuck_before}"
+        );
+    }
+
+    /// 已经空的(边说边送那条路)不该多出噪音字段来。
+    #[test]
+    fn an_already_empty_reading_gains_nothing() {
+        let mut resp = serde_json::json!({ "audio_b64": "", "speaking": true });
+        withhold_audio_from_model(&mut resp);
+        assert!(resp.get("audio_b64_withheld_bytes").is_none());
+        assert!(resp.get("note").is_none());
+        assert_eq!(resp["speaking"], true);
+    }
 
     #[test]
     fn base64_known_vectors() {

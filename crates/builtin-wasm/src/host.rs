@@ -672,6 +672,22 @@ pub trait HostFunctions {
         })
     }
 
+    /// Whether speech synthesized by a tool call would actually be heard.
+    ///
+    /// It is not heard in an ordinary desktop session, and that is the point of
+    /// asking. The synthesis tools deliver through `offer_part`, which only
+    /// pushes when a remote portal is attached; desktop playback is a different
+    /// path entirely (`speech::voice_out`, driven by the daemon itself while the
+    /// answer streams). So a `tts_synthesize_*` call from a desktop chat makes
+    /// no sound — it spends inference time and returns a result nobody can play.
+    ///
+    /// Offering those tools anyway costs their schema on every request. The
+    /// default is `false`, so a host that cannot say otherwise simply does not
+    /// advertise them.
+    fn speech_reaches_a_listener(&self) -> bool {
+        false
+    }
+
     /// Synthesize speech via local Kokoro ONNX inference (P5b-2).
     /// Daemon-side reads `[tts.kokoro] model_path / voices_path` and
     /// returns ConfigMissing until the model files exist. Hosts without

@@ -1078,6 +1078,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         "canvas_render_video",
     ];
 
+    /// Speech synthesis, held back unless it would be heard or written down.
+    ///
+    /// These reach an ear only through a remote portal, and reach a file only
+    /// through a composition — so in an ordinary desktop chat they produce
+    /// nothing at all (see `HostFunctions::speech_reaches_a_listener`). They
+    /// are not cheap to advertise: their schemas run to about 4.4 KB, paid on
+    /// every request of every conversation that was never going to use them.
+    ///
+    /// `tts_transcribe` is deliberately not here — audio in, text out works
+    /// anywhere and has nothing to do with playback.
+    const SPEECH_OUTPUT_TOOLS: &'static [&'static str] = &[
+        "tts_synthesize_local",
+        "tts_synthesize_api",
+        "tts_voices",
+    ];
+
     /// Tools whose execution creates/opens an artifact. Running any of them
     /// unlocks `CANVAS_OPERATE_TOOLS` for the rest of the turn, so a same-turn
     /// "create then operate" flow never loses the operate tools.
@@ -1096,6 +1112,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         }
         full.iter()
             .filter(|t| !Self::CANVAS_OPERATE_TOOLS.contains(&t.name.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Drop the speech-output tools unless this turn could do something with
+    /// them: a listener to hear them, or a canvas to write the narration into.
+    ///
+    /// Separate from [`Self::gate_canvas_tools`] because the two answer to
+    /// different facts — one to what is on screen, the other to who is
+    /// listening — and a turn can easily have one without the other.
+    fn gate_speech_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
+        if unlocked {
+            return full.to_vec();
+        }
+        full.iter()
+            .filter(|t| !Self::SPEECH_OUTPUT_TOOLS.contains(&t.name.as_str()))
             .cloned()
             .collect()
     }
@@ -1195,7 +1227,15 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // creating an artifact unlocks them mid-loop (see below).
         let mut canvas_unlocked =
             active_tab_is_canvas || input.user_message.contains("[Active Canvas");
-        let mut active_tools = Self::gate_canvas_tools(tools, canvas_unlocked);
+        // Speech output needs somewhere to go: a portal that plays it, or a
+        // canvas to write it into. Read once per turn — whether a listener is
+        // attached does not change mid-answer, and a canvas created mid-turn
+        // re-runs both gates below.
+        let speech_useful = self.host.speech_reaches_a_listener();
+        let mut active_tools = Self::gate_speech_tools(
+            &Self::gate_canvas_tools(tools, canvas_unlocked),
+            canvas_unlocked || speech_useful,
+        );
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1212,6 +1252,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             if self.host.is_interrupted()? {
                 break;
             }
+
+            // Before every call, not just the first: a long turn accumulates
+            // its own tool results, and the loop can run many iterations.
+            //
+            // This is about what does not belong in the request at all, rather
+            // than about making it fit: an aged tool result has been read and
+            // acted on already. The size cap on incoming results is the
+            // backstop for what this misses, not the other way round.
+            //
+            // Generated images are deliberately NOT touched here. They look
+            // like the same problem — 500 KB to 2 MB of base64 in an assistant
+            // message, re-sent every turn — but the model can actually use one:
+            // "make the sky bluer" is a follow-up that feeds the previous image
+            // back in. Audio has no such turn; an image does, and taking it
+            // away breaks editing silently.
+            shrink_aged_tool_results(&mut messages);
 
             // Use streaming or non-streaming LLM based on config
             let response = if self.config.use_streaming && !self.config.suppress_streaming {
@@ -1361,7 +1417,10 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     .any(|tc| Self::CANVAS_CREATING_TOOLS.contains(&tc.name.as_str()))
             {
                 canvas_unlocked = true;
-                active_tools = Self::gate_canvas_tools(tools, true);
+                // Both gates: a composition created this turn is exactly the
+                // case where narration becomes worth offering.
+                active_tools =
+                    Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true);
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -3494,7 +3553,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_synthesize_api".into(),
-                description: "Synthesize speech via the ElevenLabs HTTP API; returns base64 MP3 (audio_b64). Requires [tts.elevenlabs] api_key in ~/.config/nevoflux/config.toml (clear ConfigMissing error otherwise). Pass composition_id to also write the MP3 into that artifact as narration.mp3, then add <audio src=\"narration.mp3\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. Limit: text <=600 chars (~60s). See skill_load(\"video\") for the narrated flow.".into(),
+                description: "Synthesize speech via the ElevenLabs HTTP API. The audio is delivered to the listener, not returned here: the result carries duration_sec, voice_id and the byte count, and the base64 is withheld because it would sit in the conversation for every later turn. Requires [tts.elevenlabs] api_key in ~/.config/nevoflux/config.toml (clear ConfigMissing error otherwise). Pass composition_id to also write the MP3 into that artifact as narration.mp3, then add <audio src=\"narration.mp3\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. Limit: text <=600 chars (~60s). See skill_load(\"video\") for the narrated flow.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3540,7 +3599,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_synthesize_local".into(),
-                description: "Synthesize speech via local Kokoro-82M ONNX (no API key, no network); returns base64 WAV at 24kHz. English voices only (af/am/bf/bm) -- other languages return a clear error, use tts_synthesize_api for those. Pass composition_id to also write the WAV into that artifact as narration.wav, then add <audio src=\"narration.wav\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. duration_sec is measured, not estimated. Pass the whole passage in one call: long text is cut on sentence boundaries and synthesized piece by piece, which is what lets a remote listener hear it as one reading while the rest is still being made -- cutting it up yourself produces several separate recordings instead. When a remote listener is attached this returns as soon as the reading starts, with speaking=true and an estimated duration_sec: the sentences reach them as they are made, so there is nothing to wait for and no audio_b64 to collect -- say the reading has begun and carry on. Without a listener it waits and returns the file as before. Limit: text <=327680 chars, but that is a backstop rather than a target -- it is about seven hours of speech. Call tts_voices for the voice list. See skill_load(\"video\").".into(),
+                description: "Synthesize speech via local Kokoro-82M ONNX (no API key, no network), 24kHz. The audio is delivered to the listener, not returned here: the result carries duration_sec, voice_id and the byte count, and the base64 is withheld because it would sit in the conversation for every later turn. English voices only (af/am/bf/bm) -- other languages return a clear error, use tts_synthesize_api for those. Pass composition_id to also write the WAV into that artifact as narration.wav, then add <audio src=\"narration.wav\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. duration_sec is measured, not estimated. Pass the whole passage in one call: long text is cut on sentence boundaries and synthesized piece by piece, which is what lets a remote listener hear it as one reading while the rest is still being made -- cutting it up yourself produces several separate recordings instead. When a remote listener is attached this returns as soon as the reading starts, with speaking=true and an estimated duration_sec -- say the reading has begun and carry on. Without one it waits until the reading is finished and reports the measured duration. Either way there is no audio to collect from the result. Limit: text <=327680 chars, but that is a backstop rather than a target -- it is about seven hours of speech. Call tts_voices for the voice list. See skill_load(\"video\").".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -5501,6 +5560,68 @@ fn calculate_messages_size(messages: &[Message]) -> usize {
 /// - Maximum allowed total size (300KB, ~75K tokens)
 /// - Reserved space for LLM output (50KB)
 /// - Minimum tool result size (10KB)
+/// How many of the most recent tool results are re-sent in full.
+///
+/// Twelve rather than a tighter number because being wrong here is silent and
+/// asymmetric. Keeping too much costs tokens, which is measurable and bounded;
+/// shortening something the model was about to quote costs a wrong answer with
+/// nothing to show why. Twelve covers a long browse-and-read stretch, and the
+/// growth is still bounded — everything before it collapses to a fixed size.
+const RECENT_TOOL_RESULTS_KEPT_WHOLE: usize = 12;
+
+/// What an aged tool result is allowed to keep.
+///
+/// Four kilobytes is a screenful: enough to see which file, which page, what
+/// the first rows said, and to decide whether it is worth fetching again.
+const AGED_TOOL_RESULT_BUDGET: usize = 4 * 1024;
+
+/// Shorten tool results that the conversation has moved past.
+///
+/// Nothing here trimmed the history before this: [`truncate_tool_result_if_needed`]
+/// bounds each result **as it arrives** and never looks at it again, so a
+/// conversation only ever grew. Every request re-sent every byte of every
+/// result from every earlier turn, and a session with thirty-five requests paid
+/// for the first one thirty-five times.
+///
+/// Two properties make this safe to do on the wire:
+///
+/// * It shortens `content` and never removes a message, so an assistant's
+///   `tool_calls` keeps the matching tool result it was paired with. Dropping
+///   messages is the version of this that gets rejected by the provider.
+/// * It runs on the copy being sent, not on stored history. What the user can
+///   scroll back to is untouched; only what we pay for each round is smaller.
+///
+/// Idempotent: a result already under budget is left alone, so repeated calls
+/// across loop iterations converge instead of eating into it each time.
+fn shrink_aged_tool_results(messages: &mut [Message]) {
+    let results: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.role, MessageRole::Tool))
+        .map(|(i, _)| i)
+        .collect();
+    if results.len() <= RECENT_TOOL_RESULTS_KEPT_WHOLE {
+        return;
+    }
+    for &i in &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE] {
+        let full = messages[i].content.len();
+        if full <= AGED_TOOL_RESULT_BUDGET {
+            continue;
+        }
+        // The note counts against the budget, so that what comes out is *under*
+        // it and the `<=` above skips this result next time. Idempotence by
+        // construction rather than by recognising our own note — a tool result
+        // is free to contain any text, including that note.
+        let note = format!(
+            "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
+             this turn still needs it.]"
+        );
+        let head_budget = AGED_TOOL_RESULT_BUDGET.saturating_sub(note.len());
+        let head = truncate_string_safe(&messages[i].content, head_budget).to_string();
+        messages[i].content = head + &note;
+    }
+}
+
 fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
     // Total message size limit (~75K tokens for most models)
     const MAX_TOTAL_MESSAGE_SIZE: usize = 300 * 1024; // 300KB
@@ -5509,13 +5630,36 @@ fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String
                                                    // Minimum tool result size (don't truncate below this)
     const MIN_TOOL_RESULT_SIZE: usize = 10 * 1024; // 10KB
 
+    // Ceiling on any single result, however empty the conversation is.
+    //
+    // Without it the budget below is "whatever is left", and at the start of a
+    // conversation what is left is 250 KB. So the very first tool call can put
+    // 250 KB into the history, nothing ever takes it out again, and every later
+    // request in that conversation pays for it.
+    //
+    // That is not theoretical. A base64 WAV from a speech tool costs 64 KB per
+    // second of speech, so a four-second answer already passed the ceiling: the
+    // truncation below fired and kept 250 KB of base64 — the worst of both
+    // outcomes, too big to be cheap and too cut up to be usable. History then
+    // sat near 300 KB for the rest of the session (every later result squeezed
+    // down to MIN_TOOL_RESULT_SIZE), and a handful of spoken exchanges cost
+    // 2.8M tokens.
+    //
+    // 32 KB is roughly eight thousand words — past what any single result needs
+    // to be useful, and a tenth of the whole budget rather than three quarters
+    // of it. A result that genuinely needs more should be written somewhere and
+    // referenced, which is what the artifact and asset paths are for.
+    const MAX_SINGLE_TOOL_RESULT: usize = 32 * 1024;
+
     let current_size = calculate_messages_size(messages);
     let available_space = MAX_TOTAL_MESSAGE_SIZE
         .saturating_sub(current_size)
         .saturating_sub(RESERVED_OUTPUT_SIZE);
 
     // Calculate max size for this tool result
-    let max_result_size = available_space.max(MIN_TOOL_RESULT_SIZE);
+    let max_result_size = available_space
+        .max(MIN_TOOL_RESULT_SIZE)
+        .min(MAX_SINGLE_TOOL_RESULT);
 
     if content.len() <= max_result_size {
         return content.to_string();
@@ -5545,6 +5689,133 @@ fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String
 mod tests {
     use super::*;
     use crate::host::MockHostFunctions;
+
+    fn tool_result(id: &str, bytes: usize) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: "x".repeat(bytes),
+            tool_call_id: Some(id.to_string()),
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+        }
+    }
+
+    /// 回归:会话刚开始时"剩余空间"有 230KB,于是**第一个**工具结果就能把
+    /// 230KB 塞进历史,而且再也出不去 —— 一段 base64 WAV 正是这么让几轮语音
+    /// 对话花掉 280 万 token 的。上限必须是绝对的,不能只看剩余空间。
+    #[test]
+    fn a_single_tool_result_cannot_take_the_whole_budget() {
+        let empty: Vec<Message> = Vec::new();
+        let huge = "y".repeat(640 * 1024);
+        let out = truncate_tool_result_if_needed(&empty, &huge);
+        assert!(
+            out.len() < 40 * 1024,
+            "空会话里仍放进了 {} 字节",
+            out.len()
+        );
+        assert!(out.contains("[Content truncated"));
+    }
+
+    /// 普通长度的结果不受影响 —— 上限是给异常值准备的,不是给日常收税的。
+    #[test]
+    fn an_ordinary_tool_result_passes_through_untouched() {
+        let empty: Vec<Message> = Vec::new();
+        let ordinary = "z".repeat(4 * 1024);
+        assert_eq!(truncate_tool_result_if_needed(&empty, &ordinary), ordinary);
+    }
+
+    /// 短会话一个字都不该动。修剪是为长会话省钱,不是给每次对话降质。
+    #[test]
+    fn a_short_conversation_keeps_every_tool_result_whole() {
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE)
+            .map(|i| tool_result(&format!("t{i}"), 8 * 1024))
+            .collect();
+        let before = msgs.clone();
+        shrink_aged_tool_results(&mut msgs);
+        for (a, b) in before.iter().zip(msgs.iter()) {
+            assert_eq!(a.content, b.content);
+        }
+    }
+
+    /// 老的结果压缩、新的保留,而且**消息一条不少** —— 删消息会让
+    /// assistant 的 tool_calls 找不到配对的结果,供应商直接拒。
+    #[test]
+    fn aged_tool_results_shrink_while_the_pairing_survives() {
+        let n = RECENT_TOOL_RESULTS_KEPT_WHOLE + 4;
+        let mut msgs: Vec<Message> = (0..n)
+            .map(|i| tool_result(&format!("t{i}"), 8 * 1024))
+            .collect();
+        shrink_aged_tool_results(&mut msgs);
+
+        assert_eq!(msgs.len(), n, "消息数变了,配对会断");
+        for (i, m) in msgs.iter().enumerate() {
+            assert_eq!(m.tool_call_id.as_deref(), Some(format!("t{i}").as_str()));
+        }
+        // 前 4 条被压缩
+        for m in &msgs[..4] {
+            assert!(m.content.len() < 8 * 1024, "老结果没压缩");
+            assert!(m.content.contains("[Earlier tool result"));
+        }
+        // 最近 6 条原样
+        for m in &msgs[4..] {
+            assert_eq!(m.content.len(), 8 * 1024, "近期结果被误伤");
+        }
+    }
+
+    /// 没有听众、也没有 canvas 时,合成工具不该出现在请求里 ——
+    /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
+    /// 却每次请求都要付约 4.4 KB 的 schema。
+    #[test]
+    fn speech_output_tools_are_not_offered_when_nothing_can_hear_them() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let all = agent.get_chat_tools();
+        let gated = Agent::<MockHostFunctions>::gate_speech_tools(&all, false);
+
+        for name in Agent::<MockHostFunctions>::SPEECH_OUTPUT_TOOLS {
+            assert!(
+                !gated.iter().any(|t| &t.name == name),
+                "{name} 仍在请求里"
+            );
+        }
+        // 转写不受影响:音频进、文本出,与播放无关。
+        assert!(
+            gated.iter().any(|t| t.name == "tts_transcribe"),
+            "tts_transcribe 被误伤了"
+        );
+        assert_eq!(gated.len(), all.len() - 3);
+    }
+
+    /// 有听众(或有 canvas)时必须原样放行 —— 门控不能变成阉割。
+    #[test]
+    fn speech_output_tools_come_back_when_there_is_a_listener() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let all = agent.get_chat_tools();
+        let ungated = Agent::<MockHostFunctions>::gate_speech_tools(&all, true);
+        assert_eq!(ungated.len(), all.len());
+    }
+
+    /// 默认 host 说"没人听" —— 一个答不上来的 host 不该默认广告这些工具。
+    #[test]
+    fn a_host_that_cannot_say_defaults_to_no_listener() {
+        assert!(!MockHostFunctions::new().speech_reaches_a_listener());
+    }
+
+    /// 幂等:run_loop 每次迭代都会调它,不能每调一次就再啃掉一层。
+    #[test]
+    fn shrinking_twice_changes_nothing_the_second_time() {
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE + 3)
+            .map(|i| tool_result(&format!("t{i}"), 8 * 1024))
+            .collect();
+        shrink_aged_tool_results(&mut msgs);
+        let once = msgs.clone();
+        shrink_aged_tool_results(&mut msgs);
+        for (a, b) in once.iter().zip(msgs.iter()) {
+            assert_eq!(a.content, b.content, "第二次又压了一层");
+        }
+    }
 
     #[test]
     fn test_agent_config_default() {

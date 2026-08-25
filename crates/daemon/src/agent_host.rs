@@ -5365,6 +5365,10 @@ impl HostFunctions for DaemonHostFunctions {
             message: format!("serialize tts_synthesize_api response: {e}"),
         })?;
         self.offer_tts_asset(&mut out);
+        // After the offer, which reads the bytes. This path had no removal at
+        // all, so an ElevenLabs reading went into the conversation whole and
+        // was resent on every later turn.
+        crate::tts::withhold_audio_from_model(&mut out);
         Ok(out)
     }
 
@@ -5460,6 +5464,16 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
+    /// A portal, and only a portal. `offer_part` is the sole delivery route out
+    /// of the synthesis tools, and it pushes nothing without one — the desktop
+    /// hears its answers through `speech::voice_out`, which the daemon drives
+    /// itself and which no tool call touches.
+    fn speech_reaches_a_listener(&self) -> bool {
+        self.session_id
+            .as_deref()
+            .is_some_and(crate::remote::push::portal_attached)
+    }
+
     fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::SynthesizeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {
@@ -5469,8 +5483,6 @@ impl HostFunctions for DaemonHostFunctions {
         let cfg = self.config.tts.kokoro.clone();
         let session_for_tts = self.session_id.clone();
         let database = self.services.as_ref().map(|s| s.database.clone());
-        // Read before the request moves into the synthesis task.
-        let wanted_by_composition = req.composition_id.is_some();
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
                 let mut resp = crate::tts::synthesize_local(&cfg, &req, session_for_tts.as_deref())
@@ -5504,9 +5516,15 @@ impl HostFunctions for DaemonHostFunctions {
             message: format!("serialize tts_synthesize_local response: {e}"),
         })?;
         self.offer_tts_asset(&mut out);
-        // After the offer, which reads the bytes on the paths that still need
-        // to hand them over as one file.
-        crate::tts::strip_delivered_audio(&mut out, wanted_by_composition);
+        // After the offer, which reads the bytes.
+        //
+        // Unconditional now. `strip_delivered_audio` keyed on `asset_group`,
+        // and that is only set when a remote portal took the parts — so on an
+        // ordinary desktop it removed nothing and the whole reading went into
+        // the conversation. A composition is no exception: the daemon has
+        // already written the file into the artifact by this point, so the
+        // model holding a second copy buys nothing there either.
+        crate::tts::withhold_audio_from_model(&mut out);
         Ok(out)
     }
 

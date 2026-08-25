@@ -545,6 +545,11 @@ mod tests {
 
     #[test]
     fn a_very_short_run_is_not_evidence() {
+        // The guard, like its siblings: the measurement is process-global, so
+        // without it a concurrent `record_rtf` from another test lands between
+        // the store and the assert and this fails with someone else's ratio.
+        // It passed alone and failed in the suite, which is the tell.
+        let _guard = exclusive();
         // Loading a tensor and writing a header dominate a 200 ms clip; judging
         // an engine on that would bench the fixed costs.
         MEASURED_RTF.store(0, Ordering::Relaxed);
