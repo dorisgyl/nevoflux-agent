@@ -349,7 +349,7 @@ pub fn conversation_voice(
 
     match engine(
         &cfg.tts.moss,
-        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        crate::tts::backend::Setting::resolve(cfg.speech.execution_provider.as_deref()),
         budget,
     ) {
         Ok(e) => Ok((
@@ -605,6 +605,38 @@ pub fn preferred_voice(db: &nevoflux_storage::Database) -> Option<String> {
         })
 }
 
+/// One `general.<key>` out of the settings the browser writes.
+fn setting<'a>(db: &nevoflux_storage::Database, key: &'a str) -> Option<serde_json::Value> {
+    use nevoflux_storage::ConfigRepository;
+    ConfigRepository::new(db)
+        .get("config:settings")
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("general").and_then(|g| g.get(key)).cloned())
+}
+
+/// 用户对「语音可以用 GPU 吗」的表态。没设置过就是 `None`。
+///
+/// 这个开关最有用的方向是**关**。打开并不强制用 GPU —— 探测仍然要跑,而它可能
+/// 判定 CPU 更快(这台机器上 CUDA 实测 2.63x 对 CPU 1.17x)。关掉才是硬的:
+/// 显卡或驱动出问题时,那是一条一定回得去的路。
+pub fn gpu_preference(db: &nevoflux_storage::Database) -> Option<bool> {
+    setting(db, "speechUseGpu").and_then(|v| v.as_bool())
+}
+
+/// 要不要把回答念出来。**默认不念。**
+///
+/// 从前这件事和麦克风绑在一起:开了语音输入,每一条回答就都会被读出来,没有
+/// 中间态。但「我想说话给它听」和「我想听它说」是两个决定 —— 会议里、公共场合、
+/// 或者只是想快速扫一眼答案时,前者要开、后者要关。
+///
+/// 默认关,因为出声是打扰:没要求过就不该发生。
+pub fn speak_replies(db: &nevoflux_storage::Database) -> bool {
+    setting(db, "speakReplies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// What the settings page needs to offer a voice: which engine will speak,
 /// why that one, and the voices it actually has.
 ///
@@ -640,7 +672,7 @@ fn engine_voices(cfg: &AgentConfig) -> Vec<serde_json::Value> {
     // 所以这不会额外触发一次探测。
     match engine(
         &cfg.tts.moss,
-        crate::tts::backend::Setting::parse(cfg.speech.execution_provider.as_deref()),
+        crate::tts::backend::Setting::resolve(cfg.speech.execution_provider.as_deref()),
         cfg.speech.rtf_budget,
     ) {
         Ok(e) => e

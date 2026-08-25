@@ -6457,7 +6457,16 @@ async fn handle_chat_message_streaming(
     // 只影响要不要把流出的回答抄一份去合成 —— **回答本身不因为有人在听而改变**。
     // 早先这里还会给模型加一段 prompt,要它在 `<speak>` 里另写一份口语稿;那等于
     // 让语音去改写回答,而且模型不守格式时整轮无声。现在念的就是回答。
-    let voice_on = crate::speech::conversation().voice_mode(&session_id).await;
+    //
+    // 两个条件,不是一个:麦克风开着(voice_mode)**而且**用户要求把回答念出来。
+    // 从前只看前者,于是「我想说话给它听」和「我想听它说」被绑成一个决定,开麦
+    // 就一定出声。默认不念 —— 出声是打扰,没要求过就不该发生。
+    let voice_on = crate::speech::conversation().voice_mode(&session_id).await
+        && crate::tts::moss::speak_replies(&services.database);
+
+    // 用户对 GPU 的表态,在引擎建起来之前告诉后端选择那一层。放在这里是因为
+    // 探测发生在第一次真的要说话的时刻,而那就在下面几行。
+    crate::tts::backend::set_gpu_allowed(crate::tts::moss::gpu_preference(&services.database));
 
     // Create agent with host functions
     let agent = Agent::new(host);
