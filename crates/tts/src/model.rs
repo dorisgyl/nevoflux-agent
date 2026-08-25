@@ -206,10 +206,22 @@ fn attach(builder: SessionBuilder, ep: Ep) -> Result<SessionBuilder, TtsError> {
         // Built without it. This is a real answer, not an omission: a build that
         // cannot attach CUDA should say so rather than run on CPU and let the
         // measurement take the blame.
+        // Apple's, covering both the GPU and the neural engine. Unlike the
+        // other two this needs no different runtime — the official macOS build
+        // carries it — so enabling it costs no download at all.
+        #[cfg(feature = "ort-coreml")]
+        Ep::CoreMl => builder
+            .with_execution_providers([ort::ep::CoreML::default().build().error_on_failure()])
+            .map_err(|e| refused(e.to_string())),
+        // Built without it. This is a real answer, not an omission: a build that
+        // cannot attach CUDA should say so rather than run on CPU and let the
+        // measurement take the blame.
         #[cfg(not(feature = "ort-cuda"))]
         Ep::Cuda => Err(refused("built without the ort-cuda feature".into())),
         #[cfg(not(feature = "ort-directml"))]
         Ep::DirectMl => Err(refused("built without the ort-directml feature".into())),
+        #[cfg(not(feature = "ort-coreml"))]
+        Ep::CoreMl => Err(refused("built without the ort-coreml feature".into())),
     }
 }
 
@@ -220,11 +232,32 @@ fn attach(builder: SessionBuilder, ep: Ep) -> Result<SessionBuilder, TtsError> {
 /// remaining cores for concurrency rather than for one utterance. Machines
 /// report logical cores, so on a hyperthreaded box this lands on roughly the
 /// physical count by accident of the cap — which is the number that matters.
+/// How wide to run inference when config does not say.
+///
+/// The ceiling was four, and four is where speech stops being comfortable.
+/// Measured on this machine, Kokoro v1.1-zh reading the same three sentences:
+///
+///     4 threads   RTF 0.782x      <- the old ceiling
+///     8 threads   RTF 0.534x
+///     12 threads  RTF 0.491x
+///     16 threads  RTF 0.459x
+///
+/// 0.782x is under the 0.85 budget and therefore counts as fast enough, but
+/// with nothing to spare: one busy tab and the reading falls behind, which is
+/// heard as stuttering rather than as a number. Eight buys the margin back.
+///
+/// Eight rather than everything because the gain past it is small (0.534 to
+/// 0.459 across a further eight threads) and this runs inside a browser the
+/// user is still using. A machine with fewer cores is unchanged — it was
+/// never near the old ceiling either.
+///
+/// Both engines take `threads` from config; this is only what happens when
+/// nobody chose.
 pub fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, 4)
+        .clamp(1, 8)
 }
 
 /// Where the model files live when config does not say.
@@ -253,10 +286,20 @@ mod tests {
         assert!(matches!(err, TtsError::ModelCorrupt(_)), "got: {err}");
     }
 
+    /// 上限从 4 抬到 8:4 线程下 Kokoro 是 0.782x,压在 0.85 预算之下但毫无余量,
+    /// 一个占资源的标签页就能把它推过线 —— 听上去就是断续。8 线程 0.534x。
+    ///
+    /// 也不该无限放开:这跑在用户正在用的浏览器里,而 8 往上收益已经很小
+    /// (8→16 只从 0.534 到 0.459)。
     #[test]
     fn default_threads_stays_in_the_useful_range() {
         let t = default_threads();
-        assert!((1..=4).contains(&t), "got {t}");
+        assert!((1..=8).contains(&t), "got {t}");
+        // 机器给得起就该用得上 —— 上一版在 36 核的机器上也只取 4。
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(t, cores.min(8), "{cores} 核的机器只用了 {t} 线程");
     }
 
     #[cfg(feature = "ort-load-dynamic")]
