@@ -6466,7 +6466,7 @@ async fn handle_chat_message_streaming(
 
     // 用户对 GPU 的表态,在引擎建起来之前告诉后端选择那一层。放在这里是因为
     // 探测发生在第一次真的要说话的时刻,而那就在下面几行。
-    crate::tts::backend::set_gpu_allowed(crate::tts::moss::gpu_preference(&services.database));
+    crate::tts::moss::apply_gpu_preference(&services.database);
 
     // Create agent with host functions
     let agent = Agent::new(host);

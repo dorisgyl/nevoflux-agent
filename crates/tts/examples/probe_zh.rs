@@ -29,12 +29,17 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(model::default_threads);
 
+    // 后端。默认 CPU —— 不带参数的调用还是在量老问题。给 cuda/directml 才是
+    // 在问新问题:GPU 上这个模型到底快不快。那个答案不该靠推理。
+    let ep = args.next().and_then(|s| Ep::parse(&s)).unwrap_or(Ep::Cpu);
+
     println!("模型: {}", model.display());
     println!("音色: {} / {voice}", voices.display());
-    println!("线程: {threads}\n");
+    println!("线程: {threads}");
+    println!("后端: {ep}\n");
 
     let t0 = Instant::now();
-    let synth = Synthesizer::new(&model, &voices, threads, Ep::Cpu).expect("合成器建不起来");
+    let synth = Synthesizer::new(&model, &voices, threads, ep).expect("合成器建不起来");
     println!("加载: {:.1}s", t0.elapsed().as_secs_f32());
     println!("音色数: {}\n", synth.voices().len());
 
