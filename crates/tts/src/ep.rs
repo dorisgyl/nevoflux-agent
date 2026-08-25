@@ -25,13 +25,18 @@ use std::fmt;
 
 /// 一个执行提供者。
 ///
-/// 只列真正接了线的三个。加一个新的(CoreML、ROCm)是加一个 variant 加一条
-/// 注册分支,不需要动选择逻辑 —— 那正是这一层存在的意义。
+/// 只列真正接了线的。加一个新的(ROCm、OpenVINO)是加一个 variant 加一条注册
+/// 分支,不需要动选择逻辑 —— 那正是这一层存在的意义,CoreML 就是这么加进来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ep {
     Cpu,
     DirectMl,
     Cuda,
+    /// Apple 的 CoreML。GPU 和神经引擎都归它调度。
+    ///
+    /// 与另外两个 GPU 后端不同,它不需要换运行时:官方的 macOS 包里就编着,
+    /// 所以在 mac 上开启它是零体积代价的。
+    CoreMl,
 }
 
 impl Ep {
@@ -40,6 +45,7 @@ impl Ep {
             Ep::Cpu => "cpu",
             Ep::DirectMl => "directml",
             Ep::Cuda => "cuda",
+            Ep::CoreMl => "coreml",
         }
     }
 
@@ -49,6 +55,7 @@ impl Ep {
             "cpu" => Some(Ep::Cpu),
             "directml" | "dml" => Some(Ep::DirectMl),
             "cuda" => Some(Ep::Cuda),
+            "coreml" | "ane" => Some(Ep::CoreMl),
             _ => None,
         }
     }
@@ -182,6 +189,13 @@ pub fn has_nvidia(devices: &[DeviceInfo]) -> bool {
 /// 一个候选,而它**永远不该让某个后端连试的机会都没有**。
 pub fn order(has_nvidia: bool) -> Vec<Ep> {
     // CPU 恒在最后:它是地板,不是竞争者。
+    //
+    // macOS 上只排 CoreML:那台机器上另外两个都不存在(DirectML 是 Windows 的,
+    // CUDA 在 Apple Silicon 上没有),排上去只会让每次探测多两条注定失败的
+    // 记录 —— 而那些记录会一路报到界面上,读起来像出了问题。
+    if cfg!(target_os = "macos") {
+        return vec![Ep::CoreMl, Ep::Cpu];
+    }
     if has_nvidia {
         vec![Ep::Cuda, Ep::DirectMl, Ep::Cpu]
     } else {
@@ -250,6 +264,22 @@ mod tests {
         assert_eq!(tried, vec![Ep::Cuda], "达标之后不该再加载别的后端");
     }
 
+    /// mac 上不该去试 DirectML 和 CUDA —— 那两个在那台机器上根本不存在。
+    ///
+    /// 不是为了省时间(门会挡下它们),是为了别在界面上留两条注定失败的记录:
+    /// 「directml: 不可用」出现在一台 Mac 的语音说明里,读起来像出了故障。
+    #[test]
+    fn a_mac_is_only_offered_what_a_mac_has() {
+        let want = if cfg!(target_os = "macos") {
+            vec![Ep::CoreMl, Ep::Cpu]
+        } else {
+            vec![Ep::Cuda, Ep::DirectMl, Ep::Cpu]
+        };
+        assert_eq!(order(true), want);
+        // CPU 恒在最后,平台无关。
+        assert_eq!(order(false).last(), Some(&Ep::Cpu));
+    }
+
     /// 建不出来的候选要留下**原因**。「没用上 GPU」和「用上了没变快」是两件事。
     #[test]
     fn an_unavailable_candidate_records_why_and_moves_on() {
@@ -277,6 +307,7 @@ mod tests {
             Ep::Cuda => Ok(2.4),
             Ep::DirectMl => Ok(1.1),
             Ep::Cpu => Ok(1.6),
+            Ep::CoreMl => unreachable!("不在候选里"),
         })
         .unwrap();
         assert_eq!(sel.ep, Ep::DirectMl);
@@ -289,7 +320,7 @@ mod tests {
         let sel = choose(&[Ep::DirectMl, Ep::Cpu], 0.85, |ep| match ep {
             Ep::DirectMl => Ok(3.0),
             Ep::Cpu => Ok(1.5),
-            Ep::Cuda => unreachable!("不在候选里"),
+            Ep::Cuda | Ep::CoreMl => unreachable!("不在候选里"),
         })
         .unwrap();
         assert_eq!(sel.ep, Ep::Cpu);

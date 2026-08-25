@@ -15,6 +15,13 @@ env:
   # with EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs and `ort_version`
   # in the justfile (fastembed 5 -> ort rc.12 -> ONNX Runtime 1.24.x).
   ORT_VERSION: "1.24.2"
+  # DirectML redistributable, for the Windows GPU path. Not a free choice:
+  # `Microsoft.ML.OnnxRuntime.DirectML` 1.24.2 declares a dependency on exactly
+  # this version, and the copy Windows ships in System32 is whatever that
+  # Windows build shipped with — which on an older machine is older than the
+  # runtime was compiled against. Bump it when the ORT package's dependency
+  # says to, not on its own schedule.
+  DML_VERSION: "1.15.4"
 
 jobs:
   # Download embedding model once, share across all platform builds
@@ -253,13 +260,48 @@ jobs:
         if: runner.os == 'Windows' && matrix.no_embedding != true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $v = $env:ORT_VERSION
-          $pkg = "onnxruntime-win-x64-$v"
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$v/$pkg.zip"
-          Invoke-WebRequest -Uri $url -OutFile ort.zip
-          Expand-Archive -Path ort.zip -DestinationPath ort_extract -Force
+          $d = $env:DML_VERSION
           New-Item -ItemType Directory -Force -Path staging/lib | Out-Null
-          Copy-Item "ort_extract/$pkg/lib/onnxruntime.dll" "staging/lib/onnxruntime.dll"
+
+          # The DirectML build, from NuGet, rather than the GitHub release zip.
+          #
+          # That zip is CPU-only, and it is the reason every GPU probe failed:
+          # the daemon asked for DirectML and ONNX Runtime answered "Specified
+          # provider is not supported", because the runtime beside it had no
+          # such provider. Shipping the CPU runtime made the whole execution
+          # provider path unreachable no matter what the binary supported.
+          #
+          # DirectML rather than the CUDA zip: it runs on any DX12 adapter —
+          # NVIDIA, AMD, Intel — with no CUDA toolkit to install and no driver
+          # version to match, and it costs 16.5 MB against the CUDA package's
+          # 268. A browser cannot ask its users to install a toolkit.
+          #
+          # A machine with no usable GPU is unaffected: this runtime still
+          # carries the CPU provider, DirectML simply refuses to register, and
+          # `nevoflux_tts::ep` records that and measures the CPU instead.
+          $ortUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/$v/microsoft.ml.onnxruntime.directml.$v.nupkg"
+          Invoke-WebRequest -Uri $ortUrl -OutFile ort.zip
+          Expand-Archive -Path ort.zip -DestinationPath ort_extract -Force
+          Copy-Item "ort_extract/runtimes/win-x64/native/onnxruntime.dll" "staging/lib/onnxruntime.dll"
+          Copy-Item "ort_extract/runtimes/win-x64/native/onnxruntime_providers_shared.dll" "staging/lib/"
+
+          # DirectML.dll itself. See DML_VERSION above for why it is carried
+          # rather than left to whatever System32 holds.
+          $dmlUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/$d/microsoft.ai.directml.$d.nupkg"
+          Invoke-WebRequest -Uri $dmlUrl -OutFile dml.zip
+          Expand-Archive -Path dml.zip -DestinationPath dml_extract -Force
+          Copy-Item "dml_extract/bin/x64-win/DirectML.dll" "staging/lib/DirectML.dll"
+
+          # Loud, because being wrong here is silent: a missing DirectML.dll
+          # or a CPU-only runtime both end as "speech is slow", never as an
+          # error anyone sees.
+          foreach ($f in @("onnxruntime.dll", "DirectML.dll")) {
+            if (-not (Test-Path "staging/lib/$f")) {
+              Write-Error "staging/lib/$f missing — the GPU path would silently be unavailable"
+            }
+          }
           Get-ChildItem staging/lib
 
       # Package: binary + embedding model + (load-dynamic) ONNX Runtime lib
