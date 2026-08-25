@@ -103,10 +103,21 @@ wasmtime = "27"
 wasmtime-wasi = "27"
 
 [features]
-default = ["embedding", "ort-load-dynamic", "tts-local", "asr-sensevoice", "asr-whisper"]
+default = ["embedding", "ort-load-dynamic", "tts-local", "tts-gpu", "asr-sensevoice", "asr-whisper"]
 embedding = ["nevoflux-daemon/embedding"]
 # Local Kokoro speech, forwarded to nevoflux-daemon.
 tts-local = ["nevoflux-daemon/tts-local"]
+# GPU execution providers for speech, forwarded to nevoflux-daemon.
+#
+# This forwarding is why they work at all. `nevoflux-daemon` is depended on
+# with `default-features = false`, so its own default list is inert here and
+# every feature it should have has to be named again in this file. `tts-gpu`
+# was not, for as long as it has existed: the daemon probed for DirectML and
+# CUDA at startup, and the binary answered "built without the ort-directml
+# feature" every time, because it was. No release has ever shipped able to use
+# a GPU. Adding a feature to a crate's own defaults does nothing until it is
+# listed here too.
+tts-gpu = ["nevoflux-daemon/tts-gpu"]
 # Peer-to-peer transport for remote sessions, forwarded to nevoflux-daemon.
 # Off by default: str0m pulls ~100 crates and the path is not proven on real
 # networks yet. Without it every range takes the relay, as it does today.
