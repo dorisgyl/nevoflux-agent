@@ -98,6 +98,26 @@ impl Vocab {
         tokenize_with(&self.table, phonemes)
     }
 
+    /// 这张表不认识的音素,去重后按出现顺序给出。
+    ///
+    /// 丢弃本身是对的(见 [`tokenize`]),但**丢光了**是另一回事:那说明模型和
+    /// 文本根本不是一套。这个方法存在的唯一理由,是让那句话能被说出来 ——
+    /// 「你的词表里没有 ㄋ ㄧ ㄏ」远比半秒钟的空白有用。
+    ///
+    /// `limit` 是取样上限:诊断信息要能读,不是要完整。
+    pub fn unknown_chars(&self, phonemes: &str, limit: usize) -> Vec<char> {
+        let mut out: Vec<char> = Vec::new();
+        for c in phonemes.chars() {
+            if out.len() >= limit {
+                break;
+            }
+            if !self.table.contains_key(&c) && !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.table.len()
     }
@@ -133,5 +153,35 @@ mod tests {
     fn unknown_chars_are_dropped() {
         // A character outside the table must not shift every id after it.
         assert_eq!(tokenize("a\u{1F600}b"), tokenize("ab"));
+    }
+
+    /// 丢弃是对的,**丢光**要说得出是哪些符号。
+    ///
+    /// 这就是「中文没声音」那两轮排查缺的那句话:内置表(v1.0)里没有注音符号,
+    /// 于是整句中文的每一个音素都落空 —— 而 [`tokenize`] 两端各补一个 0,拿到的
+    /// 是 `[0, 0]` 而不是空表,所以「有没有内容」不能用 is_empty 判。
+    #[test]
+    fn the_builtin_table_reports_what_it_cannot_read() {
+        let v = Vocab::builtin();
+        let bopomofo = "ㄋㄧ2ㄏㄠ3";
+        let unknown = v.unknown_chars(bopomofo, 8);
+        assert!(unknown.contains(&'ㄋ'), "{unknown:?}");
+        assert!(unknown.contains(&'ㄏ'), "{unknown:?}");
+        // 丢光之后只剩两个填充,而不是空 —— 判据是长度,不是 is_empty。
+        assert_eq!(v.tokenize(bopomofo).len(), 2);
+    }
+
+    #[test]
+    fn a_table_that_understands_everything_reports_nothing() {
+        let v = Vocab::builtin();
+        assert!(v.unknown_chars("həlˈoʊ", 8).is_empty());
+    }
+
+    /// 取样要去重、要有上限 —— 诊断信息是给人读的。
+    #[test]
+    fn the_unknown_sample_is_deduped_and_bounded() {
+        let v = Vocab::builtin();
+        assert_eq!(v.unknown_chars("ㄋㄋㄋㄋ", 8), vec!['ㄋ']);
+        assert_eq!(v.unknown_chars("ㄅㄆㄇㄈㄉㄊㄋㄌㄍㄎ", 3).len(), 3);
     }
 }

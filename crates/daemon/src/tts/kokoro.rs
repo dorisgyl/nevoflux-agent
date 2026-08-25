@@ -511,6 +511,10 @@ fn map_err(e: nevoflux_tts::TtsError) -> TtsError {
     use nevoflux_tts::TtsError as E;
     match e {
         E::ModelNotFound(m) => TtsError::ConfigMissing(m),
+        // 缺的是**模型**,不是请求写错了,更不是内部故障。这条要落在
+        // ConfigMissing 上:装上中文那档就好了,而 "internal error" 只会
+        // 让人以为程序坏了 —— 这次就是这么误导过一轮的。
+        E::VocabMismatch(m) => TtsError::ConfigMissing(m),
         E::UnsupportedVoice(m) | E::TextTooLong(m) => TtsError::InvalidRequest(m),
         E::ModelCorrupt(m) | E::InferenceFailed(m) => TtsError::Internal(m),
     }
