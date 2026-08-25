@@ -624,6 +624,21 @@ pub fn gpu_preference(db: &nevoflux_storage::Database) -> Option<bool> {
     setting(db, "speechUseGpu").and_then(|v| v.as_bool())
 }
 
+/// 把用户的 GPU 选择告诉后端选择那一层。
+///
+/// 存在的理由是 `tts::backend` 本身带 `tts-local` 门控,而调用它的地方(server
+/// 的回合入口)不带 —— 直接调会让 `--no-default-features` 的构建编不过,而那
+/// 条腿只在 CI 上跑,本地测试一次也碰不到。这里用仓库里既有的写法把门控收进来:
+/// 没有本地引擎时它就没什么可通知的。
+#[cfg(feature = "tts-local")]
+pub fn apply_gpu_preference(db: &nevoflux_storage::Database) {
+    crate::tts::backend::set_gpu_allowed(gpu_preference(db));
+}
+
+/// 没有本地引擎,也就没有后端可选。
+#[cfg(not(feature = "tts-local"))]
+pub fn apply_gpu_preference(_db: &nevoflux_storage::Database) {}
+
 /// 要不要把回答念出来。**默认不念。**
 ///
 /// 从前这件事和麦克风绑在一起:开了语音输入,每一条回答就都会被读出来,没有
