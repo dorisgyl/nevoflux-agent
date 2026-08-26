@@ -41,6 +41,12 @@ pub struct ChunkInfo {
 
 pub struct Synthesizer {
     session: Mutex<Session>,
+    /// 这个合成器**真正**跑在哪个后端上。
+    ///
+    /// 不能靠问 `backend::chosen_ep()` —— 那是探测阶段的结论,而这个合成器可能
+    /// 是在探测之后因为 GPU 跑不动而在 CPU 上重建的。问错了地方,日志就会说
+    /// 「ep=directml」而实际在 CPU 上跑:一次真实的误导,而且是它自己造的。
+    ep: crate::ep::Ep,
     /// 这份模型的音素表。
     ///
     /// 与模型配套,和音色一样 —— 用错了不报错,只出杂音。
@@ -179,6 +185,7 @@ impl Synthesizer {
         };
         Ok(Synthesizer {
             session: Mutex::new(session),
+            ep,
             vocab,
             audio_output,
             token_input,
@@ -186,6 +193,15 @@ impl Synthesizer {
             english: EnglishG2p::new(),
             chinese: ChineseG2p::new(),
         })
+    }
+
+    /// 这个合成器真正跑在哪个后端上。
+    ///
+    /// 存在的理由是一次自造的误导:日志报的是 `backend::chosen_ep()`,而那是
+    /// **探测**选中的后端;GPU 跑不动被换到 CPU 重建之后,那个值仍是旧的,于是
+    /// 每一句 CPU 合成都被记成 `ep=directml`。问合成器自己,它不会记错。
+    pub fn ep(&self) -> crate::ep::Ep {
+        self.ep
     }
 
     pub fn voices(&self) -> Vec<&str> {
