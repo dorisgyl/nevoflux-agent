@@ -79,9 +79,22 @@ impl SpeechSynth for nevoflux_tts::moss::MossEngine {
 #[cfg(feature = "tts-local")]
 impl SpeechSynth for nevoflux_tts::Synthesizer {
     fn speak(&self, text: &str, voice: Option<&str>) -> Result<(Vec<f32>, u32), DaemonError> {
+        let started = std::time::Instant::now();
         let audio = self
             .synthesize(text, voice, 1.0)
             .map_err(|e| DaemonError::InternalError(format!("tts: {e}")))?;
+        // 量它,而且要单独量。
+        //
+        // 以前只有 MOSS 被计时,理由是那个数字只用来决定「MOSS 是否太慢」。代价
+        // 是:回落到 Kokoro 之后,**没有任何人知道它跑多快** —— 用户说「不流畅」,
+        // 我说「本机实测 0.534x 应该够快」,两边都在描述感受,而那台机器上真实
+        // 的数字谁也没有。
+        //
+        // 存进另一个格子而不是 MOSS 那个:两个引擎的速度差一个数量级,混在一起
+        // 会让 MOSS 的预算判断读到一个不属于它的中位数,把一个太慢的引擎重新
+        // 放进来。
+        let seconds = audio.pcm.len() as f64 / audio.sample_rate.max(1) as f64;
+        crate::tts::kokoro::record_rtf(started.elapsed(), seconds, self.ep());
         Ok((audio.pcm, audio.sample_rate))
     }
 }
@@ -180,6 +193,23 @@ impl VoiceTurn {
                 self.seq += 1;
             }
             Err(e) => {
+                // 后端本身坏了的时候,「一句失败不该让整轮哑掉」这份宽容就变成
+                // 了全程静默:每一句都失败,每一句都被容忍,用户什么都听不到。
+                //
+                // 真实经过:DirectML 通过了探测、赢了裁判,然后每句话都在
+                // `ConvTranspose` 上报 80070057。日志里一句一条错误,声音一个
+                // 字都没有,而唯一的出路是有人去读日志、再去设置页关掉 GPU。
+                //
+                // 所以在这里认账:非 CPU 的后端一旦真的合成失败,就把它降级。
+                // 引擎是进程级缓存的,这一轮救不回来,但下一轮会落到 CPU 上,
+                // 不需要任何人做任何事。
+                #[cfg(feature = "tts-local")]
+                {
+                    let ep = crate::tts::backend::chosen_ep();
+                    if ep != nevoflux_tts::ep::Ep::Cpu {
+                        crate::tts::backend::demote(ep, e.to_string());
+                    }
+                }
                 // 一句失败不该让整轮哑掉 —— 后面的句子还有机会。但要说出来,
                 // 静默跳过会表现为「它漏了一句」而没有任何线索。
                 tracing::warn!(target: "speech", error = %e, "sentence synthesis failed");

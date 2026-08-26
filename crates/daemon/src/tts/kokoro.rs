@@ -216,6 +216,41 @@ fn estimate_seconds(chars: usize) -> f32 {
 /// loads 92 MB, and whether that is worth waiting for depends on whether
 /// anybody is waiting.
 #[cfg(feature = "tts-local")]
+/// 建一个,并且证明它真的算得出来。
+///
+/// 「建得出 session」证明不了「跑得动这张图」:DirectML 两样都能过,直到遇上
+/// 一个它不接受的算子参数 —— 而那发生在用户说第一句话的时候,不是在这里。
+///
+/// 两种长度,因为一种不够:DirectML 对动态输入尺寸支持不好,一句固定短句只走出
+/// 一种形状,过了不说明别的形状也过。这正是上一版漏掉这个 bug 的原因。
+///
+/// 只有非 CPU 后端才付这个代价。CPU 上跳过 —— 它是地板,验它等于给每一次
+/// Kokoro 加载凭空加两次合成。
+#[cfg(feature = "tts-local")]
+fn build_verified(
+    model_path: &std::path::Path,
+    voices_path: &std::path::Path,
+    threads: usize,
+    ep: nevoflux_tts::ep::Ep,
+) -> Result<nevoflux_tts::Synthesizer, nevoflux_tts::TtsError> {
+    let synth = nevoflux_tts::Synthesizer::new(model_path, voices_path, threads, ep)?;
+    if ep == nevoflux_tts::ep::Ep::Cpu {
+        return Ok(synth);
+    }
+    for probe in [
+        "你好。",
+        "这一句刻意长一些，用来确认换一种输入长度之后它仍然算得出来。",
+    ] {
+        let audio = synth.synthesize(probe, None, 1.0)?;
+        if audio.pcm.is_empty() {
+            return Err(nevoflux_tts::TtsError::InferenceFailed(
+                "合成出来是空的".into(),
+            ));
+        }
+    }
+    Ok(synth)
+}
+
 fn synthesizer(
     model_path: &std::path::Path,
     voices_path: &std::path::Path,
@@ -232,22 +267,87 @@ fn synthesizer(
         threads,
         "loading Kokoro; first call pays the model load, later ones do not"
     );
-    let built =
-        // 用探测选出来的那个后端。Kokoro 不自己探:同一台机器同一个运行时,
-        // 两个引擎各得一个结论只会让「到底用没用 GPU」更难回答。探测还没跑过
-        // 时是 CPU —— 那正是这条回落路径的常态(MOSS 缺失或太慢)。
-        nevoflux_tts::Synthesizer::new(
-            model_path,
-            voices_path,
-            threads,
-            crate::tts::backend::chosen_ep(),
-        )
-        .map_err(map_err)?;
+    // 探测选出来的那个后端 —— 但那是**拿 MOSS 量出来的**,而这里要跑的是
+    // Kokoro。
+    //
+    // 原来的注释写着「探测还没跑过时是 CPU,那正是这条回落路径的常态」,而那
+    // 个假设是错的,代价是一次真实故障:MOSS 装着但太慢(1.18x 超预算)时,
+    // 探测**跑过了**并选中 DirectML,MOSS 随后被弃用,Kokoro 继承了一个为另
+    // 一个模型选的后端 —— 然后每一句都在 `ConvTranspose` 上报 80070057,用户
+    // 全程无声。
+    //
+    // 所以拿到之后要自己验一遍。一个模型能在某后端上跑,不能替另一个模型作证。
+    let ep = crate::tts::backend::chosen_ep();
+    let built = match build_verified(model_path, voices_path, threads, ep) {
+        Ok(s) => s,
+        // GPU 没通过验证:记下原因,落回 CPU 重建。CPU 是地板,它没通过就是
+        // 真的没救了,该照实报错。
+        Err(e) if ep != nevoflux_tts::ep::Ep::Cpu => {
+            crate::tts::backend::demote(ep, e.to_string());
+            tracing::warn!(
+                target: "speech",
+                %ep, error = %e,
+                "Kokoro cannot run on the probed backend; rebuilding on the CPU"
+            );
+            nevoflux_tts::Synthesizer::new(
+                model_path,
+                voices_path,
+                threads,
+                nevoflux_tts::ep::Ep::Cpu,
+            )
+            .map_err(map_err)?
+        }
+        Err(e) => return Err(map_err(e)),
+    };
     let arc = Arc::new(built);
     // A concurrent first call may have won the race; either Arc is equally
     // usable, so take whichever landed.
     let _ = SYNTH.set(arc.clone());
     Ok(SYNTH.get().cloned().unwrap_or(arc))
+}
+
+/// Kokoro 的实测速度,与 MOSS 的分开存。
+///
+/// 分开不是洁癖:两个引擎差一个数量级,混在一起会让 MOSS 的预算判断读到一个
+/// 不属于它的中位数,于是一个太慢的引擎被重新放行。
+///
+/// 中位数而不是最近一次,理由和 MOSS 那边一样:一次赶上系统忙碌的测量不该成为
+/// 定论。
+static KOKORO_SAMPLES: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+
+/// 记一次真实合成的耗时。
+#[cfg(feature = "tts-local")]
+pub fn record_rtf(elapsed: std::time::Duration, audio_seconds: f64, ep: nevoflux_tts::ep::Ep) {
+    // 太短的一句由固定开销主导,说明不了持续吞吐。
+    if audio_seconds < 0.5 {
+        return;
+    }
+    let rtf = (elapsed.as_secs_f64() / audio_seconds) as f32;
+    if let Ok(mut s) = KOKORO_SAMPLES.lock() {
+        s.push(rtf);
+        let len = s.len();
+        if len > 5 {
+            s.drain(..len - 5);
+        }
+        // 说出来。这个数字以前只存在于「听起来卡不卡」里,而那个说法既传不到
+        // 日志里,也没法比较。RTF 小于 1 才是比实时快。
+        tracing::info!(
+            target: "speech",
+            rtf = format_args!("{rtf:.2}"),
+            median = format_args!("{:.2}", crate::tts::moss::median(&s).unwrap_or(rtf)),
+            audio_s = format_args!("{audio_seconds:.1}"),
+            // 合成器自己报的,不是探测阶段的结论 —— GPU 跑不动被换到 CPU
+            // 重建之后,那两个值会分叉,而分叉时说谎的是后者。
+            ep = %ep,
+            "kokoro spoke a sentence"
+        );
+    }
+}
+
+/// 这台机器上 Kokoro 的实测速度。没说过话时是 `None`。
+pub fn measured_rtf() -> Option<f32> {
+    let s = KOKORO_SAMPLES.lock().ok()?;
+    crate::tts::moss::median(&s)
 }
 
 /// Hand one finished part to whoever is listening.

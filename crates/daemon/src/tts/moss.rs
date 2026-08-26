@@ -134,6 +134,29 @@ fn publish_verdict(samples: &[f32]) {
 }
 
 /// Record what a synthesis cost. `audio_seconds` of speech took `elapsed`.
+/// 记下一个已经算好的 RTF。
+///
+/// 给探测用。探测本来就是**跑一次真合成再量**,和一句真实的话没有区别 —— 而在
+/// 这之前那个数被丢掉了:`backend::record` 只记住了赢家是谁,把它跑多快扔了。
+///
+/// 代价是一次真实故障。探测量出 MOSS 在 DirectML 上是 1.43x(预算 0.85),然后
+/// 因为 `measured_rtf()` 还是空的,预算那道判断被跳过,MOSS 照常上场,以追不上
+/// 播放的速度说话 —— 要等真实句子攒够了才会在后面某一轮才回落。探测已经把活干
+/// 完了,结论却没交给做决定的那个人。
+pub fn record_rtf_value(rtf: f32) {
+    if !rtf.is_finite() || rtf <= 0.0 {
+        return;
+    }
+    if let Ok(mut s) = SAMPLES.lock() {
+        s.push(rtf);
+        let len = s.len();
+        if len > RECENT {
+            s.drain(..len - RECENT);
+        }
+        publish_verdict(&s);
+    }
+}
+
 pub fn record_rtf(elapsed: std::time::Duration, audio_seconds: f64) {
     // A run this short is dominated by fixed costs and says nothing about
     // sustained throughput.
@@ -290,6 +313,9 @@ mod local {
                 // 启动时:启动不该为一个多数会话用不到的功能付几秒。
                 let probed = crate::tts::backend::probe(&dir, threads, setting, budget);
                 crate::tts::backend::record(&probed.selection);
+                // 探测量到的速度就是这台机器上 MOSS 的速度,交给预算那道判断 ——
+                // 它读的是 `measured_rtf()`,而在这之前那里是空的。
+                record_rtf_value(probed.selection.rtf);
                 // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
                 // 而后者建出来的会带着真正的错误失败。
                 let loaded = match probed.engine {
@@ -352,10 +378,33 @@ pub fn conversation_voice(
         crate::tts::backend::Setting::resolve(cfg.speech.execution_provider.as_deref()),
         budget,
     ) {
-        Ok(e) => Ok((
-            e as Arc<dyn crate::speech::voice_out::SpeechSynth>,
-            Choice::primary(),
-        )),
+        Ok(e) => {
+            // 再问一次预算。
+            //
+            // 上面那次问的时候 `measured_rtf()` 还是空的 —— 这台机器还没被量过。
+            // 而 `engine()` 里的探测**刚刚量完**,结论就在手上:1.43x 对 0.85 的
+            // 预算。不在这里用掉它,就要等下一轮才回落,而这一轮的每一句话都会
+            // 以追不上播放的速度说出来。
+            //
+            // 加载的代价已经付了,收不回来 —— 探测本来就要加载才能量。能收回来
+            // 的是这一轮的声音。
+            if let Some(rtf) = measured_rtf() {
+                if budget > 0.0 && rtf > budget {
+                    let k = kokoro()?;
+                    return Ok((
+                        k,
+                        Choice::fallback(format!(
+                            "MOSS runs at {rtf:.2}x real time on this machine, \
+                             over the {budget:.2} budget"
+                        )),
+                    ));
+                }
+            }
+            Ok((
+                e as Arc<dyn crate::speech::voice_out::SpeechSynth>,
+                Choice::primary(),
+            ))
+        }
         Err(e) => {
             // Name what failed. "Falling back" with no reason is how a
             // 717 MB download nobody notices is missing gets shipped.
@@ -533,6 +582,31 @@ mod tests {
         // machine that has never run it.
         MEASURED_RTF.store(0, Ordering::Relaxed);
         assert_eq!(measured_rtf(), None);
+    }
+
+    /// 探测量出来的速度要能被预算看见。
+    ///
+    /// 回归一次真实故障:探测量出 MOSS 在 DirectML 上 1.43x(预算 0.85),
+    /// `backend::record` 只记住了「赢家是 directml」就把 1.43 扔了,于是
+    /// `measured_rtf()` 仍是空的、预算那道判断被跳过、MOSS 以追不上播放的速度
+    /// 上场 —— 要等真实句子攒够才会在后面某一轮才回落。
+    ///
+    /// 探测本来就是跑一次真合成再量,它和一句真实的话没有区别,没有理由不算数。
+    #[test]
+    fn a_probe_measurement_counts_the_same_as_a_real_one() {
+        let _guard = exclusive();
+        clear_measurements();
+        assert_eq!(measured_rtf(), None, "前提:还没量过");
+
+        record_rtf_value(1.43);
+        assert_eq!(measured_rtf(), Some(1.43), "探测的结论没进来");
+
+        // 荒唐的值不该污染判断 —— 量不出来时给的是 NaN。
+        clear_measurements();
+        record_rtf_value(f32::NAN);
+        record_rtf_value(0.0);
+        record_rtf_value(-1.0);
+        assert_eq!(measured_rtf(), None, "无效的测量被当真了");
     }
 
     #[test]

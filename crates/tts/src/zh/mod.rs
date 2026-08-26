@@ -18,6 +18,7 @@
 
 #[cfg(test)]
 mod golden;
+pub mod number;
 pub mod sandhi;
 pub mod syllable;
 
@@ -178,7 +179,13 @@ fn phonemize_han(text: &str) -> String {
 /// `en_callable` 时的行为一致,而且**是有意让它显形**:英文被静默丢掉的话,
 /// 「CUDA 慢两倍」会被念成「慢两倍」,意思正好反过来。
 pub fn phonemize(text: &str, english: Option<&dyn Fn(&str) -> String>) -> String {
-    let text = map_punctuation(text);
+    // 数字先变成汉字,再交给下面的切分。
+    //
+    // 顺序不能反:数字既不是汉字也不是拉丁字母,`phonemize_han` 会把它原样带过,
+    // 而词表里 `0`-`9` 是声调标记而不是可读字符 —— 于是它们在编码那一步无声地
+    // 消失。「RTF 是 0.51x」会丢掉那个 `0`。
+    let text = number::normalize(text);
+    let text = map_punctuation(&text);
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut buf_is_latin = false;
