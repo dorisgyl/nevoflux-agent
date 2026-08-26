@@ -251,6 +251,7 @@ fn build_verified(
     Ok(synth)
 }
 
+#[cfg(feature = "tts-local")]
 fn synthesizer(
     model_path: &std::path::Path,
     voices_path: &std::path::Path,
