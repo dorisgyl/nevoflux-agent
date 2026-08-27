@@ -6489,6 +6489,24 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
+    // 要被念出来的回答,得写成能听懂的样子。
+    //
+    // 朗读过滤器会**整段跳过代码块**(见 `Speakable`),还会把表格压成顿号分隔、
+    // 把 markdown 记号去掉。所以一个「先给代码、再解释」的回答,听起来是从半句
+    // 跳到另外半句 —— 用户的原话是「语义跳跃」。
+    //
+    // 提示挂在用户消息上,和 `[Active Canvas]` 走同一条路:它随回合来去,不进
+    // 系统提示词,所以关掉开关之后不会有残留。
+    let effective_message = if voice_on {
+        format!(
+            "[这条回答会被读出来。请写成**听得懂**的样子:先用完整的句子把结论             说清楚,再展开;别让代码块、表格或列表承担意思(它们不会被念出来);             需要给代码时,先用一句话说明它做什么。]
+
+{effective_message}"
+        )
+    } else {
+        effective_message
+    };
+
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
