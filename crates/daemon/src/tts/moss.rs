@@ -215,6 +215,32 @@ pub fn reset_rtf() -> Result<(), String> {
     c.save().map_err(|e| e.to_string())
 }
 
+/// 立刻把测量写进 `config.toml`,不等这一轮说完。
+///
+/// [`persist_measurement`] 挂在一轮结束之后,而探测发生在**第一句话之前** ——
+/// 中间隔着几十秒的加载与合成。那段时间里崩一次,测量就丢了,下次启动只好从头
+/// 再探测一次,然后再崩一次。用户看到的是「等很久、崩两次、要重启浏览器」。
+///
+/// 探测本身就是这台机器的答案,拿到就该记下来。记下来之后,即使后面崩了,下次
+/// 启动也会在预算那道判断上直接短路,根本不再探测。
+///
+/// 自己从磁盘读写,不走那个共享句柄:这里在引擎构造的深处,拿不到它,而要落盘
+/// 的是文件。
+fn persist_now() {
+    let Some(now) = measured_rtf() else { return };
+    let Ok(mut c) = AgentConfig::load() else { return };
+    c.speech.measured_rtf = Some(now);
+    c.speech.recent_rtf = recent_samples();
+    match c.save() {
+        Ok(()) => {
+            LAST_PERSISTED.store((now * 1000.0).round() as u32, Ordering::Relaxed);
+            tracing::info!(target: "speech", rtf = now, "probe result written down");
+        }
+        // 记不下来不致命:这个进程仍然用得上它,只是活不过重启。
+        Err(e) => tracing::warn!(target: "speech", error = %e, "could not persist probe result"),
+    }
+}
+
 /// Write the measurement back to `config.toml`, if it has moved.
 ///
 /// Persisted so a machine does not have to re-learn on every restart that it
@@ -316,6 +342,9 @@ mod local {
                 // 探测量到的速度就是这台机器上 MOSS 的速度,交给预算那道判断 ——
                 // 它读的是 `measured_rtf()`,而在这之前那里是空的。
                 record_rtf_value(probed.selection.rtf);
+                // 立刻落盘。等这一轮说完再写,中间崩一次就要重探一次 —— 而
+                // 探测正是最容易崩的那一段。
+                persist_now();
                 // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
                 // 而后者建出来的会带着真正的错误失败。
                 let loaded = match probed.engine {

@@ -2357,6 +2357,9 @@ pub async fn start_server(
     // A machine already judged too slow for MOSS should not have to prove it
     // again on the user's first reply of the session.
     crate::tts::moss::prime_rtf(&process_config.read().unwrap().clone());
+    // 上次崩在哪个后端上,这次就别再去了。
+    #[cfg(feature = "tts-local")]
+    crate::tts::backend::prime_demotion(&process_config.read().unwrap().clone());
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
     let process_available_browsers = available_browsers.clone();

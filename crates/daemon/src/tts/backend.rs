@@ -83,6 +83,35 @@ mod gpu_choice_tests {
         set_gpu_allowed(None);
     }
 
+    /// 上次记下的失败要能在启动时读回来。
+    ///
+    /// 回归的是一次堆损坏:DirectML 的失败路径把堆写坏,agent 以 0xC0000374
+    /// 崩掉。进程内的降级救不了下一次启动 —— 那时它会从头再试一遍同一个后端,
+    /// 再崩一次。用户看到的是「崩了两次,要重启浏览器」。
+    #[test]
+    fn a_backend_that_crashed_before_is_not_tried_again_after_a_restart() {
+        let _g = exclusive();
+        clear_demotion();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.speech.failed_providers = vec!["directml".into()];
+
+        prime_demotion(&cfg);
+        assert_eq!(demoted().map(|(ep, _)| ep), Some(Ep::DirectMl));
+        // 读回来之后,选择那一层就该躲开它。
+        assert_eq!(Setting::resolve(Some("directml")), Setting::Pinned(Ep::Cpu));
+
+        clear_demotion();
+    }
+
+    /// 空的记录不该凭空造出一个降级。
+    #[test]
+    fn nothing_recorded_means_nothing_demoted() {
+        let _g = exclusive();
+        clear_demotion();
+        prime_demotion(&crate::config::AgentConfig::default());
+        assert!(demoted().is_none());
+    }
+
     /// CPU 是地板,降级它没有意义 —— 没有地方可退。
     #[test]
     fn the_cpu_is_never_demoted() {
@@ -163,7 +192,57 @@ pub fn demote(ep: Ep, why: impl Into<String>) {
             %ep, why = %why,
             "backend failed on real input; falling back to the CPU from here on"
         );
-        *slot = Some((ep, why));
+        *slot = Some((ep, why.clone()));
+        drop(slot);
+        // 写下来,不只是记在进程里。
+        //
+        // 这条路的失败不总是温和的:DirectML 在 Kokoro 的 `ConvTranspose` 上
+        // 抛 80070057 之后,它的清理把堆写坏了,agent 以 0xC0000374 崩掉。进程
+        // 内的降级救不了下一次启动 —— 那时它又会从头试一遍 DirectML,再撞一次
+        // 同一个 bug。记在 config 里,这台机器就只撞一次。
+        persist_demotion(ep, &why);
+    }
+}
+
+/// 把降级写进 `[speech] failed_providers`。
+///
+/// 自己读写磁盘:调用点在合成失败的处理里,拿不到那个共享配置句柄,而要落盘的
+/// 是文件。写不成不致命 —— 这个进程仍然记得,只是活不过重启。
+fn persist_demotion(ep: Ep, why: &str) {
+    let Ok(mut c) = crate::config::AgentConfig::load() else {
+        return;
+    };
+    let name = ep.name().to_string();
+    if c.speech.failed_providers.contains(&name) {
+        return;
+    }
+    c.speech.failed_providers.push(name);
+    match c.save() {
+        Ok(()) => tracing::info!(
+            target: "speech",
+            %ep, why,
+            "backend recorded as unusable on this machine; it will not be tried again"
+        ),
+        Err(e) => tracing::warn!(target: "speech", error = %e, "could not record the failed backend"),
+    }
+}
+
+/// 启动时把上次记下的失败读回来。
+///
+/// 没有这一步,写下去的东西没人看,每次启动仍然会重试那个会让进程崩掉的后端。
+pub fn prime_demotion(cfg: &crate::config::AgentConfig) {
+    let Some(name) = cfg.speech.failed_providers.first() else {
+        return;
+    };
+    let Some(ep) = Ep::parse(name) else { return };
+    let mut slot = DEMOTED.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        tracing::info!(
+            target: "speech",
+            %ep,
+            "backend was recorded as unusable here before; not trying it again"
+        );
+        *slot = Some((ep, "recorded on an earlier run".to_string()));
     }
 }
 
@@ -386,6 +465,15 @@ pub fn probe(dir: &Path, threads: usize, setting: Setting, budget: f32) -> Probe
             Some(i) => i,
             None => match MossEngine::load(dir, threads, candidate) {
                 Ok(e) => {
+                    // 两份权重同时在手上是探测期间的内存峰值(MOSS 一份 717 MB,
+                    // GPU 那份还压着显存),而探测正是崩溃被报告的那一段。
+                    //
+                    // 试过在这里把量过的那份丢掉,是错的:两个候选**都超预算**
+                    // 时 `choose` 选的是实测更快的那个,而那可能正是先建的那份
+                    // —— 丢掉它只会让上层再加载一次,比不丢更慢。
+                    //
+                    // 削峰要么等 `choose` 能说出「这个已经出局」,要么接受一次
+                    // 重建。都不是这里能顺手做的。
                     built.push((candidate, e));
                     built.len() - 1
                 }

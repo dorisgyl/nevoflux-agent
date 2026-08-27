@@ -229,6 +229,20 @@ pub struct SpeechConfig {
     /// 的快样本把常年跑不动的机器永久钉在主引擎上,用户每一轮都听卡顿。
     #[serde(default)]
     pub recent_rtf: Vec<f32>,
+    /// 在这台机器上真用起来会坏的后端。
+    ///
+    /// 不是偏好,是事故记录。写下来的理由是一次堆损坏:DirectML 在 Kokoro 的
+    /// `ConvTranspose` 上抛 80070057,而它的失败路径把堆写坏了 —— agent 进程
+    /// 以 `0xC0000374`(STATUS_HEAP_CORRUPTION,故障模块 ntdll.dll)崩掉,用户
+    /// 看到的是「等很久、崩两次、要重启浏览器」。
+    ///
+    /// 那是 ONNX Runtime / DirectML 里的上游问题,我们改不了。能做的是**别再
+    /// 走上那条路**:降级本来只活在进程里,重启就忘,于是每次启动都要再撞一次。
+    /// 记在这里,它就只撞一次。
+    ///
+    /// 手动清空可以让它重新试一次 —— 换了驱动之后这是唯一的复活方式。
+    #[serde(default)]
+    pub failed_providers: Vec<String>,
     /// 在哪个推理后端上合成:`auto`(默认)、`cpu`、`directml`、`cuda`。
     ///
     /// `auto` 的意思是**量出来**,不是猜:第一次要说话时,依次试运行时报告的
@@ -265,6 +279,7 @@ impl Default for SpeechConfig {
         SpeechConfig {
             measured_rtf: None,
             recent_rtf: Vec::new(),
+            failed_providers: Vec::new(),
             execution_provider: None,
             rtf_budget: default_rtf_budget(),
         }
