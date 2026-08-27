@@ -384,6 +384,7 @@ pub fn conversation_voice(
     if cfg.tts.moss.enabled == Some(false) {
         // 关掉是一个决定,不是一次失败。
         let k = kokoro()?;
+        RESOLVED.store(true, Ordering::Relaxed);
         return Ok((k, Choice::configured()));
     }
 
@@ -393,6 +394,7 @@ pub fn conversation_voice(
     if let Some(rtf) = measured_rtf() {
         if budget > 0.0 && rtf > budget {
             let k = kokoro()?;
+            RESOLVED.store(true, Ordering::Relaxed);
             return Ok((
                 k,
                 Choice::fallback(format!(
@@ -408,6 +410,7 @@ pub fn conversation_voice(
         budget,
     ) {
         Ok(e) => {
+            RESOLVED.store(true, Ordering::Relaxed);
             // 再问一次预算。
             //
             // 上面那次问的时候 `measured_rtf()` 还是空的 —— 这台机器还没被量过。
@@ -706,6 +709,22 @@ pub fn preferred_voice(db: &nevoflux_storage::Database) -> Option<String> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
+}
+
+/// 引擎已经决定过了吗。
+///
+/// 决定一次要几十秒:加载 717 MB、跑探测合成、跟 CPU 比一次。那几十秒发生在
+/// **第一次要说话的那一刻**,而那一刻正好在聊天回合的路径上 —— 于是整个侧栏
+/// 停在那里,输入框也动不了。用户的原话是「大不了没有声音,不要导致整个
+/// sidebar 都停顿」。
+///
+/// 有了这个标记,聊天那条路就能问一句「现在能说吗」,而不是「给我一个能说话
+/// 的引擎,多久都等」。
+static RESOLVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 引擎决定好了没有。没有就别在聊天路径上等它。
+pub fn engine_ready() -> bool {
+    RESOLVED.load(Ordering::Relaxed)
 }
 
 /// One `general.<key>` out of the settings the browser writes.
