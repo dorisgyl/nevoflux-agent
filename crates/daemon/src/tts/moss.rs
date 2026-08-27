@@ -215,6 +215,32 @@ pub fn reset_rtf() -> Result<(), String> {
     c.save().map_err(|e| e.to_string())
 }
 
+/// 立刻把测量写进 `config.toml`,不等这一轮说完。
+///
+/// [`persist_measurement`] 挂在一轮结束之后,而探测发生在**第一句话之前** ——
+/// 中间隔着几十秒的加载与合成。那段时间里崩一次,测量就丢了,下次启动只好从头
+/// 再探测一次,然后再崩一次。用户看到的是「等很久、崩两次、要重启浏览器」。
+///
+/// 探测本身就是这台机器的答案,拿到就该记下来。记下来之后,即使后面崩了,下次
+/// 启动也会在预算那道判断上直接短路,根本不再探测。
+///
+/// 自己从磁盘读写,不走那个共享句柄:这里在引擎构造的深处,拿不到它,而要落盘
+/// 的是文件。
+fn persist_now() {
+    let Some(now) = measured_rtf() else { return };
+    let Ok(mut c) = AgentConfig::load() else { return };
+    c.speech.measured_rtf = Some(now);
+    c.speech.recent_rtf = recent_samples();
+    match c.save() {
+        Ok(()) => {
+            LAST_PERSISTED.store((now * 1000.0).round() as u32, Ordering::Relaxed);
+            tracing::info!(target: "speech", rtf = now, "probe result written down");
+        }
+        // 记不下来不致命:这个进程仍然用得上它,只是活不过重启。
+        Err(e) => tracing::warn!(target: "speech", error = %e, "could not persist probe result"),
+    }
+}
+
 /// Write the measurement back to `config.toml`, if it has moved.
 ///
 /// Persisted so a machine does not have to re-learn on every restart that it
@@ -316,6 +342,9 @@ mod local {
                 // 探测量到的速度就是这台机器上 MOSS 的速度,交给预算那道判断 ——
                 // 它读的是 `measured_rtf()`,而在这之前那里是空的。
                 record_rtf_value(probed.selection.rtf);
+                // 立刻落盘。等这一轮说完再写,中间崩一次就要重探一次 —— 而
+                // 探测正是最容易崩的那一段。
+                persist_now();
                 // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
                 // 而后者建出来的会带着真正的错误失败。
                 let loaded = match probed.engine {
@@ -355,6 +384,7 @@ pub fn conversation_voice(
     if cfg.tts.moss.enabled == Some(false) {
         // 关掉是一个决定,不是一次失败。
         let k = kokoro()?;
+        RESOLVED.store(true, Ordering::Relaxed);
         return Ok((k, Choice::configured()));
     }
 
@@ -364,6 +394,7 @@ pub fn conversation_voice(
     if let Some(rtf) = measured_rtf() {
         if budget > 0.0 && rtf > budget {
             let k = kokoro()?;
+            RESOLVED.store(true, Ordering::Relaxed);
             return Ok((
                 k,
                 Choice::fallback(format!(
@@ -379,6 +410,7 @@ pub fn conversation_voice(
         budget,
     ) {
         Ok(e) => {
+            RESOLVED.store(true, Ordering::Relaxed);
             // 再问一次预算。
             //
             // 上面那次问的时候 `measured_rtf()` 还是空的 —— 这台机器还没被量过。
@@ -677,6 +709,22 @@ pub fn preferred_voice(db: &nevoflux_storage::Database) -> Option<String> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
+}
+
+/// 引擎已经决定过了吗。
+///
+/// 决定一次要几十秒:加载 717 MB、跑探测合成、跟 CPU 比一次。那几十秒发生在
+/// **第一次要说话的那一刻**,而那一刻正好在聊天回合的路径上 —— 于是整个侧栏
+/// 停在那里,输入框也动不了。用户的原话是「大不了没有声音,不要导致整个
+/// sidebar 都停顿」。
+///
+/// 有了这个标记,聊天那条路就能问一句「现在能说吗」,而不是「给我一个能说话
+/// 的引擎,多久都等」。
+static RESOLVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 引擎决定好了没有。没有就别在聊天路径上等它。
+pub fn engine_ready() -> bool {
+    RESOLVED.load(Ordering::Relaxed)
 }
 
 /// One `general.<key>` out of the settings the browser writes.

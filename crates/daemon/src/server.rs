@@ -2357,6 +2357,9 @@ pub async fn start_server(
     // A machine already judged too slow for MOSS should not have to prove it
     // again on the user's first reply of the session.
     crate::tts::moss::prime_rtf(&process_config.read().unwrap().clone());
+    // 上次崩在哪个后端上,这次就别再去了。
+    #[cfg(feature = "tts-local")]
+    crate::tts::backend::prime_demotion(&process_config.read().unwrap().clone());
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
     let process_available_browsers = available_browsers.clone();
@@ -6486,6 +6489,24 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
+    // 要被念出来的回答,得写成能听懂的样子。
+    //
+    // 朗读过滤器会**整段跳过代码块**(见 `Speakable`),还会把表格压成顿号分隔、
+    // 把 markdown 记号去掉。所以一个「先给代码、再解释」的回答,听起来是从半句
+    // 跳到另外半句 —— 用户的原话是「语义跳跃」。
+    //
+    // 提示挂在用户消息上,和 `[Active Canvas]` 走同一条路:它随回合来去,不进
+    // 系统提示词,所以关掉开关之后不会有残留。
+    let effective_message = if voice_on {
+        format!(
+            "[这条回答会被读出来。请写成**听得懂**的样子:先用完整的句子把结论             说清楚,再展开;别让代码块、表格或列表承担意思(它们不会被念出来);             需要给代码时,先用一句话说明它做什么。]
+
+{effective_message}"
+        )
+    } else {
+        effective_message
+    };
+
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
@@ -6553,6 +6574,36 @@ async fn handle_chat_message_streaming(
     //
     // 谁在发声,「整轮没什么可念」那句要按它挑语言 —— Kokoro 只会英文。
     let mut voice_engine: Option<&'static str> = None;
+    // 引擎还没决定好时,**这一轮不出声**,而不是让所有人等它。
+    //
+    // 决定一次要几十秒(加载 717 MB、探测合成、跟 CPU 比一次),而这段代码在
+    // 聊天回合的路径上 —— 等下去的不只是声音,是整个侧栏:回答不流、输入框
+    // 不动。用户的原话是「大不了没有声音,不要导致整个 sidebar 都停顿」。
+    //
+    // 同时在后台把它建起来,所以下一轮就有声音了。麦克风打开时也会预热
+    // (见 listener attach 那条),多数情况下这里根本不会落空。
+    #[cfg(feature = "tts-local")]
+    let voice_on = if voice_on && !crate::tts::moss::engine_ready() {
+        let warm = shared_config.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(cfg) = warm.read().map(|c| c.clone()) else {
+                return;
+            };
+            match crate::tts::moss::conversation_voice(&cfg) {
+                Ok((_, choice)) => tracing::info!(
+                    target: "speech",
+                    engine = choice.engine,
+                    "voice engine resolved in the background; the next reply can speak"
+                ),
+                Err(e) => tracing::debug!(target: "speech", error = %e, "no synthesizer"),
+            }
+        });
+        info!("voice: engine not ready yet — this reply is text only, the next one will speak");
+        false
+    } else {
+        voice_on
+    };
+
     let voice_tap: Option<tokio::sync::mpsc::UnboundedSender<String>> = if voice_on {
         // 用户在设置里选的音色。在 spawn 之前读:`services` 借的是这个函数的栈,
         // 活不到那个任务里。读不到就交给引擎自己的默认,而不是硬写一个名字。
