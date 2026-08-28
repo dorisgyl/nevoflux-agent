@@ -31,6 +31,7 @@ pub mod brain_rpc;
 pub mod brain_share;
 pub mod brain_share_rpc;
 pub mod brain_tools;
+pub mod browser_backend;
 pub mod browser_launch;
 pub mod canvas_persist;
 pub mod canvas_tools;

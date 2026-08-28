@@ -805,9 +805,9 @@ async fn run_daemon(
                 metrics.clone(),
             )
             .unwrap_or_else(|| {
-                tracing::warn!(
-                    "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
-                );
+                // `build_headless_runner` has already logged which piece was
+                // missing — a daemon context, or any engine at all.
+                tracing::warn!("no headless runner could be built; serving stub");
                 Arc::new(|id, _req, _sink, _cancel| {
                     Box::pin(async move {
                         http::types::TaskResponse {
@@ -860,7 +860,11 @@ async fn run_daemon(
                 // `browser_*` needs the browser to survive between calls, which
                 // only session mode provides; without it they are not offered
                 // rather than offered-and-broken.
-                let session_mode = std::env::var("NEVOFLUX_SESSION_MODE").as_deref() == Ok("1");
+                // Unless the engine is in this process, in which case it
+                // survives between calls by construction and there is no
+                // browser to keep alive.
+                let browser_tools = std::env::var("NEVOFLUX_SESSION_MODE").as_deref() == Ok("1")
+                    || nevoflux_daemon::browser_backend::Backend::from_env().in_process();
                 let mut sources: Vec<std::sync::Arc<dyn ToolSource>> = vec![std::sync::Arc::new(
                     nevoflux_daemon::mcp_service::TaskSource::new(state.clone()),
                 )];
@@ -874,7 +878,7 @@ async fn run_daemon(
                                 services.clone(),
                                 browsers.clone(),
                             )
-                            .with_browser_tools(session_mode),
+                            .with_browser_tools(browser_tools),
                         ));
                     }
                     _ => tracing::warn!(

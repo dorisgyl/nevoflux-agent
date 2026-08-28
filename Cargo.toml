@@ -123,6 +123,11 @@ tts-gpu = ["nevoflux-daemon/tts-gpu"]
 # networks yet. Without it every range takes the relay, as it does today.
 #   cargo build --features webrtc
 webrtc = ["nevoflux-daemon/webrtc"]
+# nevoflux-skiff as an in-process browser backend, forwarded to
+# nevoflux-daemon. Off by default. With it, NEVOFLUX_BROWSER_BACKEND selects
+# the engine at runtime and defaults to skiff-first with escalation; without
+# it, every setting serves from the browser extension as before.
+skiff-backend = ["nevoflux-daemon/skiff-backend"]
 # Local SenseVoice transcription, forwarded to nevoflux-daemon.
 asr-sensevoice = ["nevoflux-daemon/asr-sensevoice"]
 # Whisper via Candle, forwarded to nevoflux-daemon. On by default; the

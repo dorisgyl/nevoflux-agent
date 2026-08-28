@@ -15,6 +15,11 @@ default = ["embedding", "ort-load-dynamic", "tts-local", "tts-gpu", "asr-sensevo
 # a hundred crates, and until a session can reach the peer path that cost buys
 # nothing. `remote::rtc` compiles either way and falls back to the relay.
 webrtc = ["dep:nevoflux-rtc-transport"]
+# nevoflux-skiff as an in-process browser backend. Off by default: it needs
+# the skiff repository checked out beside this one, and a daemon that cannot
+# find it should still build rather than failing for a backend nobody asked
+# for.
+skiff-backend = ["dep:skiff", "dep:skiff-net"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
@@ -67,6 +72,29 @@ tts-gpu = [
 [dependencies]
 # Internal crates
 nevoflux-protocol = { path = "../protocol" }
+# nevoflux-skiff, linked in-process as a browser backend (skiff ADR-0006).
+# MIT under AGPL, which is the direction that works; the dependency must never
+# point the other way.
+#
+# A tag rather than a path, even though skiff is unpublished and usually sits
+# right beside this checkout. Cargo reads every dependency's manifest while it
+# resolves, optional or not, so a path that is not there fails `cargo check`
+# for the whole repository — with the feature off, for someone who never asked
+# for skiff. A tag resolves anywhere.
+#
+# To develop the two together, point these back at a working copy with a
+# `[patch]` in a `.cargo/config.toml` in the directory holding both checkouts
+# — outside either repository, so it cannot be committed by accident:
+#
+#     [patch.'https://github.com/nevoflux-browser/nevoflux-skiff.git']
+#     skiff = { path = "nevoflux-skiff/crates/skiff" }
+#     skiff-net = { path = "nevoflux-skiff/crates/skiff-net" }
+#
+# While that patch is active Cargo rewrites Cargo.lock to resolve skiff as a
+# path, dropping the `source` lines that pin the tag. Do not commit that lock;
+# move the config aside and re-resolve first.
+skiff = { git = "https://github.com/nevoflux-browser/nevoflux-skiff.git", tag = "v0.1.0", optional = true }
+skiff-net = { git = "https://github.com/nevoflux-browser/nevoflux-skiff.git", tag = "v0.1.0", optional = true }
 nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
 nevoflux-skills = { path = "../skills" }

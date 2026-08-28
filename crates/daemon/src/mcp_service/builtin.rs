@@ -112,6 +112,9 @@ pub struct BuiltinSource {
     browsers: Arc<BrowserRegistry>,
     tool_bridge: Arc<McpToolBridge>,
     browser_tools: bool,
+    /// Set once at construction: whether `browser_*` is served in this process
+    /// rather than by a browser that has to connect first.
+    in_process_browser: bool,
 }
 
 impl BuiltinSource {
@@ -125,6 +128,7 @@ impl BuiltinSource {
             browsers,
             tool_bridge: Arc::new(McpToolBridge::new()),
             browser_tools: true,
+            in_process_browser: crate::browser_backend::Backend::from_env().in_process(),
         }
     }
 
@@ -150,7 +154,13 @@ impl ToolSource for BuiltinSource {
         // addressed to one. An MCP client (Claude Code, say) is not itself a
         // browser, so the routing identity comes from the browser registry
         // rather than from the caller's own connection.
-        let services = if needs_browser(name) {
+        //
+        // An in-process engine has no connection to address. It is not a
+        // browser the registry ever saw, and the request reaches it off the
+        // `BrowserSender` channel, so demanding a registry entry here would
+        // refuse every call on the grounds that a browser nobody needs is
+        // missing.
+        let services = if needs_browser(name) && !self.in_process_browser {
             let entry = self.browsers.single().map_err(|e| {
                 format!("Tool '{name}' needs a connected browser, but none is usable: {e}")
             })?;

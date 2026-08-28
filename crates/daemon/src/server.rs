@@ -2179,11 +2179,48 @@ pub async fn start_server(
     });
 
     // Spawn browser request handler task
-    // This task receives browser tool requests from the agent and sends them to the sidebar
+    //
+    // Every baked browser tool the LLM can call arrives here. Which engine
+    // serves it is decided once, at start-up, and the tool surface does not
+    // change between them: the LLM sees the same names with the same
+    // parameters whichever one answers (nevoflux-skiff ADR-0001).
+    let browser_backend = crate::browser_backend::Backend::from_env();
+    info!("Browser backend: {browser_backend:?}");
+    #[cfg(feature = "skiff-backend")]
+    let skiff = browser_backend
+        .uses_skiff()
+        .then(crate::browser_backend::skiff_backend::SkiffBackend::spawn);
+
     let browser_response_tx = response_tx.clone();
     let browser_registry_clone = browser_registry.clone();
     tokio::spawn(async move {
         while let Some((request, response_sender)) = browser_rx.recv().await {
+            // Served in this process, and never registered with the sidebar:
+            // the reply goes straight back down the caller's own channel, so
+            // nothing waits on a browser that was never asked.
+            //
+            // Only for a call that names no browser. One that does has been
+            // escalated to a real browser for a reason, and serving it here
+            // would send it straight back to the engine that already said it
+            // could not do this.
+            #[cfg(feature = "skiff-backend")]
+            let (request, response_sender) = match &skiff {
+                Some(skiff) if !crate::browser_backend::addressed_to_a_browser(&request) => {
+                    match skiff.serve(request, response_sender).await {
+                        Ok(()) => continue,
+                        // The session thread is gone. Falling through to the
+                        // sidebar is better than dropping the reply channel and
+                        // leaving the agent waiting for an answer that cannot
+                        // come.
+                        Err(returned) => {
+                            error!("skiff backend is not answering; falling back to the sidebar");
+                            returned
+                        }
+                    }
+                }
+                _ => (request, response_sender),
+            };
+
             let request_id = request.request_id.clone();
             info!(
                 "Browser request sending to sidebar: id={}, action={:?}, proxy_id={}, identity_len={}",

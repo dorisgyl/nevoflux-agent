@@ -66,6 +66,17 @@ pub async fn prewarm_session_browser() {
         tracing::debug!("NEVOFLUX_BROWSER_BIN unset; skipping browser pre-warm");
         return;
     };
+    // Where skiff serves, a browser is started only for a task that turns out
+    // to need one. Pre-warming one for every daemon would put back exactly the
+    // process this is meant to save.
+    let engine = crate::browser_backend::Backend::from_env();
+    if engine.uses_skiff() {
+        tracing::debug!(
+            ?engine,
+            "skiff serves browser tools; skipping browser pre-warm"
+        );
+        return;
+    }
 
     // Same profile the interface front-ends default to, or the pre-warmed
     // browser would be running the wrong one and the first task would throw it
@@ -86,11 +97,12 @@ pub async fn prewarm_session_browser() {
         profile,
         registry: registry.clone(),
         services_template: template.clone(),
-        browser_bin: PathBuf::from(browser_bin),
+        browser_bin: Some(PathBuf::from(browser_bin)),
         display: std::env::var("DISPLAY").ok(),
         mode: nevoflux_builtin_wasm::AgentMode::Chat,
         workspace: std::env::temp_dir().join("nevoflux-prewarm"),
         script_call: None,
+        engine,
     };
     let holder = crate::automation::session_holder::SessionHolder::global();
     let mut guard = holder.inner.lock().await;
@@ -108,7 +120,26 @@ pub fn build_headless_runner(
     use std::sync::atomic::Ordering;
     let template = CURRENT_SERVICES_TEMPLATE.get()?.clone();
     let registry = crate::registry::CURRENT_BROWSER_REGISTRY.get()?.clone();
-    let browser_bin = PathBuf::from(std::env::var("NEVOFLUX_BROWSER_BIN").ok()?);
+    let browser_bin = std::env::var("NEVOFLUX_BROWSER_BIN")
+        .ok()
+        .map(PathBuf::from);
+    // A runner needs one engine it can actually reach. skiff is in this
+    // process; a browser has to be on disk and pointed at. With neither, every
+    // task would fail at the same place, so say so once here instead.
+    let engine = crate::browser_backend::Backend::from_env();
+    if browser_bin.is_none() && !engine.uses_skiff() {
+        tracing::warn!(
+            ?engine,
+            "no engine for headless tasks: set NEVOFLUX_BROWSER_BIN, or build with the \
+             `skiff-backend` feature"
+        );
+        return None;
+    }
+    tracing::info!(
+        ?engine,
+        has_browser = browser_bin.is_some(),
+        "headless runner ready"
+    );
     let display = std::env::var("DISPLAY").ok();
     let base_dir = std::env::var("NEVOFLUX_BASE_PROFILES")
         .map(PathBuf::from)
@@ -159,6 +190,7 @@ pub fn build_headless_runner(
                     } else {
                         None
                     },
+                    engine,
                 };
                 let policy = req.to_policy();
                 let outcome = if session_mode {

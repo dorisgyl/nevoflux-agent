@@ -384,8 +384,13 @@ pub struct AutomationDeps {
     pub registry: std::sync::Arc<crate::registry::BrowserRegistry>,
     /// Services template (carries agent_config, runtime_handle, browser_sender).
     pub services_template: HostServices,
-    /// Path to the nevoflux browser binary.
-    pub browser_bin: std::path::PathBuf,
+    /// Path to the nevoflux browser binary, if there is one.
+    ///
+    /// `None` where `NEVOFLUX_BROWSER_BIN` is unset. That is only fatal for a
+    /// task that actually needs a browser: with skiff serving, most never do,
+    /// and demanding a browser binary up front is what used to make a browser
+    /// mandatory for every task in the queue.
+    pub browser_bin: Option<std::path::PathBuf>,
     /// X11 display for the browser (e.g. `:99`), if any.
     pub display: Option<String>,
     /// Agent mode for the task.
@@ -394,80 +399,204 @@ pub struct AutomationDeps {
     pub workspace: std::path::PathBuf,
     /// 结构化脚本调用上下文；`None` 表示走老路径（脚本只拿 task 字符串）。
     pub script_call: Option<ScriptCall>,
+    /// Which engine runs the task, and whether it may escalate.
+    pub engine: crate::browser_backend::Backend,
 }
 
-/// Run a full task: taint-gated retry over fresh attempts, each of which clones
-/// a profile → spawns a browser → resolves the binding → runs the agent leaf →
-/// cleans up. Composes the individually-tested pieces (ProfileManager,
-/// browser_launch, BrowserRegistry, execute_task_attempt, run_with_retry).
-/// End-to-end behavior is verified against a live browser (phase gate).
+/// The binding for a call served in this process: none at all.
+///
+/// An empty `proxy_id` is how the dispatcher recognises a call addressed to no
+/// browser (`crate::browser_backend::addressed_to_a_browser`). Building the
+/// entry, rather than threading an `Option` down through the leaf, keeps the
+/// skiff path and the escalated one the same code.
+fn unbound() -> crate::registry::BrowserEntry {
+    crate::registry::BrowserEntry {
+        proxy_id: String::new(),
+        client_identity: Vec::new(),
+        registered_at: std::time::Instant::now(),
+        last_heartbeat: std::time::Instant::now(),
+    }
+}
+
+/// What to do with a skiff attempt that has just finished.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterSkiff {
+    /// Take the answer as it stands.
+    Done,
+    /// Run the task again in a real browser.
+    Escalate,
+    /// A browser would have helped, and cannot be used. Carries why.
+    Stuck(&'static str),
+}
+
+/// The escalation rule.
+///
+/// All four inputs matter, and each one alone is a trap. Escalating on any
+/// failure spends a profile clone and a browser process on tasks that fail
+/// identically in a browser. Escalating when a backend was named answers a
+/// different question than the operator asked. Escalating with no browser
+/// configured swaps one failure for another. And escalating on a refusal
+/// nothing could serve — `web_search` and friends — is why the counter behind
+/// `browser_wanted` does not count those.
+fn after_skiff(
+    engine: crate::browser_backend::Backend,
+    failed: bool,
+    browser_wanted: bool,
+    have_browser: bool,
+) -> AfterSkiff {
+    if !failed || !browser_wanted {
+        return AfterSkiff::Done;
+    }
+    if !engine.may_escalate() {
+        return AfterSkiff::Stuck("a backend was named, so skiff's own answer is the answer");
+    }
+    if !have_browser {
+        return AfterSkiff::Stuck("there is no NEVOFLUX_BROWSER_BIN to escalate to");
+    }
+    AfterSkiff::Escalate
+}
+
+/// Run the task in skiff, and say whether that settles it.
+///
+/// `Some` is the answer, whether it succeeded or not; `None` means hand the
+/// task to a real browser. See [`after_skiff`] for when that is worth doing.
+async fn settled_by_skiff(
+    deps: &AutomationDeps,
+    policy: &Policy,
+    task: &str,
+) -> Option<SessionOutcome> {
+    if !deps.engine.uses_skiff() {
+        return None;
+    }
+    let before = crate::browser_backend::browser_wanted_count();
+    let outcome = run_with_retry(policy, |attempt| async move {
+        execute_task_attempt(
+            deps.services_template.clone(),
+            &unbound(),
+            policy,
+            task,
+            deps.mode,
+            format!("skiff-{attempt}"),
+            deps.script_call.as_ref(),
+        )
+        .await
+    })
+    .await;
+
+    let failed = outcome.status == TaskStatus::Failed;
+    let wanted = crate::browser_backend::browser_wanted_count() > before;
+    match after_skiff(deps.engine, failed, wanted, deps.browser_bin.is_some()) {
+        AfterSkiff::Escalate => {
+            tracing::info!("skiff refused something a browser can do; escalating to a browser");
+            None
+        }
+        AfterSkiff::Stuck(why) => {
+            tracing::warn!("skiff could not finish this task, and {why}");
+            Some(outcome)
+        }
+        AfterSkiff::Done => {
+            if failed {
+                tracing::debug!("task failed in skiff without needing a browser; not escalating");
+            }
+            Some(outcome)
+        }
+    }
+}
+
+/// Run a full task.
+///
+/// Where skiff serves ([`settled_by_skiff`]) that is the whole of it: no
+/// profile clone, no browser process, no bind. Otherwise — or when skiff hits
+/// something only a browser can do — this is taint-gated retry over fresh
+/// attempts, each of which clones a profile → spawns a browser → resolves the
+/// binding → runs the agent leaf → cleans up. Composes the individually-tested
+/// pieces (ProfileManager, browser_launch, BrowserRegistry,
+/// execute_task_attempt, run_with_retry). End-to-end behavior is verified
+/// against a live browser (phase gate).
 pub async fn execute_full_task(
     deps: &AutomationDeps,
     policy: &Policy,
     task: &str,
 ) -> SessionOutcome {
-    let outcome = run_with_retry(policy, |attempt| async move {
-        let clone = match deps.profile_mgr.clone_base(&deps.profile) {
-            Ok(c) => c,
-            Err(e) => {
-                return AttemptOutcome {
-                    success: false,
-                    tainted: false,
-                    output: None,
-                    error: Some(format!("profile clone failed: {e}")),
-                }
-            }
-        };
-        let _ = deps.profile_mgr.inject_automation_pref(&clone);
-
-        let cfg = crate::browser_launch::BrowserLaunchConfig {
-            browser_bin: deps.browser_bin.clone(),
-            profile_dir: clone.clone(),
-            display: deps.display.clone(),
-            register_timeout: std::time::Duration::from_secs(60),
-        };
-        let result =
-            match crate::browser_launch::spawn_and_supervise(cfg, deps.registry.clone()).await {
-                Err(e) => AttemptOutcome {
-                    success: false,
-                    tainted: false, // browser never started ⇒ untainted (retryable)
-                    output: None,
-                    error: Some(format!("browser launch failed: {e}")),
-                },
-                Ok(mut handle) => {
-                    let outcome = match deps.registry.single() {
-                        Ok(browser) => {
-                            execute_task_attempt(
-                                deps.services_template.clone(),
-                                &browser,
-                                policy,
-                                task,
-                                deps.mode,
-                                format!("automation-{attempt}"),
-                                deps.script_call.as_ref(),
-                            )
-                            .await
-                        }
-                        Err(e) => AttemptOutcome {
+    let in_a_browser =
+        || {
+            run_with_retry(policy, |attempt| async move {
+                let Some(browser_bin) = deps.browser_bin.clone() else {
+                    return AttemptOutcome {
+                        success: false,
+                        tainted: false,
+                        output: None,
+                        error: Some("this task needs a browser; set NEVOFLUX_BROWSER_BIN".into()),
+                    };
+                };
+                let clone = match deps.profile_mgr.clone_base(&deps.profile) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return AttemptOutcome {
                             success: false,
                             tainted: false,
                             output: None,
-                            error: Some(format!("binding failed: {e}")),
+                            error: Some(format!("profile clone failed: {e}")),
+                        }
+                    }
+                };
+                let _ = deps.profile_mgr.inject_automation_pref(&clone);
+
+                let cfg = crate::browser_launch::BrowserLaunchConfig {
+                    browser_bin,
+                    profile_dir: clone.clone(),
+                    display: deps.display.clone(),
+                    register_timeout: std::time::Duration::from_secs(60),
+                };
+                let result =
+                    match crate::browser_launch::spawn_and_supervise(cfg, deps.registry.clone())
+                        .await
+                    {
+                        Err(e) => AttemptOutcome {
+                            success: false,
+                            tainted: false, // browser never started ⇒ untainted (retryable)
+                            output: None,
+                            error: Some(format!("browser launch failed: {e}")),
                         },
+                        Ok(mut handle) => {
+                            let outcome = match deps.registry.single() {
+                                Ok(browser) => {
+                                    execute_task_attempt(
+                                        deps.services_template.clone(),
+                                        &browser,
+                                        policy,
+                                        task,
+                                        deps.mode,
+                                        format!("automation-{attempt}"),
+                                        deps.script_call.as_ref(),
+                                    )
+                                    .await
+                                }
+                                Err(e) => AttemptOutcome {
+                                    success: false,
+                                    tainted: false,
+                                    output: None,
+                                    error: Some(format!("binding failed: {e}")),
+                                },
+                            };
+                            // Reap the launcher child for this attempt.
+                            handle.terminate().await;
+                            outcome
+                        }
                     };
-                    // Reap the launcher child for this attempt.
-                    handle.terminate().await;
-                    outcome
-                }
-            };
-        // Kill any browser process still holding this clone profile (the launcher
-        // relaunches the real browser under a new pid, so reaping the child isn't
-        // enough), then remove the clone dir. Prevents cross-task process leaks.
-        crate::browser_launch::kill_profile_processes(&clone).await;
-        deps.profile_mgr.cleanup(&clone);
-        result
-    })
-    .await;
+                // Kill any browser process still holding this clone profile (the launcher
+                // relaunches the real browser under a new pid, so reaping the child isn't
+                // enough), then remove the clone dir. Prevents cross-task process leaks.
+                crate::browser_launch::kill_profile_processes(&clone).await;
+                deps.profile_mgr.cleanup(&clone);
+                result
+            })
+        };
+
+    let outcome = match settled_by_skiff(deps, policy, task).await {
+        Some(outcome) => outcome,
+        None => in_a_browser().await,
+    };
 
     // P6/Q12 drain: write the task result to the workspace (best-effort, incl.
     // on failure) so it survives sandbox teardown. Per-step screenshots require
@@ -567,6 +696,9 @@ pub async fn ensure_session_browser(
 
     // Crash-relaunch REUSES the existing clone dir so in-flow login/cookies on
     // disk survive; a fresh flow clones the base profile.
+    let Some(browser_bin) = deps.browser_bin.clone() else {
+        return Err("this task needs a browser; set NEVOFLUX_BROWSER_BIN".into());
+    };
     let clone = match guard.take() {
         Some(mut dead) => {
             tracing::warn!(
@@ -584,7 +716,7 @@ pub async fn ensure_session_browser(
     };
     let _ = deps.profile_mgr.inject_automation_pref(&clone);
     let cfg = BrowserLaunchConfig {
-        browser_bin: deps.browser_bin.clone(),
+        browser_bin,
         profile_dir: clone.clone(),
         display: deps.display.clone(),
         register_timeout: Duration::from_secs(60),
@@ -616,6 +748,14 @@ pub async fn execute_session_task(
     save_profile: bool,
     save_profile_as: Option<String>,
 ) -> SessionOutcome {
+    // skiff keeps its session in this process, so session mode's whole job —
+    // holding one browser open across tasks — is already done, and there is
+    // nothing to launch, soft-reset or tear down. Only an escalation past this
+    // point needs the machinery below.
+    if let Some(outcome) = settled_by_skiff(deps, policy, task).await {
+        return outcome;
+    }
+
     let holder = SessionHolder::global();
     let mut guard = holder.inner.lock().await;
 
@@ -702,6 +842,82 @@ fn append_save_note(output: Option<String>, report: &session_holder::SaveReport)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The escalation rule decides whether a browser process gets started at
+    /// all, so each way of getting it wrong costs something specific.
+    mod escalation {
+        use super::*;
+        use crate::browser_backend::Backend;
+
+        /// Nothing was refused, so a browser would hit the same wall — and
+        /// cost a profile clone and a process to do it.
+        #[test]
+        fn a_failure_on_its_own_terms_starts_no_browser() {
+            assert_eq!(
+                after_skiff(Backend::Auto, true, false, true),
+                AfterSkiff::Done
+            );
+        }
+
+        /// Refusals along the way do not matter if the task got done anyway:
+        /// the agent worked around them.
+        #[test]
+        fn a_finished_task_is_not_reopened() {
+            assert_eq!(
+                after_skiff(Backend::Auto, false, true, true),
+                AfterSkiff::Done
+            );
+        }
+
+        /// Failed, and skiff refused something a browser can do. This is the
+        /// one case worth the cost.
+        #[test]
+        fn a_refusal_a_browser_could_have_served_escalates() {
+            assert_eq!(
+                after_skiff(Backend::Auto, true, true, true),
+                AfterSkiff::Escalate
+            );
+        }
+
+        /// Naming a backend asks what that backend alone can do. Starting a
+        /// browser behind that question would answer a different one.
+        #[test]
+        fn a_named_backend_keeps_its_own_answer() {
+            assert!(matches!(
+                after_skiff(Backend::Skiff, true, true, true),
+                AfterSkiff::Stuck(_)
+            ));
+        }
+
+        /// Escalating to a browser that is not there swaps one failure for
+        /// another, so the first failure is the one reported.
+        #[test]
+        fn with_no_browser_configured_the_failure_stands() {
+            assert!(matches!(
+                after_skiff(Backend::Auto, true, true, false),
+                AfterSkiff::Stuck(_)
+            ));
+        }
+    }
+
+    /// The dispatcher routes on this being empty, and the escalated attempt
+    /// routes on it being filled. A non-empty value here would send every
+    /// skiff call to a sidebar that is not there.
+    #[test]
+    fn the_in_process_binding_names_no_browser() {
+        assert!(!crate::browser_backend::addressed_to_a_browser(
+            &BrowserRequest {
+                request_id: String::new(),
+                session_id: String::new(),
+                tab_id: None,
+                action: nevoflux_protocol::BrowserToolAction::Navigate,
+                params: serde_json::Value::Null,
+                timeout_ms: 0,
+                client_identity: unbound().client_identity,
+                proxy_id: unbound().proxy_id,
+            }
+        ));
+    }
 
     fn call_with(script_path: Option<&str>) -> ScriptCall {
         ScriptCall {
