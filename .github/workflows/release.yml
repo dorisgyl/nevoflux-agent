@@ -104,10 +104,15 @@ jobs:
             # (24.04, glibc 2.39) would not run on Ubuntu 22.04.
             os: ubuntu-22.04
             artifact: nevoflux-agent-linux-x86_64
+            # skiff links V8 through deno_core, so it builds only where V8
+            # ships a prebuilt: linux x86_64/aarch64, macOS x86_64/aarch64 and
+            # windows x86_64. Everything else keeps the extension.
+            skiff: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: nevoflux-agent-linux-aarch64
             use_cross: true
+            skiff: true
             # Embedding works here now: load-dynamic links no ONNX Runtime at
             # build time, so the old "ort C++ linking fails in cross Docker"
             # blocker is gone; the aarch64 runtime is bundled at package time.
@@ -117,17 +122,22 @@ jobs:
             # ONNX Runtime 1.24.x ships no Intel-macOS (osx-x86_64) build, so no
             # version-matched runtime to bundle. Embedding off for Intel Macs.
             no_embedding: true
+            skiff: true
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: nevoflux-agent-macos-aarch64
+            skiff: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: nevoflux-agent-windows-x86_64
+            skiff: true
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             artifact: nevoflux-agent-windows-aarch64
             # ort (ONNX Runtime) doesn't link on Windows ARM64 yet
             no_embedding: true
+            # No `skiff` either: V8 has no Windows ARM64 build, so this is the
+            # one target whose browser tools can only come from the extension.
 
     runs-on: ${{ matrix.os }}
 
@@ -201,13 +211,27 @@ jobs:
       # variants:
       #   - matrix.no_embedding -> --no-default-features (skips embedding/ort)
       #   - matrix.use_cross    -> `cross` instead of `cargo`
+      #   - matrix.skiff        -> --features skiff-backend
       # `shell: bash` makes the same loop run on the Windows runners too.
+      #
+      # skiff is compiled in rather than shipped as a second artifact: the
+      # packaging below (ONNX Runtime, DirectML, the embedding model) is the
+      # expensive part and would have to be duplicated for a binary that
+      # differs by one feature. What it changes for a released binary is that
+      # NEVOFLUX_BROWSER_BACKEND has something to select, and that leaving it
+      # unset now means skiff first, escalating to a browser only for what
+      # skiff does not cover. Setting it to `extension` restores the old
+      # behaviour exactly.
+      #
+      # It also costs size: V8 is statically linked, so a skiff build is tens
+      # of megabytes larger than the same target without it.
       - name: Build
         shell: bash
         run: |
           set -u
           flags=""
           [ "${{ matrix.no_embedding }}" = "true" ] && flags="--no-default-features"
+          [ "${{ matrix.skiff }}" = "true" ] && flags="$flags --features skiff-backend"
           if [ "${{ matrix.use_cross }}" = "true" ]; then tool="cross"; else tool="cargo"; fi
           for attempt in 1 2 3; do
             echo "::group::$tool build --release --target ${{ matrix.target }} $flags (attempt $attempt/3)"
