@@ -460,16 +460,26 @@ fn after_skiff(
 ///
 /// `Some` is the answer, whether it succeeded or not; `None` means hand the
 /// task to a real browser. See [`after_skiff`] for when that is worth doing.
+///
+/// `fresh` is what separates the two callers. The task runner wants each
+/// attempt to start on nothing, because that is what the browser path means by
+/// a fresh attempt — it clones a new profile every time, so a half-finished
+/// attempt never resumes and one task cannot read the page another left. The
+/// session runner wants the opposite, which is its whole purpose.
 async fn settled_by_skiff(
     deps: &AutomationDeps,
     policy: &Policy,
     task: &str,
+    fresh: bool,
 ) -> Option<SessionOutcome> {
     if !deps.engine.uses_skiff() {
         return None;
     }
     let before = crate::browser_backend::browser_wanted_count();
     let outcome = run_with_retry(policy, |attempt| async move {
+        if fresh {
+            crate::browser_backend::release_skiff_session().await;
+        }
         execute_task_attempt(
             deps.services_template.clone(),
             &unbound(),
@@ -482,6 +492,14 @@ async fn settled_by_skiff(
         .await
     })
     .await;
+
+    // The task is over, so nothing should still be holding its last page: a
+    // document and the isolate under it, resident for as long as the daemon
+    // lives, on the engine whose whole argument against a browser is what it
+    // does not keep.
+    if fresh {
+        crate::browser_backend::release_skiff_session().await;
+    }
 
     let failed = outcome.status == TaskStatus::Failed;
     let wanted = crate::browser_backend::browser_wanted_count() > before;
@@ -593,7 +611,7 @@ pub async fn execute_full_task(
             })
         };
 
-    let outcome = match settled_by_skiff(deps, policy, task).await {
+    let outcome = match settled_by_skiff(deps, policy, task, true).await {
         Some(outcome) => outcome,
         None => in_a_browser().await,
     };
@@ -752,7 +770,13 @@ pub async fn execute_session_task(
     // holding one browser open across tasks — is already done, and there is
     // nothing to launch, soft-reset or tear down. Only an escalation past this
     // point needs the machinery below.
-    if let Some(outcome) = settled_by_skiff(deps, policy, task).await {
+    if let Some(outcome) = settled_by_skiff(deps, policy, task, false).await {
+        // Session mode holds the page across tasks on purpose, so the only
+        // thing that ends it is being told the session is over. `save_profile`
+        // has nothing to save here: skiff has no profile on disk to keep.
+        if end_session {
+            crate::browser_backend::release_skiff_session().await;
+        }
         return outcome;
     }
 

@@ -2190,6 +2190,12 @@ pub async fn start_server(
     let skiff = browser_backend
         .uses_skiff()
         .then(crate::browser_backend::skiff_backend::SkiffBackend::spawn);
+    // Published so the automation runner can end a session it never had a
+    // handle on. Ignored if already set: a second daemon in tests.
+    #[cfg(feature = "skiff-backend")]
+    if let Some(skiff) = skiff.clone() {
+        let _ = crate::browser_backend::CURRENT_SKIFF.set(skiff);
+    }
 
     let browser_response_tx = response_tx.clone();
     let browser_registry_clone = browser_registry.clone();

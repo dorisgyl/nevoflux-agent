@@ -59,6 +59,26 @@ pub fn addressed_to_a_browser(request: &BrowserRequest) -> bool {
     !request.proxy_id.is_empty()
 }
 
+/// The running skiff backend, for code that is nowhere near the dispatcher.
+///
+/// The same shape as `CURRENT_BROWSER_REGISTRY`: the dispatcher owns the
+/// backend, and the automation runner needs to reach it to end a session
+/// without having it threaded through every layer between them.
+#[cfg(feature = "skiff-backend")]
+pub static CURRENT_SKIFF: std::sync::OnceLock<skiff_backend::SkiffBackend> =
+    std::sync::OnceLock::new();
+
+/// Drop whatever the skiff session is holding, if there is one.
+///
+/// A no-op where skiff is not built in or not running, so a caller can say
+/// "this task is over" without first working out which engine served it.
+pub async fn release_skiff_session() {
+    #[cfg(feature = "skiff-backend")]
+    if let Some(skiff) = CURRENT_SKIFF.get() {
+        skiff.release().await;
+    }
+}
+
 /// Refusals so far that a real browser could have served.
 static BROWSER_WANTED: AtomicU64 = AtomicU64::new(0);
 

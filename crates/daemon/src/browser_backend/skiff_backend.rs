@@ -43,10 +43,18 @@ mod code {
     pub const FAILED: i32 = 1;
 }
 
+/// What the session thread is asked to do.
+enum Message {
+    /// Serve one browser tool call.
+    Serve(BrowserRequest, oneshot::Sender<BrowserResponse>),
+    /// Drop the session and everything it holds.
+    Release,
+}
+
 /// A handle on the thread that owns the skiff session.
 #[derive(Clone)]
 pub struct SkiffBackend {
-    requests: mpsc::Sender<(BrowserRequest, oneshot::Sender<BrowserResponse>)>,
+    requests: mpsc::Sender<Message>,
 }
 
 impl SkiffBackend {
@@ -56,20 +64,32 @@ impl SkiffBackend {
     /// construction, and an unbounded queue in front of it would turn a slow
     /// page into unbounded memory rather than into backpressure.
     pub fn spawn() -> Self {
-        let (requests, mut inbox) =
-            mpsc::channel::<(BrowserRequest, oneshot::Sender<BrowserResponse>)>(32);
+        let (requests, mut inbox) = mpsc::channel::<Message>(32);
 
         std::thread::Builder::new()
             .name("skiff-session".into())
             .spawn(move || {
-                let mut session = Session::new();
+                // Built on the first call rather than up front, so a daemon
+                // that has skiff compiled in and never uses it holds no
+                // document and starts no isolate.
+                let mut session: Option<Session> = None;
                 // `blocking_recv` is what lets a plain thread read a tokio
                 // channel, and is why this thread must never be a tokio worker.
-                while let Some((request, reply)) = inbox.blocking_recv() {
-                    let answer = session.serve(&request);
-                    // A caller that gave up before the answer arrived is not an
-                    // error: it timed out, and the timeout already told it so.
-                    let _ = reply.send(answer);
+                while let Some(message) = inbox.blocking_recv() {
+                    match message {
+                        Message::Serve(request, reply) => {
+                            let answer = session.get_or_insert_with(Session::new).serve(&request);
+                            // A caller that gave up before the answer arrived
+                            // is not an error: it timed out, and the timeout
+                            // already told it so.
+                            let _ = reply.send(answer);
+                        }
+                        // Assigning `None` drops the old session before
+                        // anything replaces it. Two live isolates on one thread
+                        // is the thing skiff ADR-0016 says will take the
+                        // process with it, so the order is not incidental.
+                        Message::Release => session = None,
+                    }
                 }
             })
             .expect("a thread for the skiff session");
@@ -87,7 +107,26 @@ impl SkiffBackend {
         request: BrowserRequest,
         reply: oneshot::Sender<BrowserResponse>,
     ) -> Result<(), (BrowserRequest, oneshot::Sender<BrowserResponse>)> {
-        self.requests.send((request, reply)).await.map_err(|e| e.0)
+        self.requests
+            .send(Message::Serve(request, reply))
+            .await
+            .map_err(|e| match e.0 {
+                Message::Serve(request, reply) => (request, reply),
+                Message::Release => unreachable!("a Serve was sent"),
+            })
+    }
+
+    /// Drop the session and everything it holds.
+    ///
+    /// The document, its isolate and the storage that went with it. The next
+    /// call builds a fresh one, so this is both how a task stops paying for
+    /// the page the last one left behind and how it stops being able to see
+    /// it.
+    ///
+    /// Best-effort: a thread that has gone away has already released
+    /// everything this was going to ask it to.
+    pub async fn release(&self) {
+        let _ = self.requests.send(Message::Release).await;
     }
 }
 

@@ -7472,7 +7472,6 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 [[package]]
 name = "skiff"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "flate2",
  "skiff-core",
@@ -7486,7 +7485,6 @@ dependencies = [
 [[package]]
 name = "skiff-core"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "cssparser",
  "flate2",
@@ -7501,7 +7499,6 @@ dependencies = [
 [[package]]
 name = "skiff-js"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -7514,7 +7511,6 @@ dependencies = [
 [[package]]
 name = "skiff-layout"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "markup5ever_rcdom",
  "skiff-core",
@@ -7524,7 +7520,6 @@ dependencies = [
 [[package]]
 name = "skiff-net"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "reqwest 0.12.28",
  "skiff-core",
@@ -7534,7 +7529,6 @@ dependencies = [
 [[package]]
 name = "skiff-paint"
 version = "0.1.0"
-source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#dbb5e37b22b50be00592d880c0d71b576fd86f5d"
 dependencies = [
  "jpeg-decoder",
  "png 0.17.16",
