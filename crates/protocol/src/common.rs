@@ -1124,4 +1124,19 @@ mod tool_result_tests {
         let status: BashStatus = serde_json::from_str("\"timeout\"").unwrap();
         assert!(matches!(status, BashStatus::Timeout));
     }
+
+    /// These strings are a wire contract with the extension's `switch`, which
+    /// lives in another repository. Nothing in either build fails if they stop
+    /// matching — the action just falls through to the default case and the
+    /// feature is dead at runtime. So pin them here.
+    #[test]
+    fn network_actions_serialize_to_the_strings_the_extension_matches() {
+        for (action, expected) in [
+            (BrowserToolAction::NetworkCaptureStart, "network_capture_start"),
+            (BrowserToolAction::NetworkCaptureStop, "network_capture_stop"),
+            (BrowserToolAction::NetworkRequests, "network_requests"),
+        ] {
+            assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{expected}\""));
+        }
+    }
 }
