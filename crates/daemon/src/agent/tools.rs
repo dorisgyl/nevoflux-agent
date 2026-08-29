@@ -904,8 +904,17 @@ impl BrowserTool {
             | BrowserToolAction::GoForward
             | BrowserToolAction::GetContent
             | BrowserToolAction::Screenshot
-            | BrowserToolAction::GetElements => {
+            | BrowserToolAction::GetElements
+            | BrowserToolAction::NetworkCaptureStart
+            | BrowserToolAction::NetworkCaptureStop => {
                 serde_json::json!({})
+            }
+            BrowserToolAction::NetworkRequests => {
+                let only_failed = arguments
+                    .get("only_failed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                serde_json::json!({ "only_failed": only_failed })
             }
             BrowserToolAction::ListTabs | BrowserToolAction::QueryTabs => {
                 // QueryTabs may have optional filters, pass through

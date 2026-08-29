@@ -4321,6 +4321,33 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::GoForward, serde_json::json!({}), tab_id)
     }
 
+    fn browser_network_capture(
+        &self,
+        on: bool,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_network_capture on={on}");
+        let action = if on {
+            BrowserToolAction::NetworkCaptureStart
+        } else {
+            BrowserToolAction::NetworkCaptureStop
+        };
+        self.execute_browser_action(action, serde_json::json!({}), tab_id)
+    }
+
+    fn browser_network_requests(
+        &self,
+        only_failed: bool,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_network_requests only_failed={only_failed}");
+        self.execute_browser_action(
+            BrowserToolAction::NetworkRequests,
+            serde_json::json!({ "only_failed": only_failed }),
+            tab_id,
+        )
+    }
+
     fn browser_click(&self, selector: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         debug!("browser_click: selector={}", selector);
         self.execute_browser_action(

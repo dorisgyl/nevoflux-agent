@@ -321,6 +321,36 @@ pub enum BrowserToolAction {
     /// - `recording_id`: Echo of the recording ID
     #[serde(rename = "recording_stop")]
     StopRecording,
+    /// Start capturing this turn's network requests for a tab.
+    ///
+    /// Driven by `run_loop`, not by the model: capture has to be on before the
+    /// requests happen, and by the time an agent decides it wants a log they
+    /// already have.
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - `active`: true
+    NetworkCaptureStart,
+    /// Stop capturing and discard this tab's buffer.
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - `active`: false
+    NetworkCaptureStop,
+    /// Read the requests captured for a tab this turn.
+    ///
+    /// Params:
+    /// - `only_failed`: Optional, return only 4xx/5xx and network errors
+    ///
+    /// Returns:
+    /// - `active`: whether capture was on — false means "not enabled", which is
+    ///   NOT the same as an empty list
+    /// - `records`: Array of {url, method, status, type, duration_ms, headers, error}
+    /// - `summary`: {total, failed, dropped, by_status}
+    /// - `message`: present only when `active` is false; says how to enable it
+    NetworkRequests,
 }
 
 /// File attachment
@@ -1093,5 +1123,20 @@ mod tool_result_tests {
         assert!(matches!(status, BashStatus::Success));
         let status: BashStatus = serde_json::from_str("\"timeout\"").unwrap();
         assert!(matches!(status, BashStatus::Timeout));
+    }
+
+    /// These strings are a wire contract with the extension's `switch`, which
+    /// lives in another repository. Nothing in either build fails if they stop
+    /// matching — the action just falls through to the default case and the
+    /// feature is dead at runtime. So pin them here.
+    #[test]
+    fn network_actions_serialize_to_the_strings_the_extension_matches() {
+        for (action, expected) in [
+            (BrowserToolAction::NetworkCaptureStart, "network_capture_start"),
+            (BrowserToolAction::NetworkCaptureStop, "network_capture_stop"),
+            (BrowserToolAction::NetworkRequests, "network_requests"),
+        ] {
+            assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{expected}\""));
+        }
     }
 }

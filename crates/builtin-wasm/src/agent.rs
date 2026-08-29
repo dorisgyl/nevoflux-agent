@@ -448,6 +448,22 @@ fn build_elements_summary(elements: &[CachedElement]) -> String {
 }
 
 /// The built-in agent.
+/// Stops the turn's network capture however `run_loop` leaves.
+///
+/// `run_loop` has three return points and any number of `?` paths. Capture
+/// left running would keep recording into the next turn — one that never
+/// named the tool and never agreed to be recorded — so the stop cannot live
+/// on the happy path alone.
+struct CaptureGuard<'a, H: HostFunctions> {
+    host: &'a H,
+}
+
+impl<H: HostFunctions> Drop for CaptureGuard<'_, H> {
+    fn drop(&mut self) {
+        let _ = self.host.browser_network_capture(false, None);
+    }
+}
+
 pub struct Agent<H: HostFunctions> {
     /// Host functions interface.
     host: H,
@@ -1132,6 +1148,38 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             .collect()
     }
 
+    /// Tools that only work when the user names them.
+    ///
+    /// Network capture does not happen by default; it is switched on for the
+    /// one turn whose prompt writes the tool's name out (see the spec). A tool
+    /// that only works when named should not be paid for on every request.
+    const NAMED_ONLY_TOOLS: &'static [&'static str] = &["browser_network_requests"];
+
+    /// Did the user name the tool? A literal match, not intent detection.
+    ///
+    /// Does "why is this page slow" mean capture? No rule answers that
+    /// reliably, and both ways of being wrong are real: credentials collected
+    /// for nothing, or nothing collected when it mattered. Naming it is
+    /// explicit, auditable, and the user's own decision.
+    fn wants_network_capture(user_message: &str) -> bool {
+        user_message.contains("browser_network_requests")
+    }
+
+    /// Drop the named-only tools unless this turn's prompt named them.
+    ///
+    /// Separate from the canvas and speech gates because it answers to a
+    /// different fact — what the user wrote, rather than what is on screen or
+    /// who is listening.
+    fn gate_network_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
+        if unlocked {
+            return full.to_vec();
+        }
+        full.iter()
+            .filter(|t| !Self::NAMED_ONLY_TOOLS.contains(&t.name.as_str()))
+            .cloned()
+            .collect()
+    }
+
     fn run_loop(
         &self,
         input: &AgentInput,
@@ -1232,9 +1280,26 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // attached does not change mid-answer, and a canvas created mid-turn
         // re-runs both gates below.
         let speech_useful = self.host.speech_reaches_a_listener();
-        let mut active_tools = Self::gate_speech_tools(
-            &Self::gate_canvas_tools(tools, canvas_unlocked),
-            canvas_unlocked || speech_useful,
+        // Network capture only happens on a turn that named the tool. It is
+        // switched on here, at the top, because by the time an agent decides
+        // it wants a request log the requests have already been made.
+        let network_named = Self::wants_network_capture(&input.user_message);
+        let _capture_guard = if network_named {
+            // A failure here must not stop the turn, and it does not need to be
+            // logged: with no capture running the tool reports that it was not
+            // enabled, which is both true and the thing the model needs to know.
+            // This crate has no logger of its own anyway.
+            let _ = self.host.browser_network_capture(true, None);
+            Some(CaptureGuard { host: &self.host })
+        } else {
+            None
+        };
+        let mut active_tools = Self::gate_network_tools(
+            &Self::gate_speech_tools(
+                &Self::gate_canvas_tools(tools, canvas_unlocked),
+                canvas_unlocked || speech_useful,
+            ),
+            network_named,
         );
 
         let mut iterations = 0;
@@ -1419,8 +1484,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 canvas_unlocked = true;
                 // Both gates: a composition created this turn is exactly the
                 // case where narration becomes worth offering.
-                active_tools =
-                    Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true);
+                // 第三道门要跟着重建 —— 否则同回合创建 artifact 会把一个
+                // 没被点名的工具悄悄放回请求里。
+                active_tools = Self::gate_network_tools(
+                    &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
+                    network_named,
+                );
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -2164,6 +2233,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "browser_get_markdown" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_markdown(tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
+            "browser_network_requests" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let only_failed = tool_call.arguments["only_failed"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let result = self.host.browser_network_requests(only_failed, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_screenshot" => {
@@ -3346,6 +3423,23 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                         "tab_id": {
                             "type": "integer",
                             "description": "Optional tab ID (uses active tab if not specified)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "browser_network_requests".into(),
+                description: "List the network requests the page made during this turn: URL, method, status, resource type, duration, sizes, and a whitelisted subset of headers. Capture is off unless the user's own prompt names this tool, and it covers only the tab that was active when the turn started, only from the turn's start onward — it cannot show what happened before. Request and response bodies are never captured; Authorization and Cookie values read <redacted>. When capture was not enabled the reply says so rather than returning an empty list, because an empty list would mean the page made no requests. Pass only_failed to see just 4xx/5xx and network errors.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID (uses active tab if not specified). A tab other than the one active at turn start will report that capture was not enabled."
+                        },
+                        "only_failed": {
+                            "type": "boolean",
+                            "description": "Return only 4xx, 5xx and network errors"
                         }
                     }
                 }),
@@ -5767,6 +5861,40 @@ mod tests {
     /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
     /// 却每次请求都要付约 4.4 KB 的 schema。
     #[test]
+    /// 没被点名时,这个工具不该出现在请求里。
+    ///
+    /// 它必须被点名才会捕获(见 spec),所以每轮都付它的 schema 是白付 —— 与
+    /// canvas、语音那两族用的是同一条规则。
+    #[test]
+    fn the_network_tool_appears_only_when_the_prompt_names_it() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let all = agent.get_chat_tools();
+        assert!(
+            all.iter().any(|t| t.name == "browser_network_requests"),
+            "工具本身要存在"
+        );
+
+        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, false);
+        assert!(!gated.iter().any(|t| t.name == "browser_network_requests"));
+        assert_eq!(gated.len(), all.len() - 1);
+
+        let ungated = Agent::<MockHostFunctions>::gate_network_tools(&all, true);
+        assert_eq!(ungated.len(), all.len());
+    }
+
+    /// 点名是字面匹配,不是意图猜测。
+    #[test]
+    fn naming_the_network_tool_is_a_literal_match() {
+        assert!(Agent::<MockHostFunctions>::wants_network_capture(
+            "帮我调试,调用 browser_network_requests 看看"
+        ));
+        // 描述得再像也不算 —— 判错的代价是白抓一堆凭证,或者该抓时没抓。
+        assert!(!Agent::<MockHostFunctions>::wants_network_capture(
+            "帮我看看这个页面为什么慢"
+        ));
+    }
+
     fn speech_output_tools_are_not_offered_when_nothing_can_hear_them() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);

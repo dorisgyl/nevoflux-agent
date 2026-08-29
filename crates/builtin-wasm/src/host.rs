@@ -328,6 +328,20 @@ pub trait HostFunctions {
 
     /// Get page content as markdown.
     fn browser_get_markdown(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+    /// Turn this turn's network capture on or off for a tab.
+    fn browser_network_capture(
+        &self,
+        on: bool,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Read the network requests captured for a tab this turn.
+    fn browser_network_requests(
+        &self,
+        only_failed: bool,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
 
     /// Take a screenshot of the page.
     fn browser_screenshot(
@@ -1377,6 +1391,28 @@ impl HostFunctions for MockHostFunctions {
             "markdown": "# Mock Page\n\nThis is mock content."
         })))
     }
+    fn browser_network_capture(
+        &self,
+        on: bool,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({ "active": on })))
+    }
+
+    fn browser_network_requests(
+        &self,
+        _only_failed: bool,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        // Say it is off rather than returning nothing: an empty list reads as
+        // "the page made no requests".
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "active": false,
+            "records": [],
+            "message": "capture not enabled this turn"
+        })))
+    }
+
 
     fn browser_screenshot(
         &self,
