@@ -909,6 +909,16 @@ impl BrowserTool {
             | BrowserToolAction::NetworkCaptureStop => {
                 serde_json::json!({})
             }
+            BrowserToolAction::ConsoleMessages => {
+                let mut p = serde_json::Map::new();
+                if let Some(v) = arguments.get("levels") {
+                    p.insert("levels".into(), v.clone());
+                }
+                if let Some(v) = arguments.get("limit") {
+                    p.insert("limit".into(), v.clone());
+                }
+                serde_json::Value::Object(p)
+            }
             BrowserToolAction::NetworkRequests => {
                 let only_failed = arguments
                     .get("only_failed")

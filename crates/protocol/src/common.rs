@@ -351,6 +351,20 @@ pub enum BrowserToolAction {
     /// - `summary`: {total, failed, dropped, by_status}
     /// - `message`: present only when `active` is false; says how to enable it
     NetworkRequests,
+    /// Read a tab's console messages and uncaught JavaScript errors.
+    ///
+    /// Needs no capture switch: the platform already keeps this buffer, so the
+    /// read is the only exposure. That is also why it can show messages logged
+    /// before anyone asked — unlike the network side.
+    ///
+    /// Params:
+    /// - `levels`: Optional array, e.g. ["error", "warn"]
+    /// - `limit`: Optional, most recent N (default 100)
+    ///
+    /// Returns:
+    /// - `messages`: Array of {level, text, source, line, column, timestamp, origin}
+    /// - `summary`: {total, returned, frames, by_level}
+    ConsoleMessages,
 }
 
 /// File attachment
@@ -1135,6 +1149,7 @@ mod tool_result_tests {
             (BrowserToolAction::NetworkCaptureStart, "network_capture_start"),
             (BrowserToolAction::NetworkCaptureStop, "network_capture_stop"),
             (BrowserToolAction::NetworkRequests, "network_requests"),
+            (BrowserToolAction::ConsoleMessages, "console_messages"),
         ] {
             assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{expected}\""));
         }

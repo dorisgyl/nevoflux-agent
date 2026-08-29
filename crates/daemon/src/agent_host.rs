@@ -4333,6 +4333,27 @@ impl HostFunctions for DaemonHostFunctions {
         NETWORK_CAPTURE_ARMED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn browser_console_messages(
+        &self,
+        levels: Vec<String>,
+        limit: Option<i64>,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_console_messages levels={levels:?} limit={limit:?}");
+        let mut params = serde_json::Map::new();
+        if !levels.is_empty() {
+            params.insert("levels".into(), serde_json::json!(levels));
+        }
+        if let Some(n) = limit {
+            params.insert("limit".into(), serde_json::json!(n));
+        }
+        self.execute_browser_action(
+            BrowserToolAction::ConsoleMessages,
+            serde_json::Value::Object(params),
+            tab_id,
+        )
+    }
+
     fn browser_network_capture(
         &self,
         on: bool,

@@ -343,6 +343,20 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
+    /// Read a tab's console messages and uncaught JavaScript errors.
+    fn browser_console_messages(
+        &self,
+        levels: Vec<String>,
+        limit: Option<i64>,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        let _ = (levels, limit, tab_id);
+        Err(HostError {
+            code: 5,
+            message: "browser_console_messages not supported by this host".into(),
+        })
+    }
+
     /// Read the network requests captured for a tab this turn.
     fn browser_network_requests(
         &self,

@@ -1138,7 +1138,11 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// one turn whose prompt writes the tool's name out (see the spec). A tool
     /// that only works when named should not be paid for on every request.
     const NAMED_ONLY_TOOLS: &'static [&'static str] =
-        &["browser_network_requests", "browser_network_capture_stop"];
+        &[
+        "browser_network_requests",
+        "browser_network_capture_stop",
+        "browser_console_messages",
+    ];
 
     /// Did the user name the tool? A literal match, not intent detection.
     ///
@@ -1150,17 +1154,32 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         user_message.contains("browser_network_requests")
     }
 
+    /// 控制台工具也要被点名才提供。
+    ///
+    /// 它不需要「开启捕获」—— 平台本来就留着那个缓冲,所以读取就是唯一的暴露
+    /// 面。但门控的理由不变:页面日志里什么都可能有,不该在没人要求时进上下文。
+    fn wants_console(user_message: &str) -> bool {
+        user_message.contains("browser_console_messages")
+    }
+
     /// Drop the named-only tools unless this turn's prompt named them.
     ///
     /// Separate from the canvas and speech gates because it answers to a
     /// different fact — what the user wrote, rather than what is on screen or
     /// who is listening.
-    fn gate_network_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
-        if unlocked {
-            return full.to_vec();
-        }
+    fn gate_network_tools(
+        full: &[ToolDefinition],
+        network_on: bool,
+        console_on: bool,
+    ) -> Vec<ToolDefinition> {
         full.iter()
-            .filter(|t| !Self::NAMED_ONLY_TOOLS.contains(&t.name.as_str()))
+            .filter(|t| match t.name.as_str() {
+                "browser_console_messages" => console_on,
+                // 两个网络工具同进同出:能读却不能停,就意味着用户开了录制之后
+                // 没有办法关掉它。
+                "browser_network_requests" | "browser_network_capture_stop" => network_on,
+                _ => true,
+            })
             .cloned()
             .collect()
     }
@@ -1286,12 +1305,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // started it — otherwise the user could start a recording and then have
         // no way to read or stop it.
         let network_on = network_named || network_armed;
+        let console_named = Self::wants_console(&input.user_message);
         let mut active_tools = Self::gate_network_tools(
             &Self::gate_speech_tools(
                 &Self::gate_canvas_tools(tools, canvas_unlocked),
                 canvas_unlocked || speech_useful,
             ),
             network_on,
+            console_named,
         );
 
         let mut iterations = 0;
@@ -1481,6 +1502,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 active_tools = Self::gate_network_tools(
                     &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
                     network_on,
+                    console_named,
                 );
             }
 
@@ -2225,6 +2247,20 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "browser_get_markdown" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_markdown(tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
+            "browser_console_messages" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let limit = tool_call.arguments["limit"].as_i64();
+                let levels = tool_call.arguments["levels"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let result = self.host.browser_console_messages(levels, limit, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_network_capture_stop" => {
@@ -3424,13 +3460,29 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                 }),
             },
             ToolDefinition {
+                name: "browser_console_messages".into(),
+                description: "Read a page's console messages and uncaught JavaScript errors: level, text, source file, line, and timestamp. Unlike the network tool this needs no recording — the browser already keeps this buffer, so messages logged BEFORE you ask are included, and you do not have to reload the page first. Covers every frame of the tab, including cross-origin iframes. Pass levels (e.g. [\"error\", \"warn\"]) to filter and limit for how many of the most recent to return (default 100). Message text is whatever the page logged and is not redacted — a page that logs a token will show it.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tab_id": { "type": "integer", "description": "Optional tab ID (uses active tab if not specified)" },
+                        "levels": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Only these levels: log, info, warn, error, debug"
+                        },
+                        "limit": { "type": "integer", "description": "Most recent N messages (default 100)" }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "browser_network_capture_stop".into(),
                 description: "Stop the network recording and discard everything it captured. Recording keeps running across turns once started, so it needs an explicit end; call this as soon as the user says they are done, and tell them it stopped. It also stops on its own after 30 minutes.".into(),
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             },
             ToolDefinition {
                 name: "browser_network_requests".into(),
-                description: "List the network requests captured since recording started: URL, method, status, resource type, duration, sizes, and whitelisted request_headers and response_headers. Recording starts when the user's own prompt names this tool and then KEEPS RUNNING across turns until stopped or 30 minutes pass, so requests the user makes by clicking the page themselves are captured too — tell them they can browse and then ask again. It cannot show requests made before recording started. Every tab is recorded; tab_id selects which one to read, defaulting to the active tab. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether recording is off or simply had nothing yet — read it rather than concluding the page made no requests. Pass only_failed to see just 4xx/5xx and network errors. Call browser_network_capture_stop when the user is done.".into(),
+                description: "List the network requests captured since recording started: URL, method, status, resource type, duration, byte counts, and whitelisted request_headers and response_headers. Recording starts when the user's own prompt names this tool and then KEEPS RUNNING across turns until stopped or 30 minutes pass, so requests the user makes by clicking the page themselves are captured too — tell them they can browse and then ask again. It cannot show requests made before recording started. Every tab is recorded; tab_id selects which one to read, defaulting to the active tab. At most 100 records come back per call, newest last, while summary counts them all — read summary.by_type before paging, since a page load is mostly static assets, and use only_failed for 4xx/5xx and network errors. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether recording is off or simply had nothing yet — read it rather than concluding the page made no requests. Call browser_network_capture_stop when the user is done.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -5876,15 +5928,49 @@ mod tests {
             "工具本身要存在"
         );
 
-        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, false);
-        assert!(!gated.iter().any(|t| t.name == "browser_network_requests"));
-        assert!(!gated
-            .iter()
-            .any(|t| t.name == "browser_network_capture_stop"));
-        assert_eq!(gated.len(), all.len() - 2);
+        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, false, false);
+        for name in Agent::<MockHostFunctions>::NAMED_ONLY_TOOLS {
+            assert!(!gated.iter().any(|t| &t.name == name), "{name} 仍在请求里");
+        }
+        assert_eq!(gated.len(), all.len() - 3);
 
-        let ungated = Agent::<MockHostFunctions>::gate_network_tools(&all, true);
+        let ungated = Agent::<MockHostFunctions>::gate_network_tools(&all, true, true);
         assert_eq!(ungated.len(), all.len());
+    }
+
+    /// 点名控制台不该把网络那两个也带出来,反之亦然。
+    ///
+    /// 它们答的是两件不同的事,而多带出来的每个 schema 都是每轮都付的钱。
+    #[test]
+    fn the_console_and_network_gates_are_independent() {
+        let all = Agent::new(MockHostFunctions::new()).get_chat_tools();
+
+        let console_only = Agent::<MockHostFunctions>::gate_network_tools(&all, false, true);
+        assert!(console_only
+            .iter()
+            .any(|t| t.name == "browser_console_messages"));
+        assert!(!console_only
+            .iter()
+            .any(|t| t.name == "browser_network_requests"));
+
+        let network_only = Agent::<MockHostFunctions>::gate_network_tools(&all, true, false);
+        assert!(network_only
+            .iter()
+            .any(|t| t.name == "browser_network_requests"));
+        assert!(!network_only
+            .iter()
+            .any(|t| t.name == "browser_console_messages"));
+    }
+
+    /// 控制台也是字面点名,和网络同一条规则。
+    #[test]
+    fn naming_the_console_tool_is_a_literal_match() {
+        assert!(Agent::<MockHostFunctions>::wants_console(
+            "调用 browser_console_messages 看看报了什么错"
+        ));
+        assert!(!Agent::<MockHostFunctions>::wants_console(
+            "这个页面好像有报错"
+        ));
     }
 
     /// 停止的工具必须和读取的工具一起出现。
@@ -5897,7 +5983,7 @@ mod tests {
         let agent = Agent::new(mock);
         let all = agent.get_chat_tools();
         for on in [true, false] {
-            let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, on);
+            let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, on, on);
             assert_eq!(
                 gated.iter().any(|t| t.name == "browser_network_requests"),
                 gated
@@ -5919,7 +6005,7 @@ mod tests {
         let named = Agent::<MockHostFunctions>::wants_network_capture("现在有哪些请求?");
         assert!(!named);
         let armed = true;
-        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, named || armed);
+        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, named || armed, false);
         assert!(gated.iter().any(|t| t.name == "browser_network_requests"));
     }
 
