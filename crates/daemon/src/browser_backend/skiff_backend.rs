@@ -467,6 +467,27 @@ impl Session {
                 })
             }
 
+            // ── Engine work, but not built here yet ─────────────────────────
+            //
+            // Unlike the group below these ARE browser-engine actions: skiff
+            // simply has no network observer or console store yet, and the
+            // extension backend serves them through webRequest and
+            // nsIConsoleAPIStorage. Refusing by name matters more here than
+            // elsewhere — an empty request log or an empty console reads as
+            // "the page did nothing", which is a wrong answer rather than a
+            // missing one.
+            BrowserToolAction::NetworkCaptureStart
+            | BrowserToolAction::NetworkCaptureStop
+            | BrowserToolAction::NetworkRequests
+            | BrowserToolAction::ConsoleMessages => Err(BrowserToolError {
+                code: code::CAPABILITY_MISS,
+                message: format!(
+                    "skiff does not serve {:?} yet; the extension backend does",
+                    request.action
+                ),
+                recoverable: true,
+            }),
+
             // ── Never this engine's work ────────────────────────────────────
             //
             // On the agent's tool surface but not browser-engine actions

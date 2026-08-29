@@ -112,7 +112,13 @@ jobs:
             os: ubuntu-latest
             artifact: nevoflux-agent-linux-aarch64
             use_cross: true
-            skiff: true
+            # No `skiff` here, and not because V8 lacks a build for the target
+            # — it has one. The cross image (ghcr.io/cross-rs/…:0.2.5) is built
+            # on Ubuntu 16.04, whose glibc 2.23 predates `memfd_create`; V8
+            # calls it, so linking skiff-js's build script fails inside the
+            # container. Restoring skiff here means a cross image with glibc
+            # >= 2.27, which also raises this artifact's glibc floor — the same
+            # trade the x86_64 job makes deliberately by pinning 22.04.
             # Embedding works here now: load-dynamic links no ONNX Runtime at
             # build time, so the old "ort C++ linking fails in cross Docker"
             # blocker is gone; the aarch64 runtime is bundled at package time.
