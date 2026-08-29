@@ -1225,6 +1225,14 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// 网络捕获此刻是否开着。
+///
+/// 真正的状态在扩展那边(缓冲和计时都在那儿),这里存一份镜像,只为了让
+/// `run_loop` 不必每回合都往浏览器问一趟就能决定要不要提供这两个工具。
+/// 会因为浏览器侧到点自动停而变陈旧,所以每次读取结果都拿来对一次。
+static NETWORK_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl HostFunctions for DaemonHostFunctions {
     /// Persist a completed tool's result as a `tool_result` message so the goal
     /// evaluator reads the raw observation (not the model's paraphrase) and the
@@ -4321,12 +4329,17 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::GoForward, serde_json::json!({}), tab_id)
     }
 
+    fn network_capture_armed(&self) -> bool {
+        NETWORK_CAPTURE_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn browser_network_capture(
         &self,
         on: bool,
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         debug!("browser_network_capture on={on}");
+        NETWORK_CAPTURE_ARMED.store(on, std::sync::atomic::Ordering::Relaxed);
         let action = if on {
             BrowserToolAction::NetworkCaptureStart
         } else {
@@ -4341,11 +4354,23 @@ impl HostFunctions for DaemonHostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         debug!("browser_network_requests only_failed={only_failed}");
-        self.execute_browser_action(
+        let result = self.execute_browser_action(
             BrowserToolAction::NetworkRequests,
             serde_json::json!({ "only_failed": only_failed }),
             tab_id,
-        )
+        )?;
+        // 录制会自己到点停掉,而那发生在浏览器里 —— 这边只有读到 active:false
+        // 时才知道。不同步的话,后面每一轮都会白白带上这两个工具的 schema。
+        if result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("active"))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            NETWORK_CAPTURE_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     fn browser_click(&self, selector: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {

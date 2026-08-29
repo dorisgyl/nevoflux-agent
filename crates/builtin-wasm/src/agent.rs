@@ -448,22 +448,6 @@ fn build_elements_summary(elements: &[CachedElement]) -> String {
 }
 
 /// The built-in agent.
-/// Stops the turn's network capture however `run_loop` leaves.
-///
-/// `run_loop` has three return points and any number of `?` paths. Capture
-/// left running would keep recording into the next turn — one that never
-/// named the tool and never agreed to be recorded — so the stop cannot live
-/// on the happy path alone.
-struct CaptureGuard<'a, H: HostFunctions> {
-    host: &'a H,
-}
-
-impl<H: HostFunctions> Drop for CaptureGuard<'_, H> {
-    fn drop(&mut self) {
-        let _ = self.host.browser_network_capture(false, None);
-    }
-}
-
 pub struct Agent<H: HostFunctions> {
     /// Host functions interface.
     host: H,
@@ -1153,7 +1137,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// Network capture does not happen by default; it is switched on for the
     /// one turn whose prompt writes the tool's name out (see the spec). A tool
     /// that only works when named should not be paid for on every request.
-    const NAMED_ONLY_TOOLS: &'static [&'static str] = &["browser_network_requests"];
+    const NAMED_ONLY_TOOLS: &'static [&'static str] =
+        &["browser_network_requests", "browser_network_capture_stop"];
 
     /// Did the user name the tool? A literal match, not intent detection.
     ///
@@ -1280,26 +1265,33 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // attached does not change mid-answer, and a canvas created mid-turn
         // re-runs both gates below.
         let speech_useful = self.host.speech_reaches_a_listener();
-        // Network capture only happens on a turn that named the tool. It is
-        // switched on here, at the top, because by the time an agent decides
-        // it wants a request log the requests have already been made.
+        // Network capture starts when the user names the tool, and then keeps
+        // running across turns until it is stopped or times out. A one-turn
+        // window was the first design and it did not survive contact with the
+        // job: debugging a page means clicking around it yourself, and by the
+        // time you have switched to the browser the turn is over.
+        //
+        // So a later turn cannot tell from its own user message whether capture
+        // is on — it has to ask.
+        let network_armed = self.host.network_capture_armed();
         let network_named = Self::wants_network_capture(&input.user_message);
-        let _capture_guard = if network_named {
+        if network_named && !network_armed {
             // A failure here must not stop the turn, and it does not need to be
             // logged: with no capture running the tool reports that it was not
             // enabled, which is both true and the thing the model needs to know.
             // This crate has no logger of its own anyway.
             let _ = self.host.browser_network_capture(true, None);
-            Some(CaptureGuard { host: &self.host })
-        } else {
-            None
-        };
+        }
+        // Offer the tools while recording is live, not only on the turn that
+        // started it — otherwise the user could start a recording and then have
+        // no way to read or stop it.
+        let network_on = network_named || network_armed;
         let mut active_tools = Self::gate_network_tools(
             &Self::gate_speech_tools(
                 &Self::gate_canvas_tools(tools, canvas_unlocked),
                 canvas_unlocked || speech_useful,
             ),
-            network_named,
+            network_on,
         );
 
         let mut iterations = 0;
@@ -1488,7 +1480,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 // 没被点名的工具悄悄放回请求里。
                 active_tools = Self::gate_network_tools(
                     &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
-                    network_named,
+                    network_on,
                 );
             }
 
@@ -2233,6 +2225,10 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "browser_get_markdown" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_markdown(tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
+            "browser_network_capture_stop" => {
+                let result = self.host.browser_network_capture(false, None)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_network_requests" => {
@@ -3428,8 +3424,13 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                 }),
             },
             ToolDefinition {
+                name: "browser_network_capture_stop".into(),
+                description: "Stop the network recording and discard everything it captured. Recording keeps running across turns once started, so it needs an explicit end; call this as soon as the user says they are done, and tell them it stopped. It also stops on its own after 30 minutes.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
                 name: "browser_network_requests".into(),
-                description: "List the network requests the page made during this turn: URL, method, status, resource type, duration, sizes, and whitelisted request_headers and response_headers. IMPORTANT: capture starts when the turn starts, so a page that was already loaded has made no requests it can see — to inspect a page, load it during this same turn (browser_navigate to its URL) and then call this. Capture is off unless the user's own prompt names this tool, and it follows the tab that was active when the turn started. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether capture was off or simply had nothing to record — read it rather than concluding the page made no requests. Pass only_failed to see just 4xx/5xx and network errors.".into(),
+                description: "List the network requests captured since recording started: URL, method, status, resource type, duration, sizes, and whitelisted request_headers and response_headers. Recording starts when the user's own prompt names this tool and then KEEPS RUNNING across turns until stopped or 30 minutes pass, so requests the user makes by clicking the page themselves are captured too — tell them they can browse and then ask again. It cannot show requests made before recording started. Every tab is recorded; tab_id selects which one to read, defaulting to the active tab. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether recording is off or simply had nothing yet — read it rather than concluding the page made no requests. Pass only_failed to see just 4xx/5xx and network errors. Call browser_network_capture_stop when the user is done.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -5877,10 +5878,49 @@ mod tests {
 
         let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, false);
         assert!(!gated.iter().any(|t| t.name == "browser_network_requests"));
-        assert_eq!(gated.len(), all.len() - 1);
+        assert!(!gated
+            .iter()
+            .any(|t| t.name == "browser_network_capture_stop"));
+        assert_eq!(gated.len(), all.len() - 2);
 
         let ungated = Agent::<MockHostFunctions>::gate_network_tools(&all, true);
         assert_eq!(ungated.len(), all.len());
+    }
+
+    /// 停止的工具必须和读取的工具一起出现。
+    ///
+    /// 录制会活过开启它的那个回合,所以「能开、能读、不能停」是一种真实可达的
+    /// 状态 —— 那意味着用户开了录制之后没有办法关掉它。
+    #[test]
+    fn whatever_can_read_the_recording_can_also_stop_it() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let all = agent.get_chat_tools();
+        for on in [true, false] {
+            let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, on);
+            assert_eq!(
+                gated.iter().any(|t| t.name == "browser_network_requests"),
+                gated
+                    .iter()
+                    .any(|t| t.name == "browser_network_capture_stop"),
+                "读和停必须同进同出 (on={on})"
+            );
+        }
+    }
+
+    /// 录制开着时,后续回合即使没再点名也要能拿到工具。
+    ///
+    /// 这正是「一个回合」改成「一段会话」要解决的问题:人开了录制去点页面,
+    /// 回来再问的那一轮,提示词里不会再出现工具名。
+    #[test]
+    fn a_live_recording_keeps_the_tools_on_later_turns() {
+        let all = Agent::new(MockHostFunctions::new()).get_chat_tools();
+        // 没点名、也没在录 —— 不提供。
+        let named = Agent::<MockHostFunctions>::wants_network_capture("现在有哪些请求?");
+        assert!(!named);
+        let armed = true;
+        let gated = Agent::<MockHostFunctions>::gate_network_tools(&all, named || armed);
+        assert!(gated.iter().any(|t| t.name == "browser_network_requests"));
     }
 
     /// 点名是字面匹配,不是意图猜测。

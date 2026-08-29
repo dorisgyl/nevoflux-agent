@@ -328,7 +328,15 @@ pub trait HostFunctions {
 
     /// Get page content as markdown.
     fn browser_get_markdown(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
-    /// Turn this turn's network capture on or off for a tab.
+    /// Is network capture running right now?
+    ///
+    /// Capture outlives the turn that started it, so a later turn has to ask
+    /// rather than infer it from its own user message.
+    fn network_capture_armed(&self) -> bool {
+        false
+    }
+
+    /// Turn network capture on or off.
     fn browser_network_capture(
         &self,
         on: bool,
