@@ -4333,6 +4333,27 @@ impl HostFunctions for DaemonHostFunctions {
         NETWORK_CAPTURE_ARMED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn browser_console_messages(
+        &self,
+        levels: Vec<String>,
+        limit: Option<i64>,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_console_messages levels={levels:?} limit={limit:?}");
+        let mut params = serde_json::Map::new();
+        if !levels.is_empty() {
+            params.insert("levels".into(), serde_json::json!(levels));
+        }
+        if let Some(n) = limit {
+            params.insert("limit".into(), serde_json::json!(n));
+        }
+        self.execute_browser_action(
+            BrowserToolAction::ConsoleMessages,
+            serde_json::Value::Object(params),
+            tab_id,
+        )
+    }
+
     fn browser_network_capture(
         &self,
         on: bool,
@@ -4351,12 +4372,18 @@ impl HostFunctions for DaemonHostFunctions {
     fn browser_network_requests(
         &self,
         only_failed: bool,
+        types: Vec<String>,
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
-        debug!("browser_network_requests only_failed={only_failed}");
+        debug!("browser_network_requests only_failed={only_failed} types={types:?}");
+        let mut params = serde_json::Map::new();
+        params.insert("only_failed".into(), serde_json::json!(only_failed));
+        if !types.is_empty() {
+            params.insert("types".into(), serde_json::json!(types));
+        }
         let result = self.execute_browser_action(
             BrowserToolAction::NetworkRequests,
-            serde_json::json!({ "only_failed": only_failed }),
+            serde_json::Value::Object(params),
             tab_id,
         )?;
         // 录制会自己到点停掉,而那发生在浏览器里 —— 这边只有读到 active:false

@@ -909,12 +909,27 @@ impl BrowserTool {
             | BrowserToolAction::NetworkCaptureStop => {
                 serde_json::json!({})
             }
+            BrowserToolAction::ConsoleMessages => {
+                let mut p = serde_json::Map::new();
+                if let Some(v) = arguments.get("levels") {
+                    p.insert("levels".into(), v.clone());
+                }
+                if let Some(v) = arguments.get("limit") {
+                    p.insert("limit".into(), v.clone());
+                }
+                serde_json::Value::Object(p)
+            }
             BrowserToolAction::NetworkRequests => {
                 let only_failed = arguments
                     .get("only_failed")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                serde_json::json!({ "only_failed": only_failed })
+                let mut p = serde_json::Map::new();
+                p.insert("only_failed".into(), serde_json::json!(only_failed));
+                if let Some(v) = arguments.get("types") {
+                    p.insert("types".into(), v.clone());
+                }
+                serde_json::Value::Object(p)
             }
             BrowserToolAction::ListTabs | BrowserToolAction::QueryTabs => {
                 // QueryTabs may have optional filters, pass through
