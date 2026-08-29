@@ -2272,7 +2272,15 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 let only_failed = tool_call.arguments["only_failed"]
                     .as_bool()
                     .unwrap_or(false);
-                let result = self.host.browser_network_requests(only_failed, tab_id)?;
+                let types = tool_call.arguments["types"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let result = self.host.browser_network_requests(only_failed, types, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_screenshot" => {
@@ -3482,7 +3490,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "browser_network_requests".into(),
-                description: "List the network requests captured since recording started: URL, method, status, resource type, duration, byte counts, and whitelisted request_headers and response_headers. Recording starts when the user's own prompt names this tool and then KEEPS RUNNING across turns until stopped or 30 minutes pass, so requests the user makes by clicking the page themselves are captured too — tell them they can browse and then ask again. It cannot show requests made before recording started. Every tab is recorded; tab_id selects which one to read, defaulting to the active tab. At most 100 records come back per call, newest last, while summary counts them all — read summary.by_type before paging, since a page load is mostly static assets, and use only_failed for 4xx/5xx and network errors. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether recording is off or simply had nothing yet — read it rather than concluding the page made no requests. Call browser_network_capture_stop when the user is done.".into(),
+                description: "List the network requests captured since recording started: URL, method, status, resource type, duration, request_bytes and response_bytes (wire bytes including headers, not body size), and whitelisted request_headers and response_headers. Recording starts when the user's own prompt names this tool and then KEEPS RUNNING across turns until stopped or 30 minutes pass, so requests the user makes by clicking the page themselves are captured too — tell them they can browse and then ask again. It cannot show requests made before recording started. Every tab is recorded; tab_id selects which one to read, defaulting to the active tab. At most 100 records come back per call, newest last, while summary counts them all — read summary.by_type before paging, since a page load is mostly static assets, and narrow with types (e.g. [\"xmlhttprequest\",\"fetch\"]) or only_failed. Request and response bodies are never captured; Authorization, Cookie and Set-Cookie values read <redacted>, their names kept. An empty result carries a message saying whether recording is off or simply had nothing yet — read it rather than concluding the page made no requests. Call browser_network_capture_stop when the user is done.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3493,6 +3501,11 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                         "only_failed": {
                             "type": "boolean",
                             "description": "Return only 4xx, 5xx and network errors"
+                        },
+                        "types": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Only these resource types, e.g. [\"xmlhttprequest\", \"fetch\"] for API calls. Combines with only_failed. See summary.by_type for what is there."
                         }
                     }
                 }),

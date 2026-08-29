@@ -924,7 +924,12 @@ impl BrowserTool {
                     .get("only_failed")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                serde_json::json!({ "only_failed": only_failed })
+                let mut p = serde_json::Map::new();
+                p.insert("only_failed".into(), serde_json::json!(only_failed));
+                if let Some(v) = arguments.get("types") {
+                    p.insert("types".into(), v.clone());
+                }
+                serde_json::Value::Object(p)
             }
             BrowserToolAction::ListTabs | BrowserToolAction::QueryTabs => {
                 // QueryTabs may have optional filters, pass through

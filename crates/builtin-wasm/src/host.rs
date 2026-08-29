@@ -361,6 +361,7 @@ pub trait HostFunctions {
     fn browser_network_requests(
         &self,
         only_failed: bool,
+        types: Vec<String>,
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
@@ -1424,6 +1425,7 @@ impl HostFunctions for MockHostFunctions {
     fn browser_network_requests(
         &self,
         _only_failed: bool,
+        _types: Vec<String>,
         _tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         // Say it is off rather than returning nothing: an empty list reads as
