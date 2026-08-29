@@ -321,6 +321,36 @@ pub enum BrowserToolAction {
     /// - `recording_id`: Echo of the recording ID
     #[serde(rename = "recording_stop")]
     StopRecording,
+    /// Start capturing this turn's network requests for a tab.
+    ///
+    /// Driven by `run_loop`, not by the model: capture has to be on before the
+    /// requests happen, and by the time an agent decides it wants a log they
+    /// already have.
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - `active`: true
+    NetworkCaptureStart,
+    /// Stop capturing and discard this tab's buffer.
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - `active`: false
+    NetworkCaptureStop,
+    /// Read the requests captured for a tab this turn.
+    ///
+    /// Params:
+    /// - `only_failed`: Optional, return only 4xx/5xx and network errors
+    ///
+    /// Returns:
+    /// - `active`: whether capture was on — false means "not enabled", which is
+    ///   NOT the same as an empty list
+    /// - `records`: Array of {url, method, status, type, duration_ms, headers, error}
+    /// - `summary`: {total, failed, dropped, by_status}
+    /// - `message`: present only when `active` is false; says how to enable it
+    NetworkRequests,
 }
 
 /// File attachment
