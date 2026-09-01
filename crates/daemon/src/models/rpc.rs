@@ -184,6 +184,11 @@ async fn download_with(
         let frame = match result {
             Ok(()) => {
                 tracing::info!(target: "models", tier = tier.id(), "ready");
+                // 新权重落地,语音那边缓存着的结论就过期了。不推翻它的后果是
+                // 刚下完的 717 MB 要等到下次重启才用得上。
+                if tier.carries_speech() {
+                    crate::tts::moss::weights_changed();
+                }
                 serde_json::json!({
                     "tier": tier.id(),
                     "status": "ok",

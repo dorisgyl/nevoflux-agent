@@ -30,8 +30,8 @@
 //! speaker now gets a voice either way — while the warning text stayed as
 //! loud as when it meant silence.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::config::{AgentConfig, MossConfig};
 use crate::tts::TtsError;
@@ -317,74 +317,162 @@ mod local {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
-    /// The loaded engine, kept for the life of the process.
+    /// 上一次决定的结果,连失败一起缓存。
     ///
     /// 717 MB and several seconds to load: per-request would put that on every
-    /// reply. `OnceLock<Result>` rather than retrying — a missing file will
-    /// still be missing on the next sentence, and retrying turns one clear
-    /// failure into one per sentence.
+    /// reply. 失败也留着 —— 缺的文件下一句话还是缺,重试只会把一次清楚的失败
+    /// 变成每句一次。
+    ///
+    /// 但「留着」不等于「永远」。从前这里是 `OnceLock<Result>`,而 `OnceLock`
+    /// 没有反悔的余地:权重下到一半时问过一次,得到「没装」,那个结论就跟着进程
+    /// 走到底 —— 下完的 717 MB 要等到下次重启才用得上。这不是假想,日志里就是
+    /// 这么发生的:06:24 判定没装,06:29 下载完成,之后每一轮仍然是 Kokoro。
+    static ENGINE: std::sync::Mutex<Option<(u64, Result<Arc<MossEngine>, String>)>> =
+        std::sync::Mutex::new(None);
+
+    /// 权重换过几代。缓存里那条比它旧,就不算数了。
+    ///
+    /// 用一个计数器,而不是让 [`forget`] 直接去把缓存清空:清空要拿 `ENGINE` 的
+    /// 锁,而那把锁可能正被一次十秒的加载握着。而 [`forget`] 的调用方是下载完成
+    /// 的回调,跑在 async 任务里 —— 让它在那儿等十秒,就是把一个 tokio 工作线程
+    /// 钉住十秒。加一个数不会等任何人。
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// 忘掉上一次的结论,让下一次重新决定。
+    pub fn forget() {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The loaded engine, kept for the life of the process — or until the
+    /// weights change under it.
     pub fn engine(
         cfg: &MossConfig,
         setting: crate::tts::backend::Setting,
         budget: f32,
     ) -> Result<Arc<MossEngine>, TtsError> {
-        static ENGINE: OnceLock<Result<Arc<MossEngine>, String>> = OnceLock::new();
-        ENGINE
-            .get_or_init(|| {
-                let dir = model_dir(cfg);
-                let threads = cfg
-                    .threads
-                    .unwrap_or_else(nevoflux_tts::model::default_threads);
-                // 探测就发生在这里 —— 第一次真的要说话的那一刻,而不是 daemon
-                // 启动时:启动不该为一个多数会话用不到的功能付几秒。
-                let probed = crate::tts::backend::probe(&dir, threads, setting, budget);
-                crate::tts::backend::record(&probed.selection);
-                // 探测量到的速度就是这台机器上 MOSS 的速度,交给预算那道判断 ——
-                // 它读的是 `measured_rtf()`,而在这之前那里是空的。
-                record_rtf_value(probed.selection.rtf);
-                // 立刻落盘。等这一轮说完再写,中间崩一次就要重探一次 —— 而
-                // 探测正是最容易崩的那一段。
-                persist_now();
-                // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
-                // 而后者建出来的会带着真正的错误失败。
-                let loaded = match probed.engine {
-                    Some(e) => Ok(e),
-                    None => MossEngine::load(&dir, threads, probed.selection.ep)
-                        .map_err(|e| e.to_string()),
-                };
-                match loaded {
-                    Ok(e) => {
-                        tracing::info!(
-                            target: "speech",
-                            voices = e.voices().len(),
-                            dir = %dir.display(),
-                            backend = %probed.selection.summary(),
-                            "MOSS loaded"
-                        );
-                        Ok(Arc::new(e))
-                    }
-                    Err(e) => Err(e),
-                }
-            })
+        let now = GENERATION.load(Ordering::Relaxed);
+        // 锁一直握到加载结束,和从前的 `get_or_init` 一样:两个人同时要说话时
+        // 第二个等第一个,而不是各自加载一次 717 MB。
+        let mut slot = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = match slot.as_ref() {
+            Some((generation, _)) => *generation != now,
+            None => true,
+        };
+        if stale {
+            *slot = Some((now, load(cfg, setting, budget)));
+        }
+        slot.as_ref()
+            .expect("刚填过")
+            .1
             .clone()
             .map_err(TtsError::ConfigMissing)
+    }
+
+    /// 真正去建一次引擎。探测、计时、落盘都在这里,所以它很贵。
+    fn load(
+        cfg: &MossConfig,
+        setting: crate::tts::backend::Setting,
+        budget: f32,
+    ) -> Result<Arc<MossEngine>, String> {
+        let dir = model_dir(cfg);
+        let threads = cfg
+            .threads
+            .unwrap_or_else(nevoflux_tts::model::default_threads);
+        // 探测就发生在这里 —— 第一次真的要说话的那一刻,而不是 daemon
+        // 启动时:启动不该为一个多数会话用不到的功能付几秒。
+        let probed = crate::tts::backend::probe(&dir, threads, setting, budget);
+        crate::tts::backend::record(&probed.selection);
+        // 探测量到的速度就是这台机器上 MOSS 的速度,交给预算那道判断 ——
+        // 它读的是 `measured_rtf()`,而在这之前那里是空的。
+        record_rtf_value(probed.selection.rtf);
+        // 立刻落盘。等这一轮说完再写,中间崩一次就要重探一次 —— 而
+        // 探测正是最容易崩的那一段。
+        persist_now();
+        // 探测赢下来的引擎直接留用;只有钉死或全军覆没时才需要现建一个,
+        // 而后者建出来的会带着真正的错误失败。
+        let loaded = match probed.engine {
+            Some(e) => Ok(e),
+            None => MossEngine::load(&dir, threads, probed.selection.ep).map_err(|e| e.to_string()),
+        };
+        match loaded {
+            Ok(e) => {
+                tracing::info!(
+                    target: "speech",
+                    voices = e.voices().len(),
+                    dir = %dir.display(),
+                    backend = %probed.selection.summary(),
+                    "MOSS loaded"
+                );
+                Ok(Arc::new(e))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
 #[cfg(feature = "tts-local")]
 pub use local::engine;
 
-/// Pick an engine for conversation, with the reason attached.
+/// 权重变了,上一次的结论就不算数了。
+///
+/// 两件事一起忘,而第二件才是要紧的那个:
+///
+/// 1. 缓存住的 MOSS 引擎 —— 它记着「没装」,而现在装上了。
+/// 2. 「已经决定过了」这个标记。
+///
+/// 清标记不是顺手,它是让重新决定发生在**后台**的唯一办法。建一次 MOSS 要十秒
+/// (717 MB 加载 + 探测合成 + 跟 CPU 比一次),而聊天回合是同步等在那条路上的。
+/// 留着标记,下一句话就在异步路径上等那十秒:回答不流、输入框不动。清掉之后,
+/// 聊天那条路看到「还没决定」就放弃这一轮的声音、把决定甩给后台线程,下一轮
+/// 才出声 —— 「大不了没有声音,不要卡住 sidebar」。
 #[cfg(feature = "tts-local")]
-pub fn conversation_voice(
-    cfg: &AgentConfig,
-) -> Result<(Arc<dyn crate::speech::voice_out::SpeechSynth>, Choice), TtsError> {
-    let kokoro = || crate::tts::kokoro::conversation_synthesizer(&cfg.tts.kokoro);
+pub fn weights_changed() {
+    local::forget();
+    RESOLVED.store(false, Ordering::Relaxed);
+}
 
+/// 没有本地引擎,也就没有结论可以推翻。
+#[cfg(not(feature = "tts-local"))]
+pub fn weights_changed() {}
+
+/// 挑一个引擎,并记下「挑过了」。
+///
+/// 记在这唯一的出口上,而不是在每个 return 前面各记一次。漏掉一个的代价不是少
+/// 一条记录,是**永远不出声**:`engine_ready()` 一直是假,聊天那条路每一轮都判
+/// 定「引擎还没好,这轮先不出声,下一轮会说」,而下一轮同样如此。
+///
+/// 原本就漏过一个 —— MOSS 加载失败回落 Kokoro 的那条。漏的代价是语音整个不响,
+/// 而它是四条出口里最常走的一条:多数机器上 MOSS 本来就没装。
+#[cfg(any(feature = "tts-local", test))]
+fn pick<T>(
+    cfg: &AgentConfig,
+    kokoro: impl Fn() -> Result<T, TtsError>,
+    moss: impl FnOnce() -> Result<T, TtsError>,
+    moss_installed: impl FnOnce() -> bool,
+) -> Result<(T, Choice), TtsError> {
+    let picked = best_available(cfg, kokoro, moss, moss_installed);
+    // 交出了一个能说话的引擎,就等于「决定好了」—— 不管交出来的是哪一个。
+    if picked.is_ok() {
+        RESOLVED.store(true, Ordering::Relaxed);
+    }
+    picked
+}
+
+/// 哪一个引擎来说这一轮,以及为什么是它。
+///
+/// 加载动作全部从外面传进来,这里只剩策略。理由是这段策略必须能被测到,而它
+/// 原本的三条入口分别要 300 MB 权重、684 MB 权重和一次真实探测 —— CI 上一条
+/// 都没有,于是这段最容易出事的判断从来没有测试看着。
+#[cfg(any(feature = "tts-local", test))]
+fn best_available<T>(
+    cfg: &AgentConfig,
+    kokoro: impl Fn() -> Result<T, TtsError>,
+    moss: impl FnOnce() -> Result<T, TtsError>,
+    moss_installed: impl FnOnce() -> bool,
+) -> Result<(T, Choice), TtsError> {
     if cfg.tts.moss.enabled == Some(false) {
         // 关掉是一个决定,不是一次失败。
         let k = kokoro()?;
-        RESOLVED.store(true, Ordering::Relaxed);
         return Ok((k, Choice::configured()));
     }
 
@@ -394,7 +482,6 @@ pub fn conversation_voice(
     if let Some(rtf) = measured_rtf() {
         if budget > 0.0 && rtf > budget {
             let k = kokoro()?;
-            RESOLVED.store(true, Ordering::Relaxed);
             return Ok((
                 k,
                 Choice::fallback(format!(
@@ -404,17 +491,12 @@ pub fn conversation_voice(
         }
     }
 
-    match engine(
-        &cfg.tts.moss,
-        crate::tts::backend::Setting::resolve(cfg.speech.execution_provider.as_deref()),
-        budget,
-    ) {
+    match moss() {
         Ok(e) => {
-            RESOLVED.store(true, Ordering::Relaxed);
             // 再问一次预算。
             //
             // 上面那次问的时候 `measured_rtf()` 还是空的 —— 这台机器还没被量过。
-            // 而 `engine()` 里的探测**刚刚量完**,结论就在手上:1.43x 对 0.85 的
+            // 而 `moss()` 里的探测**刚刚量完**,结论就在手上:1.43x 对 0.85 的
             // 预算。不在这里用掉它,就要等下一轮才回落,而这一轮的每一句话都会
             // 以追不上播放的速度说出来。
             //
@@ -432,10 +514,7 @@ pub fn conversation_voice(
                     ));
                 }
             }
-            Ok((
-                e as Arc<dyn crate::speech::voice_out::SpeechSynth>,
-                Choice::primary(),
-            ))
+            Ok((e, Choice::primary()))
         }
         Err(e) => {
             // Name what failed. "Falling back" with no reason is how a
@@ -445,8 +524,7 @@ pub fn conversation_voice(
             // 不在。那是常态,报出来只会变成每一句话后面的一行噪音。真正要吵的
             // 是「装了却用不了」—— 权重损坏、版本对不上,那种才是意外。
             let why = format!("MOSS is unavailable: {e}");
-            let installed =
-                nevoflux_tts::moss::MossEngine::files_present(&local::model_dir(&cfg.tts.moss));
+            let installed = moss_installed();
             match kokoro() {
                 Ok(k) if !installed => Ok((k, Choice::configured())),
                 Ok(k) => Ok((k, Choice::fallback(why))),
@@ -456,6 +534,27 @@ pub fn conversation_voice(
             }
         }
     }
+}
+
+/// Pick an engine for conversation, with the reason attached.
+#[cfg(feature = "tts-local")]
+pub fn conversation_voice(
+    cfg: &AgentConfig,
+) -> Result<(Arc<dyn crate::speech::voice_out::SpeechSynth>, Choice), TtsError> {
+    type Voice = Arc<dyn crate::speech::voice_out::SpeechSynth>;
+    pick(
+        cfg,
+        || crate::tts::kokoro::conversation_synthesizer(&cfg.tts.kokoro).map(|k| k as Voice),
+        || {
+            engine(
+                &cfg.tts.moss,
+                crate::tts::backend::Setting::resolve(cfg.speech.execution_provider.as_deref()),
+                cfg.speech.rtf_budget,
+            )
+            .map(|e| e as Voice)
+        },
+        || nevoflux_tts::moss::MossEngine::files_present(&local::model_dir(&cfg.tts.moss)),
+    )
 }
 
 #[cfg(not(feature = "tts-local"))]
@@ -494,6 +593,7 @@ mod tests {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SAMPLES.lock().unwrap().clear();
         MEASURED_RTF.store(0, Ordering::Relaxed);
+        RESOLVED.store(false, Ordering::Relaxed);
         g
     }
 
@@ -502,6 +602,146 @@ mod tests {
         c.speech.measured_rtf = rtf;
         c.speech.rtf_budget = budget;
         c
+    }
+
+    /// 在这些测试里,一个「引擎」就只是一个名字。要判的是**挑哪一个**,而不是
+    /// 权重能不能加载 —— 真加载要 300 MB 和 684 MB,CI 上一个都没有。
+    fn ready(name: &'static str) -> Result<&'static str, TtsError> {
+        Ok(name)
+    }
+
+    fn absent(why: &str) -> Result<&'static str, TtsError> {
+        Err(TtsError::ConfigMissing(why.into()))
+    }
+
+    /// 回落到 Kokoro,也算「已经决定好了」。
+    ///
+    /// 这是真出过的事故,日志里长这样:MOSS 的权重还没下载完,加载返回 Err,
+    /// 这条路回落到一个**完全可用**的 Kokoro 并把它交了出去 —— 却没有记下
+    /// 「决定过了」。于是聊天那条路每一轮都判定「引擎还没好,这轮先不出声,
+    /// 下一轮会说」,而下一轮同样如此:
+    ///
+    /// ```text
+    /// voice engine warmed on listener attach engine="kokoro"
+    /// voice: engine not ready yet — this reply is text only, the next one will speak
+    /// voice engine resolved in the background; the next reply can speak engine="kokoro"
+    /// voice: engine not ready yet — this reply is text only, the next one will speak
+    /// ```
+    ///
+    /// 开着 Speak replies,从头到尾一点声音都没有。
+    #[test]
+    fn a_fallback_engine_still_counts_as_decided() {
+        let _g = exclusive();
+        assert!(!engine_ready(), "起点就不该是「已决定」");
+
+        let (speaking, choice) = pick(
+            &cfg_with(None, 0.85),
+            || ready("kokoro"),
+            || absent("weights are still downloading"),
+            || false,
+        )
+        .expect("Kokoro 可用,这一轮就该挑得出引擎");
+
+        assert_eq!(speaking, "kokoro");
+        assert_eq!(choice.engine, "kokoro");
+        assert!(
+            engine_ready(),
+            "交出了一个能说话的引擎,却还报「引擎没准备好」—— 下一轮还是静音"
+        );
+    }
+
+    /// 而一个引擎都挑不出来,不算决定。
+    ///
+    /// 否则下一轮会以为引擎就绪,径直走上合成那条路,再在那里失败一次。
+    #[test]
+    fn no_engine_at_all_is_not_a_decision() {
+        let _g = exclusive();
+        let out = pick(
+            &cfg_with(None, 0.85),
+            || absent("no kokoro weights"),
+            || absent("no moss weights"),
+            || false,
+        );
+        assert!(out.is_err(), "两个引擎都没有,不该挑出一个来");
+        assert!(!engine_ready(), "一个引擎都没有,却记成了决定好了");
+    }
+
+    /// 主引擎跑起来了,当然也要记上。
+    #[test]
+    fn the_primary_engine_is_recorded_too() {
+        let _g = exclusive();
+        let (speaking, choice) = pick(
+            &cfg_with(None, 0.85),
+            || ready("kokoro"),
+            || ready("moss"),
+            || true,
+        )
+        .expect("MOSS 可用");
+        assert_eq!(speaking, "moss");
+        assert_eq!(choice.engine, "moss");
+        assert!(engine_ready());
+    }
+
+    /// 用户把 MOSS 关掉之后也要记上 —— 关掉是一个决定,不是一次失败。
+    #[test]
+    fn turning_moss_off_is_also_a_decision() {
+        let _g = exclusive();
+        let mut c = cfg_with(None, 0.85);
+        c.tts.moss.enabled = Some(false);
+
+        let (speaking, choice) =
+            pick(&c, || ready("kokoro"), || ready("moss"), || true).expect("Kokoro 可用");
+        assert_eq!(speaking, "kokoro", "关掉了却还是用了 MOSS");
+        assert_eq!(choice.reason, None, "常态不该带原因");
+        assert!(engine_ready());
+    }
+
+    /// 慢到超预算而回落的那条路,一样要记上。
+    #[test]
+    fn falling_back_for_being_slow_is_a_decision() {
+        let _g = exclusive();
+        record_rtf(std::time::Duration::from_millis(11_592), 5.6); // 2.07x
+        let (speaking, choice) = pick(
+            &cfg_with(None, 0.85),
+            || ready("kokoro"),
+            || ready("moss"),
+            || true,
+        )
+        .expect("Kokoro 可用");
+        assert_eq!(speaking, "kokoro");
+        assert!(choice.reason.is_some_and(|r| r.contains("budget")));
+        assert!(engine_ready());
+    }
+
+    /// 权重刚落地,上一次的结论就得作废 —— 连「已经决定过了」一起。
+    ///
+    /// 第二个真出过的缺陷:MOSS 的权重 06:29 下载完成,而 06:24 那次「没装」的
+    /// 结论被缓存在一个 `OnceLock` 里,再没有推翻的机会。刚下完的 717 MB 直到
+    /// 下次重启都用不上,日志里每一轮仍然回落 Kokoro。
+    ///
+    /// 连标记一起清,不是顺手 —— 它是让重新决定发生在**后台**的唯一办法。
+    /// 建一次 MOSS 要十秒(717 MB 加载 + 探测合成 + 跟 CPU 比一次),而留着标记
+    /// 的话,下一句话就会在聊天回合的异步路径上等那十秒:回答不流、输入框不动。
+    /// 清掉之后,聊天那条路看到「还没决定」就放弃这一轮的声音、把决定甩给后台
+    /// 线程,下一轮才出声 —— 正是「大不了没有声音,不要卡住 sidebar」。
+    #[test]
+    fn new_weights_retire_the_old_verdict() {
+        let _g = exclusive();
+        pick(
+            &cfg_with(None, 0.85),
+            || ready("kokoro"),
+            || absent("weights are still downloading"),
+            || false,
+        )
+        .expect("有引擎");
+        assert!(engine_ready(), "前提:这一轮先决定过一次");
+
+        weights_changed();
+
+        assert!(
+            !engine_ready(),
+            "权重下完了,「没装」那个结论却还算数 —— 刚下完的 717 MB 要等重启"
+        );
     }
 
     #[test]

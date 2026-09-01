@@ -78,6 +78,18 @@ impl Tier {
         }
     }
 
+    /// 这一档的文件会不会改变「谁能说话」。
+    ///
+    /// 下载完成后语音那边要据此推翻缓存住的结论。用穷尽匹配而不是 `!= Transcribe`:
+    /// 新加一档时编译器会逼着回答这个问题,而漏答的代价是刚下完的权重要等到下次
+    /// 重启才生效 —— MOSS 就这么坏过一次。
+    pub fn carries_speech(self) -> bool {
+        match self {
+            Tier::Transcribe => false,
+            Tier::Speak | Tier::SpeakChinese | Tier::SpeakMultilingual => true,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Tier> {
         match s {
             "transcribe" => Some(Tier::Transcribe),
@@ -518,6 +530,24 @@ pub fn tier_bytes(tier: Tier) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// 只有会改变「谁能说话」的档位,才该让语音重新决定一次。
+    ///
+    /// 两个方向都要钉住:漏掉 `SpeakMultilingual`,刚下完的 MOSS 要等重启;
+    /// 多算上 `Transcribe`,下个转写模型会让下一句回答莫名其妙变成纯文字。
+    #[test]
+    fn only_speech_tiers_retire_the_voice_verdict() {
+        assert!(
+            super::Tier::SpeakMultilingual.carries_speech(),
+            "MOSS 下完了却不通知语音"
+        );
+        assert!(super::Tier::Speak.carries_speech());
+        assert!(super::Tier::SpeakChinese.carries_speech());
+        assert!(
+            !super::Tier::Transcribe.carries_speech(),
+            "转写模型下完了,不该让下一句话变哑"
+        );
+    }
+
     use super::*;
 
     fn host_of(url: &str) -> &str {
