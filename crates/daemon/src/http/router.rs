@@ -392,7 +392,12 @@ mod tests {
         assert_eq!(r.save_as.as_deref(), Some("acme2"));
     }
 
+    /// Serial because closing a session also releases the process-global A2A
+    /// context binding (`http::a2a::ContextBinding`). Without this, the test
+    /// runs in parallel with the A2A tests and unbinds the context one of them
+    /// just established — which shows up there, not here.
     #[tokio::test]
+    #[serial_test::serial]
     async fn session_close_reports_no_active_session() {
         let app = router(test_state());
         let resp = app
