@@ -34,6 +34,12 @@ use crate::http::types::{TaskRequest, TaskResponse, TaskStatus};
 /// 同步方法等待任务终态的上限。与 `http::rpc` 的 ACP/MCP 前端一致。
 const TASK_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// 每个 context 最多回放多少轮。
+///
+/// 上限存在的理由是**成本**：历史整段进 prompt，无上限的 context 会让第 N 轮
+/// 的 token 花费随 N 线性增长，而调用方对此毫无感知。
+pub const MAX_CONTEXT_TURNS: usize = 20;
+
 /// A2A 流式任务在 `NEVOFLUX_WALL_CLOCK_SECS` 没配时的兜底墙钟。
 ///
 /// A2A 的流式**不挂** `CancelOnDrop`（与 OpenAI 那条路径相反）：断流后调用方
@@ -44,7 +50,16 @@ pub const DEFAULT_STREAM_WALL_CLOCK_SECS: u64 = 900;
 
 /// 构造流式任务的请求：env 档位 + 兜底墙钟。
 pub fn streaming_task_request(text: String) -> TaskRequest {
+    streaming_task_request_in(text, "")
+}
+
+/// 同上，但绑定到某个 context（注入历史 + 走 task-flow）。
+pub fn streaming_task_request_in(text: String, context_id: &str) -> TaskRequest {
     let mut req = TaskRequest::from_env(text);
+    if !context_id.is_empty() {
+        req.history = ContextBinding::global().history_for(context_id);
+        req.session_flow = true;
+    }
     if req.wall_clock_secs.is_none() {
         tracing::warn!(
             "NEVOFLUX_WALL_CLOCK_SECS is unset; A2A streaming tasks fall back to {}s. \
@@ -93,6 +108,7 @@ struct Binding {
     active: Option<String>,
     last_seen: Option<Instant>,
     task_context: HashMap<String, String>,
+    history: HashMap<String, Vec<crate::http::types::HistoryTurn>>,
 }
 
 impl ContextBinding {
@@ -163,6 +179,51 @@ impl ContextBinding {
             .cloned()
     }
 
+    /// 某个 context 已累积的历史。
+    pub fn history_for(&self, context_id: &str) -> Vec<crate::http::types::HistoryTurn> {
+        self.inner
+            .lock()
+            .unwrap()
+            .history
+            .get(context_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 记一轮问答，并把 context 裁到 [`MAX_CONTEXT_TURNS`] 轮。
+    pub fn record_turn(&self, context_id: &str, user: &str, assistant: &str) {
+        use crate::http::types::HistoryTurn;
+        let mut b = self.inner.lock().unwrap();
+        let h = b.history.entry(context_id.to_string()).or_default();
+        h.push(HistoryTurn {
+            role: "user".into(),
+            content: user.to_string(),
+        });
+        h.push(HistoryTurn {
+            role: "assistant".into(),
+            content: assistant.to_string(),
+        });
+        let max = MAX_CONTEXT_TURNS * 2;
+        if h.len() > max {
+            let drop = h.len() - max;
+            h.drain(0..drop);
+        }
+    }
+
+    /// 解除绑定并丢掉该 context 的历史（`POST /session/close` 调用）。
+    ///
+    /// 会话结束了，绑定也就该松开——否则下一个 context 会被一个已经不存在的
+    /// 会话挡住。
+    pub fn unbind(&self) {
+        let mut b = self.inner.lock().unwrap();
+        if let Some(ctx) = b.active.take() {
+            b.history.remove(&ctx);
+            tracing::info!(context = %ctx, "A2A context unbound by session close");
+        }
+        b.last_seen = None;
+        b.task_context.clear();
+    }
+
     /// 测试用：清空绑定。相关测试串行跑（`#[serial]`），因为这是进程级状态。
     pub fn reset_for_test(&self) {
         let mut b = self.inner.lock().unwrap();
@@ -231,11 +292,15 @@ impl TaskBackend for QueueBackend {
     }
 
     async fn send(&self, text: String, context_id: String) -> Result<Task, A2aError> {
-        let resp = self
-            .queue
-            .submit_and_wait(TaskRequest::from_env(text), TASK_TIMEOUT)
-            .await;
+        let mut req = TaskRequest::from_env(text.clone());
+        req.history = ContextBinding::global().history_for(&context_id);
+        req.session_flow = true;
+        let resp = self.queue.submit_and_wait(req, TASK_TIMEOUT).await;
         ContextBinding::global().remember(&resp.id, &context_id);
+        if resp.status == TaskStatus::Succeeded {
+            let answer = resp.output.clone().unwrap_or_default();
+            ContextBinding::global().record_turn(&context_id, &text, &answer);
+        }
         Ok(task_from_response(&resp, &context_id))
     }
 
@@ -250,31 +315,34 @@ impl TaskBackend for QueueBackend {
         // `_cancel` 被**故意丢弃**：A2A 的流断了不代表任务该停（见
         // DEFAULT_STREAM_WALL_CLOCK_SECS 的说明）。
         let (id, _cancel) = self.queue.submit_streaming(
-            streaming_task_request(text),
+            streaming_task_request_in(text.clone(), &context_id),
             crate::script_backend::DeltaSink::new(tx),
         );
         ContextBinding::global().remember(&id, &context_id);
 
         let events = futures::stream::unfold(
-            (rx, id.clone(), context_id.clone(), false),
-            |(mut rx, task_id, ctx, done)| async move {
+            (rx, id.clone(), context_id.clone(), false, text.clone()),
+            |(mut rx, task_id, ctx, done, user_text)| async move {
                 if done {
                     return None;
                 }
                 match rx.recv().await {
                     Some(crate::script_backend::Delta::Text(t)) => {
                         let ev = working_frame(&task_id, &ctx, Some(t));
-                        Some((ev, (rx, task_id, ctx, false)))
+                        Some((ev, (rx, task_id, ctx, false, user_text)))
                     }
                     Some(crate::script_backend::Delta::Progress(p)) => {
                         let ev = working_frame(&task_id, &ctx, Some(p));
-                        Some((ev, (rx, task_id, ctx, false)))
+                        Some((ev, (rx, task_id, ctx, false, user_text)))
                     }
                     Some(crate::script_backend::Delta::Finish(p)) => {
                         let (state, text) = match &p.error {
                             Some((msg, _, _)) => (TaskState::Failed, msg.clone()),
                             None => (TaskState::Completed, p.content.clone()),
                         };
+                        if state == TaskState::Completed {
+                            ContextBinding::global().record_turn(&ctx, &user_text, &text);
+                        }
                         let ev = nevoflux_a2a::model::StreamEvent::StatusUpdate {
                             task_id: task_id.clone(),
                             context_id: ctx.clone(),
@@ -285,7 +353,7 @@ impl TaskBackend for QueueBackend {
                                 timestamp: None,
                             },
                         };
-                        Some((ev, (rx, task_id, ctx, true)))
+                        Some((ev, (rx, task_id, ctx, true, user_text)))
                     }
                     // 通道关了却没终帧 = runner 死了。说出来，别静默收流。
                     None => {
@@ -302,7 +370,7 @@ impl TaskBackend for QueueBackend {
                                 timestamp: None,
                             },
                         };
-                        Some((ev, (rx, task_id, ctx, true)))
+                        Some((ev, (rx, task_id, ctx, true, user_text)))
                     }
                 }
             },
@@ -1016,5 +1084,111 @@ mod tests {
         let req = streaming_task_request("go".into());
         assert_eq!(req.wall_clock_secs, Some(42));
         std::env::remove_var("NEVOFLUX_WALL_CLOCK_SECS");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_second_turn_in_the_same_context_carries_the_first_turn_as_history() {
+        ContextBinding::global().reset_for_test();
+        // runner 把收到的 history 回显成 output，好让测试看见它到没到执行侧。
+        let runner: Runner = Arc::new(|id, req, _sink, _cancel| {
+            Box::pin(async move {
+                let echoed = req
+                    .history
+                    .iter()
+                    .map(|h| format!("{}:{}", h.role, h.content))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                TaskResponse {
+                    id,
+                    status: TaskStatus::Succeeded,
+                    attempts: 1,
+                    output: Some(format!("flow={} history=[{}]", req.session_flow, echoed)),
+                    error: None,
+                    artifacts: vec![],
+                }
+            })
+        });
+        let st = AppState {
+            queue: Arc::new(TaskQueue::new(runner)),
+            metrics: Arc::new(Metrics::default()),
+        };
+        let app = router(st);
+        let mk = |text: &str| {
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"sendMessage",
+                "params":{"message":{"messageId":"m","role":"ROLE_USER","contextId":"ctx-a",
+                                     "parts":[{"text": text}]}}
+            })
+        };
+
+        let first = post_json(app.clone(), "/a2a/v1", mk("open example.com")).await;
+        let out = first["result"]["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(out.contains("flow=true"), "got {out}");
+        assert!(out.contains("history=[]"), "first turn has no history: {out}");
+
+        let second = post_json(app.clone(), "/a2a/v1", mk("now scroll down")).await;
+        let out = second["result"]["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            out.contains("user:open example.com"),
+            "the earlier turn must reach the agent: {out}"
+        );
+        assert!(out.contains("assistant:"), "the earlier answer too: {out}");
+    }
+
+    #[test]
+    #[serial]
+    fn history_is_capped_so_a_long_context_cannot_grow_without_bound() {
+        ContextBinding::global().reset_for_test();
+        let b = ContextBinding::global();
+        b.bind(Some("ctx-a".into())).unwrap();
+        for i in 0..100 {
+            b.record_turn("ctx-a", &format!("q{i}"), &format!("a{i}"));
+        }
+        let h = b.history_for("ctx-a");
+        assert_eq!(h.len(), MAX_CONTEXT_TURNS * 2);
+        // 保留的是最近的
+        assert_eq!(h.last().unwrap().content, "a99");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn closing_the_session_releases_the_context() {
+        ContextBinding::global().reset_for_test();
+        let app = router(state());
+        let mk = |ctx: &str| {
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"sendMessage",
+                "params":{"message":{"messageId":"m","role":"ROLE_USER","contextId":ctx,
+                                     "parts":[{"text":"go"}]}}
+            })
+        };
+        let v = post_json(app.clone(), "/a2a/v1", mk("ctx-a")).await;
+        assert_eq!(v["result"]["contextId"], "ctx-a");
+        // 未关会话时，另一个 context 仍被拒
+        let v = post_json(app.clone(), "/a2a/v1", mk("ctx-b")).await;
+        assert_eq!(v["error"]["code"], -32004);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 关了之后 ctx-b 应当能绑上
+        let v = post_json(app.clone(), "/a2a/v1", mk("ctx-b")).await;
+        assert_eq!(v["result"]["contextId"], "ctx-b");
+        assert!(ContextBinding::global().history_for("ctx-a").is_empty());
     }
 }

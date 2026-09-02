@@ -137,6 +137,7 @@ pub async fn execute_task_attempt(
     task: &str,
     mode: nevoflux_builtin_wasm::AgentMode,
     session_id: String,
+    history: &[crate::http::types::HistoryTurn],
     script_call: Option<&ScriptCall>,
 ) -> AttemptOutcome {
     let Some(agent_config) = services_template.agent_config.clone() else {
@@ -187,7 +188,21 @@ pub async fn execute_task_attempt(
         session_id,
         mode,
         user_message: task.to_string(),
-        history: vec![],
+        history: history
+            .iter()
+            .map(|h| nevoflux_builtin_wasm::Message {
+                role: if h.role == "assistant" {
+                    nevoflux_builtin_wasm::MessageRole::Assistant
+                } else {
+                    nevoflux_builtin_wasm::MessageRole::User
+                },
+                content: h.content.clone(),
+                tool_call_id: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                reasoning: None,
+            })
+            .collect(),
         attachments: vec![],
         local_files: vec![],
         custom_system_prompt: None,
@@ -401,6 +416,11 @@ pub struct AutomationDeps {
     pub script_call: Option<ScriptCall>,
     /// Which engine runs the task, and whether it may escalate.
     pub engine: crate::browser_backend::Backend,
+    /// Earlier turns to replay into `AgentInput.history`.
+    ///
+    /// Non-empty only on the A2A path, where a `contextId` makes several tasks
+    /// one conversation. Everywhere else a task is a fresh run.
+    pub history: Vec<crate::http::types::HistoryTurn>,
 }
 
 /// The binding for a call served in this process: none at all.
@@ -487,6 +507,7 @@ async fn settled_by_skiff(
             task,
             deps.mode,
             format!("skiff-{attempt}"),
+            &deps.history,
             deps.script_call.as_ref(),
         )
         .await
@@ -586,6 +607,7 @@ pub async fn execute_full_task(
                                         task,
                                         deps.mode,
                                         format!("automation-{attempt}"),
+                                        &deps.history,
                                         deps.script_call.as_ref(),
                                     )
                                     .await
@@ -830,6 +852,7 @@ pub async fn execute_session_task(
             task,
             deps.mode,
             format!("session-{attempt}"),
+            &deps.history,
             deps.script_call.as_ref(),
         )
         .await
@@ -1134,6 +1157,7 @@ mod tests {
             "open example.com",
             nevoflux_builtin_wasm::AgentMode::Browser,
             "sess-1".into(),
+            &[],
             None,
         )
         .await;

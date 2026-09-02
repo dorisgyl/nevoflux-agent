@@ -353,6 +353,9 @@ async fn close_session(body: Option<Json<CloseSessionRequest>>) -> impl IntoResp
     let report =
         crate::automation::session_holder::teardown_locked(&mut guard, &pm, req.save, req.save_as)
             .await;
+    // The session is over, so the A2A binding should let go too — otherwise the
+    // next context is blocked by a session that no longer exists.
+    crate::http::a2a::ContextBinding::global().unbind();
     (
         StatusCode::OK,
         Json(serde_json::json!({

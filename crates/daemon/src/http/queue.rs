@@ -165,6 +165,8 @@ mod tests {
             save_profile_as: None,
             chat_request: None,
             backend: None,
+            history: Vec::new(),
+            session_flow: false,
         }
     }
 

@@ -103,6 +103,9 @@ pub async fn prewarm_session_browser() {
         workspace: std::env::temp_dir().join("nevoflux-prewarm"),
         script_call: None,
         engine,
+        // Pre-warm only launches a browser; it runs no task, so there is no
+        // conversation to replay.
+        history: Vec::new(),
     };
     let holder = crate::automation::session_holder::SessionHolder::global();
     let mut guard = holder.inner.lock().await;
@@ -191,9 +194,14 @@ pub fn build_headless_runner(
                         None
                     },
                     engine,
+                    history: req.history.clone(),
                 };
                 let policy = req.to_policy();
-                let outcome = if session_mode {
+                // A2A drives task-flow from its own `contextId`, so it must not
+                // depend on the process-wide switch — a caller that sent a
+                // contextId would otherwise degrade to stateless silently,
+                // which is the hardest kind of failure to trace.
+                let outcome = if session_mode || req.session_flow {
                     session::execute_session_task(
                         &deps,
                         &policy,

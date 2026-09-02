@@ -3,6 +3,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One turn of a conversation (process-internal; never serialized).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryTurn {
+    /// `"user"` or `"assistant"`.
+    pub role: String,
+    /// The text of the turn.
+    pub content: String,
+}
+
 /// Per-task capability opt-ins (maps to [`crate::automation::policy::Policy`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyRequest {
@@ -83,6 +92,20 @@ pub struct TaskRequest {
     /// 时的兜底，因为它是**进程级**开关，与按请求选后端不兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// 前几轮对话（进程内填充，**客户端 JSON 设不了**）。
+    ///
+    /// `#[serde(skip)]` 与 `chat_request` 是同一模式：它是**数据**，但不属于
+    /// 公开线格式——A2A 的调用方只能给 prompt 与 contextId，历史由前端按
+    /// context 累积后注入。
+    #[serde(skip)]
+    pub history: Vec<HistoryTurn>,
+    /// 本次任务走 task-flow（复用浏览器与 profile 克隆），与进程级的
+    /// `NEVOFLUX_SESSION_MODE` 无关。
+    ///
+    /// A2A 的 flow 语义由 `contextId` 自身驱动；若还要求部署方设一个 env，
+    /// 就会出现「客户端发了 contextId 却静默退化成无状态」这种最难查的失败。
+    #[serde(skip)]
+    pub session_flow: bool,
 }
 
 fn default_mode() -> String {
@@ -161,6 +184,8 @@ impl TaskRequest {
             // 前端在 from_env 之后按需填充（见 http::router::chat_completions）。
             chat_request: None,
             backend: None,
+            history: Vec::new(),
+            session_flow: false,
         }
     }
 }
@@ -288,6 +313,17 @@ mod tests {
         assert!(TaskStatus::Failed.is_terminal());
         assert!(!TaskStatus::Running.is_terminal());
         assert!(!TaskStatus::Queued.is_terminal());
+    }
+
+    #[test]
+    fn history_and_session_flow_are_process_internal_only() {
+        // 客户端 JSON 设不了：这两个字段是前端在进程内填的（同 chat_request）。
+        let r: TaskRequest = serde_json::from_str(
+            r#"{"task":"x","history":[{"role":"user","content":"leak"}],"session_flow":true}"#,
+        )
+        .unwrap();
+        assert!(r.history.is_empty(), "history must not be settable by callers");
+        assert!(!r.session_flow, "session_flow must not be settable by callers");
     }
 
     #[test]
