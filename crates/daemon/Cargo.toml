@@ -97,6 +97,7 @@ skiff = { git = "https://github.com/nevoflux-browser/nevoflux-skiff.git", tag = 
 skiff-net = { git = "https://github.com/nevoflux-browser/nevoflux-skiff.git", tag = "v0.1.0", optional = true }
 nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
+nevoflux-a2a = { path = "../a2a" }
 nevoflux-skills = { path = "../skills" }
 nevoflux-llm = { path = "../llm", default-features = false }
 nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }

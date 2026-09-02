@@ -4835,6 +4835,7 @@ dependencies = [
  "image",
  "monty",
  "monty-types",
+ "nevoflux-a2a",
  "nevoflux-asr",
  "nevoflux-brain",
  "nevoflux-builtin-wasm",

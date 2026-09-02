@@ -666,6 +666,7 @@ async fn run_daemon(
     openai_addr: Option<std::net::SocketAddr>,
     mcp_addr: Option<std::net::SocketAddr>,
     acp_addr: Option<std::net::SocketAddr>,
+    a2a_addr: Option<std::net::SocketAddr>,
     admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists first — managed daemons need it for the
@@ -793,6 +794,7 @@ async fn run_daemon(
             || openai_addr.is_some()
             || mcp_addr.is_some()
             || acp_addr.is_some()
+            || a2a_addr.is_some()
             || admin_addr.is_some()
         {
             use nevoflux_daemon::http;
@@ -936,13 +938,26 @@ async fn run_daemon(
                     }
                 });
             }
+
+            if let Some(addr) = a2a_addr {
+                let app = http::a2a::a2a_routes().with_state(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "A2A listening on {} (GET /.well-known/agent-card.json,                          POST /a2a = 0.3.0, POST /a2a/v1 = 1.0)",
+                        addr
+                    );
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("A2A server error: {}", e);
+                    }
+                });
+            }
         } else if !remote_control {
             // The warning was right when serving an interface was the only
             // reason to run headless. With --remote-control the absence of one
             // is the design, not an oversight.
             tracing::warn!(
-                "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr/--admin-addr: \
-                 no API served"
+                "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr/--a2a-addr/\
+                 --admin-addr: no API served"
             );
         }
     }
@@ -1616,6 +1631,7 @@ async fn main() {
             cli.openai_addr,
             cli.mcp_addr,
             cli.acp_addr,
+            cli.a2a_addr,
             cli.admin_addr,
         )
         .await

@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/session/close", post(close_session))
         .merge(openai_routes())
+        .merge(crate::http::a2a::a2a_routes())
         .with_state(state)
 }
 
