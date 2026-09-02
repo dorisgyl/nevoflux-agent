@@ -5,6 +5,7 @@
 
 pub mod a2a;
 pub mod admin;
+pub mod artifacts;
 pub mod metrics;
 pub mod openai_wire;
 pub mod queue;

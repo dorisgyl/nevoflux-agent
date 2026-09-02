@@ -168,6 +168,8 @@ pub fn build_headless_runner(
             Box::pin(async move {
                 metrics.tasks_total.fetch_add(1, Ordering::Relaxed);
                 let workspace = work_dir.join(format!("ws-{}", id));
+                // workspace 被 move 进 deps，先留一份给终态时列产物用。
+                let artifacts_dir = workspace.clone();
                 let deps = session::AutomationDeps {
                     profile_mgr: crate::profile::ProfileManager { base_dir, work_dir },
                     profile: req.profile.clone().unwrap_or_else(|| "default".to_string()),
@@ -243,7 +245,7 @@ pub fn build_headless_runner(
                     attempts: outcome.attempts,
                     output: outcome.output,
                     error: outcome.error,
-                    artifacts: Vec::new(),
+                    artifacts: crate::http::artifacts::list_artifacts(&artifacts_dir),
                 }
             })
         },

@@ -243,11 +243,61 @@ fn state_of(s: TaskStatus) -> TaskState {
     }
 }
 
+/// 把任务 workspace 里的产物映射成 A2A [`Artifact`](nevoflux_a2a::model::Artifact)。
+///
+/// 小于阈值的内联（`FilePart.bytes`，base64），超过的给 `uri` 指向
+/// `GET /tasks/:id/artifacts/:name`。内联还受**总量**上限约束，否则「二十个刚好
+/// 卡在阈值下的文件」照样能把一次响应打爆。
+pub fn artifacts_from_workspace(
+    dir: &std::path::Path,
+    task_id: &str,
+    base: &str,
+) -> Vec<nevoflux_a2a::model::Artifact> {
+    use base64::Engine as _;
+    use nevoflux_a2a::model::{Artifact, FileSource, Part};
+
+    let per_file = crate::http::artifacts::inline_max_bytes();
+    let mut inlined_total: u64 = 0;
+    let base = base.trim_end_matches('/');
+
+    crate::http::artifacts::list_artifacts(dir)
+        .into_iter()
+        .map(|name| {
+            let path = dir.join(&name);
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+            let fits = size <= per_file
+                && inlined_total.saturating_add(size)
+                    <= crate::http::artifacts::INLINE_TOTAL_MAX_BYTES;
+            let source = if fits {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        inlined_total += size;
+                        FileSource::Bytes(base64::engine::general_purpose::STANDARD.encode(bytes))
+                    }
+                    Err(_) => FileSource::Uri(format!("{base}/tasks/{task_id}/artifacts/{name}")),
+                }
+            } else {
+                FileSource::Uri(format!("{base}/tasks/{task_id}/artifacts/{name}"))
+            };
+            Artifact {
+                artifact_id: name.clone(),
+                name: Some(name.clone()),
+                description: None,
+                parts: vec![Part::File {
+                    name: Some(name.clone()),
+                    mime_type: Some(crate::http::artifacts::guess_mime(&name).to_string()),
+                    source,
+                }],
+            }
+        })
+        .collect()
+}
+
 /// 把内部 [`TaskResponse`] 翻成 A2A 的 [`Task`]。
 ///
 /// `output`（成功）或 `error`（失败）成为状态里的 agent 消息，因为 A2A 的
 /// 结果就住在 `status.message` 里——没有别的地方放这段文本。
-pub fn task_from_response(r: &TaskResponse, context_id: &str) -> Task {
+pub fn task_from_response(r: &TaskResponse, context_id: &str, base: &str) -> Task {
     let text = r
         .output
         .clone()
@@ -266,7 +316,11 @@ pub fn task_from_response(r: &TaskResponse, context_id: &str) -> Task {
             message,
             timestamp: None,
         },
-        artifacts: Vec::new(),
+        artifacts: if r.status.is_terminal() {
+            artifacts_from_workspace(&crate::http::artifacts::workspace_of(&r.id), &r.id, base)
+        } else {
+            Vec::new()
+        },
         history: Vec::new(),
     }
 }
@@ -276,12 +330,14 @@ pub fn task_from_response(r: &TaskResponse, context_id: &str) -> Task {
 /// 把 A2A 的方法接到进程内的任务队列上。
 pub struct QueueBackend {
     queue: Arc<crate::http::queue::TaskQueue>,
+    /// 外部可达基址，用于生成 artifact 的 `uri`。
+    base: String,
 }
 
 impl QueueBackend {
-    /// 绑定一个队列。
-    pub fn new(queue: Arc<crate::http::queue::TaskQueue>) -> Self {
-        Self { queue }
+    /// 绑定一个队列。`base` 是调用方能连上的基址（见 [`base_url`]）。
+    pub fn new(queue: Arc<crate::http::queue::TaskQueue>, base: String) -> Self {
+        Self { queue, base }
     }
 }
 
@@ -301,7 +357,7 @@ impl TaskBackend for QueueBackend {
             let answer = resp.output.clone().unwrap_or_default();
             ContextBinding::global().record_turn(&context_id, &text, &answer);
         }
-        Ok(task_from_response(&resp, &context_id))
+        Ok(task_from_response(&resp, &context_id, &self.base))
     }
 
     async fn send_streaming(
@@ -400,7 +456,7 @@ impl TaskBackend for QueueBackend {
         let ctx = ContextBinding::global()
             .context_of(task_id)
             .unwrap_or_default();
-        Ok(task_from_response(&resp, &ctx))
+        Ok(task_from_response(&resp, &ctx, &self.base))
     }
 
     async fn cancel(&self, task_id: &str) -> Result<Task, A2aError> {
@@ -414,7 +470,7 @@ impl TaskBackend for QueueBackend {
         let ctx = ContextBinding::global()
             .context_of(task_id)
             .unwrap_or_default();
-        Ok(task_from_response(&resp, &ctx))
+        Ok(task_from_response(&resp, &ctx, &self.base))
     }
 
     async fn subscribe(&self, task_id: &str) -> Result<EventStream, A2aError> {
@@ -432,13 +488,19 @@ impl TaskBackend for QueueBackend {
         let queue = self.queue.clone();
         let id = task_id.to_string();
         let ctx_first = ctx.clone();
+        let base = self.base.clone();
+        let base_first = base.clone();
 
         let stream = futures::stream::once(async move {
-            nevoflux_a2a::model::StreamEvent::Task(task_from_response(&snapshot, &ctx_first))
+            nevoflux_a2a::model::StreamEvent::Task(task_from_response(
+                &snapshot,
+                &ctx_first,
+                &base_first,
+            ))
         })
         .chain(futures::stream::unfold(
-            (queue, id, ctx, None::<TaskStatus>, false),
-            |(queue, id, ctx, last, done)| async move {
+            (queue, id, ctx, None::<TaskStatus>, false, base),
+            |(queue, id, ctx, last, done, base)| async move {
                 if done {
                     return None;
                 }
@@ -452,9 +514,9 @@ impl TaskBackend for QueueBackend {
                     let ev = nevoflux_a2a::model::StreamEvent::StatusUpdate {
                         task_id: id.clone(),
                         context_id: ctx.clone(),
-                        status: task_from_response(&r, &ctx).status,
+                        status: task_from_response(&r, &ctx, &base).status,
                     };
-                    return Some((ev, (queue, id, ctx, Some(r.status), terminal)));
+                    return Some((ev, (queue, id, ctx, Some(r.status), terminal, base)));
                 }
             },
         ));
@@ -679,7 +741,7 @@ async fn dispatch(
             .into_response();
     }
 
-    let backend = QueueBackend::new(s.queue.clone());
+    let backend = QueueBackend::new(s.queue.clone(), base_url(&headers));
     match handle_rpc(&backend, codec, &body).await {
         RpcOutcome::Json(v) => (StatusCode::OK, Json(v)).into_response(),
         RpcOutcome::Stream(frames) => {
@@ -1190,5 +1252,89 @@ mod tests {
         let v = post_json(app.clone(), "/a2a/v1", mk("ctx-b")).await;
         assert_eq!(v["result"]["contextId"], "ctx-b");
         assert!(ContextBinding::global().history_for("ctx-a").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn small_files_inline_and_large_ones_get_a_uri() {
+        use nevoflux_a2a::model::{FileSource, Part};
+        let d = std::env::temp_dir().join(format!("nf-a2a-art-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("small.txt"), b"ABC").unwrap();
+        std::fs::write(d.join("big.bin"), vec![0u8; 64]).unwrap();
+        std::env::set_var("NEVOFLUX_A2A_INLINE_MAX_BYTES", "16");
+
+        let arts = artifacts_from_workspace(&d, "task-0", "http://h");
+        std::env::remove_var("NEVOFLUX_A2A_INLINE_MAX_BYTES");
+
+        let big = arts
+            .iter()
+            .find(|a| a.name.as_deref() == Some("big.bin"))
+            .unwrap();
+        let small = arts
+            .iter()
+            .find(|a| a.name.as_deref() == Some("small.txt"))
+            .unwrap();
+        assert!(matches!(
+            &small.parts[0],
+            Part::File { source: FileSource::Bytes(b), .. } if b == "QUJD"
+        ));
+        assert!(matches!(
+            &big.parts[0],
+            Part::File { source: FileSource::Uri(u), .. }
+                if u == "http://h/tasks/task-0/artifacts/big.bin"
+        ));
+        // MIME 也跟着名字走
+        assert!(matches!(
+            &small.parts[0],
+            Part::File { mime_type: Some(m), .. } if m == "text/plain"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_artifact_endpoint_refuses_traversal_and_serves_a_real_file() {
+        ContextBinding::global().reset_for_test();
+        let app = router(state());
+
+        // 穿越：拒绝
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/task-0/artifacts/..%2F..%2Fsecret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
+            "got {}",
+            resp.status()
+        );
+
+        // 真文件：拿得到，且 content-type 按扩展名
+        let work = std::env::temp_dir().join(format!("nf-art-ep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(work.join("ws-task-9")).unwrap();
+        std::fs::write(work.join("ws-task-9").join("result.json"), br#"{"ok":true}"#).unwrap();
+        std::env::set_var("NEVOFLUX_PROFILE_WORK", &work);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/task-9/artifacts/result.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("NEVOFLUX_PROFILE_WORK");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], br#"{"ok":true}"#);
     }
 }
