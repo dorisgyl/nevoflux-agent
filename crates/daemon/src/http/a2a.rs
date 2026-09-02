@@ -34,6 +34,48 @@ use crate::http::types::{TaskRequest, TaskResponse, TaskStatus};
 /// 同步方法等待任务终态的上限。与 `http::rpc` 的 ACP/MCP 前端一致。
 const TASK_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A2A 流式任务在 `NEVOFLUX_WALL_CLOCK_SECS` 没配时的兜底墙钟。
+///
+/// A2A 的流式**不挂** `CancelOnDrop`（与 OpenAI 那条路径相反）：断流后调用方
+/// 可以 `subscribeToTask` 重新接上，任务本就该继续跑。代价是一个断线的客户端
+/// 会留下一个还在跑的任务，而队列是串行的——一个僵尸任务堵住后面所有请求。
+/// 这个兜底把「无限堵」换成「最多堵这么久」。
+pub const DEFAULT_STREAM_WALL_CLOCK_SECS: u64 = 900;
+
+/// 构造流式任务的请求：env 档位 + 兜底墙钟。
+pub fn streaming_task_request(text: String) -> TaskRequest {
+    let mut req = TaskRequest::from_env(text);
+    if req.wall_clock_secs.is_none() {
+        tracing::warn!(
+            "NEVOFLUX_WALL_CLOCK_SECS is unset; A2A streaming tasks fall back to {}s. \
+             A2A streams do not cancel on client disconnect (the client may resubscribe), \
+             so set an explicit budget for this deployment.",
+            DEFAULT_STREAM_WALL_CLOCK_SECS
+        );
+        req.wall_clock_secs = Some(DEFAULT_STREAM_WALL_CLOCK_SECS);
+    }
+    req
+}
+
+/// 一个 `working` 状态帧，可选带一段增量文本。
+fn working_frame(
+    task_id: &str,
+    context_id: &str,
+    text: Option<String>,
+) -> nevoflux_a2a::model::StreamEvent {
+    nevoflux_a2a::model::StreamEvent::StatusUpdate {
+        task_id: task_id.to_string(),
+        context_id: context_id.to_string(),
+        status: A2aTaskStatus {
+            state: TaskState::Working,
+            message: text
+                .filter(|t| !t.is_empty())
+                .map(|t| Message::agent_text(t, context_id, task_id)),
+            timestamp: None,
+        },
+    }
+}
+
 // ---- context 绑定（一个容器一个活跃 context） -------------------------------
 
 /// 进程级的 context 绑定与 task→context 归属。
@@ -199,13 +241,87 @@ impl TaskBackend for QueueBackend {
 
     async fn send_streaming(
         &self,
-        _text: String,
-        _context_id: String,
+        text: String,
+        context_id: String,
     ) -> Result<(String, EventStream), A2aError> {
-        // Task 7 实装。在那之前流式方法诚实地说自己没有。
-        Err(A2aError::UnsupportedOperation(
-            "streaming not enabled".into(),
-        ))
+        use futures::StreamExt as _;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // `_cancel` 被**故意丢弃**：A2A 的流断了不代表任务该停（见
+        // DEFAULT_STREAM_WALL_CLOCK_SECS 的说明）。
+        let (id, _cancel) = self.queue.submit_streaming(
+            streaming_task_request(text),
+            crate::script_backend::DeltaSink::new(tx),
+        );
+        ContextBinding::global().remember(&id, &context_id);
+
+        let events = futures::stream::unfold(
+            (rx, id.clone(), context_id.clone(), false),
+            |(mut rx, task_id, ctx, done)| async move {
+                if done {
+                    return None;
+                }
+                match rx.recv().await {
+                    Some(crate::script_backend::Delta::Text(t)) => {
+                        let ev = working_frame(&task_id, &ctx, Some(t));
+                        Some((ev, (rx, task_id, ctx, false)))
+                    }
+                    Some(crate::script_backend::Delta::Progress(p)) => {
+                        let ev = working_frame(&task_id, &ctx, Some(p));
+                        Some((ev, (rx, task_id, ctx, false)))
+                    }
+                    Some(crate::script_backend::Delta::Finish(p)) => {
+                        let (state, text) = match &p.error {
+                            Some((msg, _, _)) => (TaskState::Failed, msg.clone()),
+                            None => (TaskState::Completed, p.content.clone()),
+                        };
+                        let ev = nevoflux_a2a::model::StreamEvent::StatusUpdate {
+                            task_id: task_id.clone(),
+                            context_id: ctx.clone(),
+                            status: A2aTaskStatus {
+                                state,
+                                message: (!text.is_empty())
+                                    .then(|| Message::agent_text(text, &ctx, &task_id)),
+                                timestamp: None,
+                            },
+                        };
+                        Some((ev, (rx, task_id, ctx, true)))
+                    }
+                    // 通道关了却没终帧 = runner 死了。说出来，别静默收流。
+                    None => {
+                        let ev = nevoflux_a2a::model::StreamEvent::StatusUpdate {
+                            task_id: task_id.clone(),
+                            context_id: ctx.clone(),
+                            status: A2aTaskStatus {
+                                state: TaskState::Failed,
+                                message: Some(Message::agent_text(
+                                    "the task runner ended without producing a result",
+                                    &ctx,
+                                    &task_id,
+                                )),
+                                timestamp: None,
+                            },
+                        };
+                        Some((ev, (rx, task_id, ctx, true)))
+                    }
+                }
+            },
+        );
+
+        // 首帧给一个完整 Task 快照，客户端立刻拿到 id 与 contextId。
+        let first = nevoflux_a2a::model::StreamEvent::Task(Task {
+            id: id.clone(),
+            context_id: context_id.clone(),
+            status: A2aTaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: Vec::new(),
+            history: Vec::new(),
+        });
+        let stream = futures::stream::once(async move { first }).chain(events);
+        Ok((id, stream.boxed()))
     }
 
     async fn get(&self, task_id: &str) -> Result<Task, A2aError> {
@@ -233,10 +349,48 @@ impl TaskBackend for QueueBackend {
         Ok(task_from_response(&resp, &ctx))
     }
 
-    async fn subscribe(&self, _task_id: &str) -> Result<EventStream, A2aError> {
-        Err(A2aError::UnsupportedOperation(
-            "streaming not enabled".into(),
-        ))
+    async fn subscribe(&self, task_id: &str) -> Result<EventStream, A2aError> {
+        use futures::StreamExt as _;
+
+        // 重新订阅拿不到文本增量——`DeltaSink` 是单消费者，原始流已经被第一个
+        // 订阅者取走。能诚实提供的是**状态变迁**，与 `/tasks/:id/events` 同源。
+        let snapshot = self
+            .queue
+            .status(task_id)
+            .ok_or_else(|| A2aError::TaskNotFound(task_id.to_string()))?;
+        let ctx = ContextBinding::global()
+            .context_of(task_id)
+            .unwrap_or_default();
+        let queue = self.queue.clone();
+        let id = task_id.to_string();
+        let ctx_first = ctx.clone();
+
+        let stream = futures::stream::once(async move {
+            nevoflux_a2a::model::StreamEvent::Task(task_from_response(&snapshot, &ctx_first))
+        })
+        .chain(futures::stream::unfold(
+            (queue, id, ctx, None::<TaskStatus>, false),
+            |(queue, id, ctx, last, done)| async move {
+                if done {
+                    return None;
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let r = queue.status(&id)?;
+                    if last == Some(r.status) && !r.status.is_terminal() {
+                        continue;
+                    }
+                    let terminal = r.status.is_terminal();
+                    let ev = nevoflux_a2a::model::StreamEvent::StatusUpdate {
+                        task_id: id.clone(),
+                        context_id: ctx.clone(),
+                        status: task_from_response(&r, &ctx).status,
+                    };
+                    return Some((ev, (queue, id, ctx, Some(r.status), terminal)));
+                }
+            },
+        ));
+        Ok(stream.boxed())
     }
 }
 
@@ -460,17 +614,14 @@ async fn dispatch(
     let backend = QueueBackend::new(s.queue.clone());
     match handle_rpc(&backend, codec, &body).await {
         RpcOutcome::Json(v) => (StatusCode::OK, Json(v)).into_response(),
-        // Task 7 之前不会走到这里（send_streaming/subscribe 都返回错误）。
-        RpcOutcome::Stream(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": codec.error_to_json(&A2aError::UnsupportedOperation(
-                    "streaming not enabled".into()
-                ))
-            })),
-        )
-            .into_response(),
+        RpcOutcome::Stream(frames) => {
+            use axum::response::sse::{Event, KeepAlive, Sse};
+            use futures::StreamExt as _;
+            let sse = frames.map(|v| {
+                Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string()))
+            });
+            Sse::new(sse).keep_alive(KeepAlive::default()).into_response()
+        }
     }
 }
 
@@ -742,5 +893,128 @@ mod tests {
         .await;
         assert_eq!(missing["error"]["code"], -32001);
         assert_eq!(missing["error"]["data"]["status"], "NOT_FOUND");
+    }
+
+    async fn sse_text(app: axum::Router, path: &str, body: serde_json::Value) -> String {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// 流式 runner：先吐两段文本增量，再发终帧。
+    fn streaming_state() -> AppState {
+        let runner: Runner = Arc::new(|id, req, sink, _cancel| {
+            Box::pin(async move {
+                if let Some(s) = sink {
+                    s.text("Example ");
+                    s.text("Domain");
+                    s.finish(crate::script_backend::FinishPayload::from_text(format!(
+                        "did: {}",
+                        req.task
+                    )));
+                }
+                TaskResponse {
+                    id,
+                    status: TaskStatus::Succeeded,
+                    attempts: 1,
+                    output: Some(format!("did: {}", req.task)),
+                    error: None,
+                    artifacts: vec![],
+                }
+            })
+        });
+        AppState {
+            queue: Arc::new(TaskQueue::new(runner)),
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn v1_streaming_emits_wrapped_status_updates_then_a_terminal_frame() {
+        ContextBinding::global().reset_for_test();
+        let text = sse_text(
+            router(streaming_state()),
+            "/a2a/v1",
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"sendStreamingMessage",
+                "params":{"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"go"}]}}
+            }),
+        )
+        .await;
+        assert!(text.contains("\"statusUpdate\""), "got {text}");
+        assert!(text.contains("TASK_STATE_WORKING"), "got {text}");
+        assert!(text.contains("TASK_STATE_COMPLETED"), "got {text}");
+        assert!(
+            text.contains("Example "),
+            "text deltas must reach the client: {text}"
+        );
+        // v1.0 没有 final
+        assert!(!text.contains("\"final\""), "got {text}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn v03_streaming_marks_the_last_frame_final() {
+        ContextBinding::global().reset_for_test();
+        let text = sse_text(
+            router(streaming_state()),
+            "/a2a",
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"message/stream",
+                "params":{"message":{"kind":"message","messageId":"m","role":"user",
+                                     "parts":[{"kind":"text","text":"go"}]}}
+            }),
+        )
+        .await;
+        assert!(text.contains("\"kind\":\"status-update\""), "got {text}");
+        assert!(text.contains("\"final\":true"), "got {text}");
+        assert!(text.contains("\"final\":false"), "got {text}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_to_an_unknown_task_reports_not_found() {
+        ContextBinding::global().reset_for_test();
+        let v = post_json(
+            router(state()),
+            "/a2a/v1",
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"subscribeToTask","params":{"id":"nope"}
+            }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32001);
+    }
+
+    #[test]
+    #[serial]
+    fn the_streaming_fallback_wall_clock_is_applied_when_unset() {
+        std::env::remove_var("NEVOFLUX_WALL_CLOCK_SECS");
+        let req = streaming_task_request("go".into());
+        assert_eq!(req.wall_clock_secs, Some(DEFAULT_STREAM_WALL_CLOCK_SECS));
+
+        std::env::set_var("NEVOFLUX_WALL_CLOCK_SECS", "42");
+        let req = streaming_task_request("go".into());
+        assert_eq!(req.wall_clock_secs, Some(42));
+        std::env::remove_var("NEVOFLUX_WALL_CLOCK_SECS");
     }
 }
