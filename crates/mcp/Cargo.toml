@@ -34,6 +34,9 @@ thiserror.workspace = true
 # Logging
 tracing = "0.1"
 
+# A2A: a remote agent is registered like an MCP server (transport = a2a)
+nevoflux-a2a = { path = "../a2a" }
+
 # Official MCP SDK (default backend)
 rmcp = { version = "3.1", features = [
     "client",
@@ -46,3 +49,4 @@ rmcp = { version = "3.1", features = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+axum = "0.7"
