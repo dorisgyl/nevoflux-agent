@@ -115,7 +115,7 @@ impl TaskQueue {
         let start = std::time::Instant::now();
         loop {
             if let Some(r) = self.status(&id) {
-                if matches!(r.status, TaskStatus::Succeeded | TaskStatus::Failed) {
+                if r.status.is_terminal() {
                     return r;
                 }
                 if start.elapsed() >= timeout {
@@ -134,7 +134,7 @@ impl TaskQueue {
         match map.get_mut(id) {
             Some(r) => {
                 if matches!(r.status, TaskStatus::Queued | TaskStatus::Running) {
-                    r.status = TaskStatus::Failed;
+                    r.status = TaskStatus::Canceled;
                     r.error = Some("cancelled".into());
                 }
                 true
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_marks_queued_task_failed() {
+    async fn cancel_marks_queued_task_canceled() {
         // Runner would sleep forever; but the worker is never scheduled because
         // this test never awaits after submit, so the task stays Queued and
         // cancel wins deterministically.
@@ -282,7 +282,8 @@ mod tests {
         let id = q.submit(sample_request());
         assert!(q.cancel(&id));
         let st = q.status(&id).unwrap();
-        assert_eq!(st.status, TaskStatus::Failed);
+        assert_eq!(st.status, TaskStatus::Canceled);
+        // `error` is left as it was: existing clients may be reading it.
         assert_eq!(st.error.as_deref(), Some("cancelled"));
         assert!(!q.cancel("nope"));
     }

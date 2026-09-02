@@ -175,8 +175,25 @@ pub enum TaskStatus {
     Running,
     /// Completed successfully.
     Succeeded,
-    /// Failed (after retries / caps / cancel).
+    /// Failed (after retries / caps).
     Failed,
+    /// Cancelled (`DELETE /tasks/:id`, or A2A `cancelTask`).
+    ///
+    /// Separate from `Failed` because A2A treats `canceled` as its own state,
+    /// and recovering it from the `error` string would be brittle. **Wire
+    /// change:** clients that match exhaustively on `status` need updating.
+    Canceled,
+}
+
+impl TaskStatus {
+    /// Whether this is a terminal state. Polling and SSE both use it to decide
+    /// when to stop.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Canceled
+        )
+    }
 }
 
 /// Task result / status snapshot.
@@ -252,6 +269,25 @@ mod tests {
                 .unwrap();
         assert!(r.save_profile);
         assert_eq!(r.save_profile_as.as_deref(), Some("acme2"));
+    }
+
+    #[test]
+    fn canceled_serializes_snake_case_and_is_terminal() {
+        let r = TaskResponse {
+            id: "t1".into(),
+            status: TaskStatus::Canceled,
+            attempts: 1,
+            output: None,
+            error: Some("cancelled".into()),
+            artifacts: vec![],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""status":"canceled""#), "got {s}");
+        assert!(TaskStatus::Canceled.is_terminal());
+        assert!(TaskStatus::Succeeded.is_terminal());
+        assert!(TaskStatus::Failed.is_terminal());
+        assert!(!TaskStatus::Running.is_terminal());
+        assert!(!TaskStatus::Queued.is_terminal());
     }
 
     #[test]

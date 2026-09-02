@@ -109,7 +109,7 @@ async fn task_events(
                     Some((Ok(ev), (queue, id, true, last)))
                 }
                 Some(r) => {
-                    let terminal = matches!(r.status, TaskStatus::Succeeded | TaskStatus::Failed);
+                    let terminal = r.status.is_terminal();
                     if last != Some(r.status) || terminal {
                         let data = serde_json::to_string(&r).unwrap_or_default();
                         let ev = Event::default().event("status").data(data);

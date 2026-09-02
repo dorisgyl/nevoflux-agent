@@ -159,10 +159,16 @@ SSE each drove a real browser task to "Example Domain").
 ```
 **status / result** (`GET /tasks/:id`):
 ```jsonc
-{ "id": "task-0", "status": "succeeded",   // queued | running | succeeded | failed
+{ "id": "task-0", "status": "succeeded",   // queued | running | succeeded | failed | canceled
   "attempts": 1, "output": "The title is Example Domain.", "error": null, "artifacts": [] }
 ```
 The result + a debug bundle are also drained to the task workspace under `/work`.
+
+> **Wire change:** `status` gained a fifth value, `canceled`. A cancelled task
+> used to report `failed` with `error: "cancelled"`; it now reports `canceled`
+> and keeps that same `error` string. Clients that exhaustively match on
+> `status` need updating.
+
 
 ### SSE `GET /tasks/:id/events`
 ```bash
