@@ -46,7 +46,11 @@ pub struct McpServerConfigFile {
     /// Server name (unique identifier).
     pub name: String,
 
-    /// Server type: "stdio", "http", or "sse".
+    /// Server type: "stdio", "http", "sse", or "a2a".
+    ///
+    /// `a2a` registers a remote A2A agent as if it were an MCP server: `url`
+    /// is its Agent Card URL, its skills become tools, and one tool call is
+    /// "send a message, wait for the task".
     #[serde(default = "default_stdio")]
     pub server_type: String,
 
@@ -145,10 +149,10 @@ impl McpServerConfigFile {
             ));
         }
         match self.server_type.as_str() {
-            "http" | "sse" => {
+            "http" | "sse" | "a2a" => {
                 if self.url.is_none() {
                     return Err(McpConfigError::InvalidConfig(
-                        "url is required for http/sse server type".into(),
+                        "url is required for http/sse/a2a server type".into(),
                     ));
                 }
             }

@@ -421,13 +421,35 @@ were away.
 
 ### Calling other agents
 
-A remote A2A agent registers like an MCP server, with `transport: a2a` and the
-Agent Card URL as the command. Its skills become tools named
-`<agent>__<skillId>`; calling one submits a message and waits for the task to
-finish. The client reads the remote card and prefers its 1.0 interface, falling
-back to 0.3.0 — so it talks to either generation without configuration. Put a
-bearer token in the server config's `env` as `A2A_BEARER_TOKEN` if the remote
-requires one.
+A remote A2A agent registers like an MCP server. In `mcp-servers.toml`
+(`%APPDATA%\nevoflux\` on Windows, `~/.config/nevoflux/` elsewhere):
+
+```toml
+[[servers]]
+name = "agent-b"
+server_type = "a2a"
+url = "http://other-host:8084"   # its base, or its Agent Card URL
+enabled = true
+
+[servers.env]
+A2A_BEARER_TOKEN = ""            # only if the remote sets NEVOFLUX_A2A_TOKEN
+```
+
+Its skills become tools named `<agent>__<skillId>`; calling one submits a
+message and waits for the task to finish. The client reads the remote card and
+prefers its 1.0 interface, falling back to 0.3.0 — so it talks to either
+generation without configuration. On startup the daemon logs what it found:
+
+```
+connected to an A2A agent  agent="agent-b" version=1.0 skills=1
+```
+
+To smoke the client half against a running agent without an LLM in the loop:
+
+```bash
+A2A_LIVE_URL=http://127.0.0.1:8084 \
+  cargo test -p nevoflux-a2a --test live_client -- --ignored --nocapture
+```
 
 Two consequences of squeezing A2A through the MCP tool shape, both inherent to
 the protocols rather than to this implementation:

@@ -1056,7 +1056,25 @@ pub async fn start_server(
             // Register all server configs first (non-blocking)
             let mut server_names = Vec::new();
             for server in mcp_config.enabled_servers() {
-                let sc = if server.server_type == "http" || server.server_type == "sse" {
+                let sc = if server.server_type == "a2a" {
+                    // A2A agent: `url` is its Agent Card. Its skills become
+                    // tools; a tool call sends a message and awaits the task.
+                    let Some(ref url) = server.url else {
+                        warn!(
+                            "A2A agent {} has no url (its Agent Card) configured, skipping",
+                            server.name
+                        );
+                        continue;
+                    };
+                    // `env` carries A2A_BEARER_TOKEN; only the stdio branch
+                    // applied it before, which would have left every
+                    // authenticated remote unreachable.
+                    let mut sc = McpServerConfig::new_a2a(&server.name, url.as_str());
+                    for (k, v) in &server.env {
+                        sc = sc.with_env(k, v);
+                    }
+                    sc
+                } else if server.server_type == "http" || server.server_type == "sse" {
                     // HTTP/SSE transport: use URL from config
                     let Some(ref url) = server.url else {
                         warn!(
@@ -11093,7 +11111,17 @@ async fn register_configured_mcp_server(
         .get_server(name)
         .ok_or_else(|| format!("no MCP server named '{name}' in the config"))?;
 
-    let sc = if server.server_type == "http" || server.server_type == "sse" {
+    let sc = if server.server_type == "a2a" {
+        let url = server
+            .url
+            .as_ref()
+            .ok_or_else(|| format!("A2A agent '{name}' has no url (its Agent Card)"))?;
+        let mut sc = McpServerConfig::new_a2a(name, url.as_str());
+        for (k, v) in &server.env {
+            sc = sc.with_env(k, v);
+        }
+        sc
+    } else if server.server_type == "http" || server.server_type == "sse" {
         let url = server.url.as_ref().ok_or_else(|| {
             format!(
                 "MCP server '{name}' is {} but has no url",

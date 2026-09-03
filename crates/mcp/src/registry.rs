@@ -75,6 +75,22 @@ impl ServerConfig {
         }
     }
 
+    /// Create an A2A agent configuration. `card_url` is the remote agent's
+    /// Agent Card URL (or just its base — the well-known path is appended).
+    ///
+    /// Put a bearer token in `env` under `A2A_BEARER_TOKEN` if the remote
+    /// requires one.
+    pub fn new_a2a(name: impl Into<String>, card_url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: card_url.into(),
+            args: Vec::new(),
+            enabled: true,
+            env: HashMap::new(),
+            transport: TransportType::A2a,
+        }
+    }
+
     /// Add arguments.
     pub fn with_args(mut self, args: Vec<impl Into<String>>) -> Self {
         self.args = args.into_iter().map(Into::into).collect();

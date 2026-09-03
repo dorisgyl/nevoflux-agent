@@ -45,8 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/session/close", post(close_session))
         .merge(openai_routes())
+        // a2a_routes() already carries the artifact-dereference route.
         .merge(crate::http::a2a::a2a_routes())
-        .merge(crate::http::artifacts::artifact_routes())
         .with_state(state)
 }
 

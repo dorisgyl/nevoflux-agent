@@ -625,11 +625,17 @@ pub fn build_card(base: &str) -> AgentCard {
 // ---- 路由 ------------------------------------------------------------------
 
 /// A2A 路由（未上 state）。独占端口：`a2a_routes().with_state(state)`。
+///
+/// **产物解引用端点包含在内**，不是留给调用方去 merge 的：Agent Card 交出去的
+/// artifact `uri` 就指向它，少挂一次这些 uri 就是死链——而单元测试用的是合并后
+/// 的总路由，测不出某个独占端口忘了 merge。让这条路由跟着 A2A 走，这个失败模式
+/// 就不存在了。
 pub fn a2a_routes() -> Router<AppState> {
     Router::new()
         .route("/.well-known/agent-card.json", get(agent_card))
         .route("/a2a", post(rpc_v03))
         .route("/a2a/v1", post(rpc_v1))
+        .merge(crate::http::artifacts::artifact_routes())
 }
 
 /// 外部可达基址：`NEVOFLUX_A2A_PUBLIC_URL` 优先，否则用请求的 Host 头。
@@ -1336,5 +1342,41 @@ mod tests {
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], br#"{"ok":true}"#);
+    }
+
+    /// The dedicated `--a2a-addr` port serves `a2a_routes()` ALONE — not the
+    /// merged router the other tests build. An artifact `uri` in a card served
+    /// there must still resolve, so the route has to travel with A2A rather
+    /// than being merged in by each caller.
+    ///
+    /// This is a regression test: the dedicated port shipped without the
+    /// artifact route once, and every unit test still passed because they all
+    /// went through the merged router.
+    #[tokio::test]
+    #[serial]
+    async fn the_standalone_a2a_router_resolves_artifact_uris() {
+        ContextBinding::global().reset_for_test();
+        let work = std::env::temp_dir().join(format!("nf-standalone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(work.join("ws-task-0")).unwrap();
+        std::fs::write(work.join("ws-task-0").join("result.json"), b"{}").unwrap();
+        std::env::set_var("NEVOFLUX_PROFILE_WORK", &work);
+
+        // Exactly what src/main.rs serves on --a2a-addr.
+        let app = a2a_routes().with_state(state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/task-0/artifacts/result.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("NEVOFLUX_PROFILE_WORK");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a card served on the dedicated port hands out uris into this route"
+        );
     }
 }
