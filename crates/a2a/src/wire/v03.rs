@@ -292,12 +292,15 @@ pub fn stream_event_to_json(e: &StreamEvent, is_final: bool) -> Value {
             task_id,
             context_id,
             artifact,
-            index: _,
+            append,
+            last_chunk,
         } => json!({
             "kind": "artifact-update",
             "taskId": task_id,
             "contextId": context_id,
             "artifact": artifact_to_json(artifact),
+            "append": append,
+            "lastChunk": last_chunk,
         }),
     }
 }
@@ -365,6 +368,11 @@ pub fn card_to_json(c: &AgentCard) -> Value {
         o.insert("security".into(), json!([{ "bearer": [] }]));
     }
     Value::Object(o)
+}
+
+/// `message/send` 的 result。0.3 直接回 Task 本身——没有响应包装。
+pub fn send_message_result(t: &Task) -> Value {
+    task_to_json(t)
 }
 
 /// 构造 `message/send` 的 params（客户端方向）。
@@ -494,10 +502,16 @@ mod tests {
                 description: None,
                 parts: vec![Part::Text { text: "hi".into() }],
             },
-            index: 3,
+            append: true,
+            last_chunk: false,
         };
         let v = stream_event_to_json(&ev, false);
         assert_eq!(v["kind"], "artifact-update");
+        assert_eq!(v["append"], true);
+        assert_eq!(v["lastChunk"], false);
+        // `index` was never a field in either tier — an early cross-derived
+        // reading said v1.0 added one; the official SDK's descriptors say
+        // `append` + `lastChunk`.
         assert!(v.get("index").is_none());
     }
 

@@ -264,8 +264,10 @@ pub enum StreamEvent {
         context_id: String,
         /// 产物。
         artifact: Artifact,
-        /// 序号（v1.0 字段；v0.3 编码时忽略）。
-        index: u32,
+        /// 这一块是追加到已有产物上，而不是替换它。
+        append: bool,
+        /// 这是该产物的最后一块。
+        last_chunk: bool,
     },
 }
 

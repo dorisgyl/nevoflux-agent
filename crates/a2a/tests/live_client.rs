@@ -53,11 +53,9 @@ async fn drives_a_real_task_to_a_terminal_state() {
     let client = A2aClient::discover(&url, token).await.expect("discovery");
 
     let task = client
-        .send_and_wait(
-            "report the title",
-            Some("live-client-smoke"),
-            Duration::from_secs(300),
-        )
+        // Deliberately unnamed: a target may already be bound to a context,
+        // and a client with no opinion should join it rather than be refused.
+        .send_and_wait("report the title", None, Duration::from_secs(300))
         .await
         .expect("the task should come back");
 

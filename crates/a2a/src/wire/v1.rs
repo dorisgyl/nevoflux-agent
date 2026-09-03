@@ -1,10 +1,16 @@
 //! A2A **v1.0** 的 wire 格式。
 //!
-//! 与 v0.3 的关键差异：`kind` 判别字段被删除（Part 靠 JSON 成员存在性判别，
-//! 流事件靠包装对象 `task`/`message`/`statusUpdate`/`artifactUpdate` 判别）、
-//! 状态枚举是 `TASK_STATE_*` 大写、Agent Card 用 `supportedInterfaces[]`、
-//! `TaskStatusUpdateEvent` 没有 `final`、`TaskArtifactUpdateEvent` 多了 `index`、
-//! 错误带 `google.rpc.Status`。
+//! 与 v0.3 的关键差异：`kind` 判别字段被删除（Part 是直接挂在 Part 上的 oneof
+//! `text`/`raw`/`url`/`data`，没有 `file` 包装；流事件靠包装对象
+//! `task`/`message`/`statusUpdate`/`artifactUpdate` 判别）、状态枚举是
+//! `TASK_STATE_*` 大写、方法名是帕斯卡（`SendMessage`）、Agent Card 用
+//! `supportedInterfaces[]`、`TaskStatusUpdateEvent` 没有 `final`、错误带
+//! `google.rpc.Status`。
+//!
+//! **本文件的形状以官方 `a2a-sdk` 的 protobuf 描述符为准，不以规范页面的散文
+//! 为准。** 两者不一致过三处：方法名大小写、Part 的结构、以及散文声称 v1.0 给
+//! `TaskArtifactUpdateEvent` 加了 `index`（实际是 `append` + `lastChunk`）。
+//! 每一处都是照散文实现就无法与官方客户端互通的那种错。
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -15,24 +21,31 @@ use crate::model::{
 };
 
 /// 本档的 JSON-RPC 方法名。
+///
+/// **帕斯卡命名**，取自官方 `a2a-sdk` 的 JSON-RPC 传输层（它就是这么发的）。
+/// 规范页面的散文部分把它们写成了驼峰（`sendMessage`），那是错的——照着写
+/// 的服务端会被官方客户端的每一次调用打成 `-32601`。
 pub fn method_name(m: Method) -> &'static str {
     match m {
-        Method::SendMessage => "sendMessage",
-        Method::SendStreamingMessage => "sendStreamingMessage",
-        Method::GetTask => "getTask",
-        Method::CancelTask => "cancelTask",
-        Method::SubscribeToTask => "subscribeToTask",
+        Method::SendMessage => "SendMessage",
+        Method::SendStreamingMessage => "SendStreamingMessage",
+        Method::GetTask => "GetTask",
+        Method::CancelTask => "CancelTask",
+        Method::SubscribeToTask => "SubscribeToTask",
     }
 }
 
 /// 解析本档的方法名。
+///
+/// 宽进：帕斯卡是权威写法，但驼峰别名也收——规范文档那么写过，照着实现的
+/// 客户端不该被我们拒之门外。严出仍只发帕斯卡（见 [`method_name`]）。
 pub fn parse_method(s: &str) -> Option<Method> {
     match s {
-        "sendMessage" => Some(Method::SendMessage),
-        "sendStreamingMessage" => Some(Method::SendStreamingMessage),
-        "getTask" => Some(Method::GetTask),
-        "cancelTask" => Some(Method::CancelTask),
-        "subscribeToTask" => Some(Method::SubscribeToTask),
+        "SendMessage" | "sendMessage" => Some(Method::SendMessage),
+        "SendStreamingMessage" | "sendStreamingMessage" => Some(Method::SendStreamingMessage),
+        "GetTask" | "getTask" => Some(Method::GetTask),
+        "CancelTask" | "cancelTask" => Some(Method::CancelTask),
+        "SubscribeToTask" | "subscribeToTask" => Some(Method::SubscribeToTask),
         _ => None,
     }
 }
@@ -66,48 +79,59 @@ fn parse_state(s: &str) -> TaskState {
 }
 
 fn part_to_json(p: &Part) -> Value {
+    // v1.0 has no `file` wrapper: the content is a oneof directly on Part
+    // (`text` | `raw` | `url` | `data`) with `filename` / `mediaType` as
+    // siblings. Verified field-by-field against the official SDK's protobuf
+    // descriptors — this is where a cross-derived guess had it wrong.
     match p {
         Part::Text { text } => json!({ "text": text }),
-        Part::Data { data } => json!({ "structured": data }),
+        Part::Data { data } => json!({ "data": data }),
         Part::File {
             name,
             mime_type,
             source,
         } => {
-            let mut file = serde_json::Map::new();
+            let mut o = serde_json::Map::new();
+            match source {
+                // `raw` is protobuf `bytes`, whose canonical JSON is base64 —
+                // the same encoding the model already carries.
+                FileSource::Bytes(b) => o.insert("raw".into(), json!(b)),
+                FileSource::Uri(u) => o.insert("url".into(), json!(u)),
+            };
             if let Some(n) = name {
-                file.insert("name".into(), json!(n));
+                o.insert("filename".into(), json!(n));
             }
             if let Some(mt) = mime_type {
-                file.insert("mimeType".into(), json!(mt));
+                o.insert("mediaType".into(), json!(mt));
             }
-            match source {
-                FileSource::Bytes(b) => file.insert("bytes".into(), json!(b)),
-                FileSource::Uri(u) => file.insert("uri".into(), json!(u)),
-            };
-            json!({ "file": Value::Object(file) })
+            Value::Object(o)
         }
     }
 }
 
 fn parse_part(v: &Value) -> Option<Part> {
-    // v1.0 靠成员存在性判别，判别顺序固定：file > structured > text。
-    if let Some(f) = v.get("file") {
-        let source = if let Some(b) = f.get("bytes").and_then(|x| x.as_str()) {
-            FileSource::Bytes(b.to_string())
-        } else {
-            FileSource::Uri(f.get("uri")?.as_str()?.to_string())
-        };
+    // v1.0 discriminates by which member of the `content` oneof is present.
+    let name = v.get("filename").and_then(|x| x.as_str()).map(str::to_string);
+    let mime_type = v
+        .get("mediaType")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+
+    if let Some(b) = v.get("raw").and_then(|x| x.as_str()) {
         return Some(Part::File {
-            name: f.get("name").and_then(|x| x.as_str()).map(str::to_string),
-            mime_type: f
-                .get("mimeType")
-                .and_then(|x| x.as_str())
-                .map(str::to_string),
-            source,
+            name,
+            mime_type,
+            source: FileSource::Bytes(b.to_string()),
         });
     }
-    if let Some(d) = v.get("structured") {
+    if let Some(u) = v.get("url").and_then(|x| x.as_str()) {
+        return Some(Part::File {
+            name,
+            mime_type,
+            source: FileSource::Uri(u.to_string()),
+        });
+    }
+    if let Some(d) = v.get("data") {
         return Some(Part::Data { data: d.clone() });
     }
     Some(Part::Text {
@@ -287,13 +311,15 @@ pub fn stream_event_to_json(e: &StreamEvent, _is_final: bool) -> Value {
             task_id,
             context_id,
             artifact,
-            index,
+            append,
+            last_chunk,
         } => json!({
             "artifactUpdate": {
                 "taskId": task_id,
                 "contextId": context_id,
                 "artifact": artifact_to_json(artifact),
-                "index": index,
+                "append": append,
+                "lastChunk": last_chunk,
             }
         }),
     }
@@ -348,9 +374,30 @@ pub fn card_to_json(c: &AgentCard) -> Value {
             "securitySchemes".into(),
             json!({ "bearer": { "type": "http", "scheme": "bearer" } }),
         );
-        o.insert("security".into(), json!([{ "bearer": [] }]));
+        o.insert(
+            "securityRequirements".into(),
+            json!([{ "schemes": { "bearer": { "list": [] } } }]),
+        );
     }
     Value::Object(o)
+}
+
+/// `SendMessage` 的 result：一个 `SendMessageResponse`，即 task|message 的
+/// oneof —— 不是裸 Task。
+///
+/// `GetTask` 与 `CancelTask` 反而回裸 Task。这个不对称是规范自己的，照着抄。
+pub fn send_message_result(t: &Task) -> Value {
+    json!({ "task": task_to_json(t) })
+}
+
+/// 解析 `SendMessage` 的 result（客户端方向）：拆掉 oneof 包装。
+pub fn parse_send_message_result(v: &Value) -> Result<Task, A2aError> {
+    match v.get("task") {
+        Some(t) => parse_task(t),
+        None => Err(A2aError::InvalidAgentResponse(
+            "SendMessageResponse carried no task (a bare message reply is not a task)".into(),
+        )),
+    }
 }
 
 /// 构造 `sendMessage` 的 params（客户端方向）。
@@ -426,18 +473,28 @@ mod tests {
         }
     }
 
+    /// Pinned against the official `a2a-sdk`'s JSON-RPC transport, which is
+    /// what actually goes on the wire. The spec prose says camelCase; the SDK
+    /// sends PascalCase, and the SDK is the thing on the other end.
     #[test]
-    fn method_names_are_the_v1_strings() {
-        assert_eq!(method_name(Method::SendMessage), "sendMessage");
+    fn method_names_are_pascal_case_like_the_sdk_sends() {
+        assert_eq!(method_name(Method::SendMessage), "SendMessage");
         assert_eq!(
             method_name(Method::SendStreamingMessage),
-            "sendStreamingMessage"
+            "SendStreamingMessage"
         );
-        assert_eq!(method_name(Method::GetTask), "getTask");
-        assert_eq!(method_name(Method::CancelTask), "cancelTask");
-        assert_eq!(method_name(Method::SubscribeToTask), "subscribeToTask");
+        assert_eq!(method_name(Method::GetTask), "GetTask");
+        assert_eq!(method_name(Method::CancelTask), "CancelTask");
+        assert_eq!(method_name(Method::SubscribeToTask), "SubscribeToTask");
+
+        assert_eq!(parse_method("SendMessage"), Some(Method::SendMessage));
+        // camelCase is accepted too: the spec documented it, so a client
+        // written from the prose should still get through.
         assert_eq!(parse_method("sendMessage"), Some(Method::SendMessage));
+        assert_eq!(parse_method("subscribeToTask"), Some(Method::SubscribeToTask));
+        // but the other tier's names stay foreign
         assert_eq!(parse_method("message/send"), None);
+        assert_eq!(parse_method("tasks/get"), None);
     }
 
     #[test]
@@ -452,15 +509,63 @@ mod tests {
         assert_eq!(v["contextId"], "ctx-1");
     }
 
+    /// Pinned against JSON generated by the official `a2a-sdk` from its own
+    /// protobuf descriptors: the content is a oneof directly on Part, with no
+    /// `file` wrapper, and `filename` / `mediaType` sit beside it.
     #[test]
-    fn parts_discriminate_by_member_presence() {
+    fn parts_are_a_flat_oneof_with_sibling_metadata() {
         let v = task_to_json(&sample_task());
         let file_part = &v["artifacts"][0]["parts"][0];
         assert!(file_part.get("kind").is_none());
-        assert_eq!(file_part["file"]["bytes"], "QUJD");
+        assert!(file_part.get("file").is_none(), "v1.0 has no file wrapper");
+        assert_eq!(file_part["raw"], "QUJD");
+        assert_eq!(file_part["filename"], "shot.png");
+        assert_eq!(file_part["mediaType"], "image/png");
+
         let text_part = &v["status"]["message"]["parts"][0];
         assert!(text_part.get("kind").is_none());
         assert_eq!(text_part["text"], "Example Domain");
+    }
+
+    #[test]
+    fn a_uri_file_part_uses_url_and_data_parts_use_data() {
+        use crate::model::{Message, Role};
+        let t = Task {
+            id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: Some(Message {
+                    message_id: "m".into(),
+                    role: Role::Agent,
+                    parts: vec![
+                        Part::File {
+                            name: Some("x.bin".into()),
+                            mime_type: Some("application/octet-stream".into()),
+                            source: FileSource::Uri("https://h/x.bin".into()),
+                        },
+                        Part::Data {
+                            data: serde_json::json!({ "k": "v" }),
+                        },
+                    ],
+                    context_id: None,
+                    task_id: None,
+                }),
+                timestamp: None,
+            },
+            artifacts: vec![],
+            history: vec![],
+        };
+        let parts = &task_to_json(&t)["status"]["message"]["parts"];
+        assert_eq!(parts[0]["url"], "https://h/x.bin");
+        assert_eq!(parts[0]["mediaType"], "application/octet-stream");
+        assert_eq!(parts[1]["data"]["k"], "v");
+        assert!(
+            parts[1].get("structured").is_none(),
+            "the field is `data`, not `structured`"
+        );
+        // and they parse back
+        assert_eq!(parse_task(&task_to_json(&t)).unwrap(), t);
     }
 
     #[test]
@@ -495,11 +600,14 @@ mod tests {
                 description: None,
                 parts: vec![Part::Text { text: "hi".into() }],
             },
-            index: 3,
+            append: true,
+            last_chunk: true,
         };
         let v = stream_event_to_json(&ev, false);
-        assert_eq!(v["artifactUpdate"]["index"], 3);
+        assert_eq!(v["artifactUpdate"]["append"], true);
+        assert_eq!(v["artifactUpdate"]["lastChunk"], true);
         assert_eq!(v["artifactUpdate"]["taskId"], "task-0");
+        assert!(v["artifactUpdate"].get("index").is_none());
     }
 
     #[test]

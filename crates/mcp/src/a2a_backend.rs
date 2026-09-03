@@ -195,13 +195,16 @@ mod tests {
             .route(
                 "/a2a/v1",
                 post(|Json(b): Json<serde_json::Value>| async move {
+                    // v1.0 wraps SendMessage's result in a SendMessageResponse
+                    // oneof — a bare task here would not match a real agent.
                     Json(serde_json::json!({
                         "jsonrpc": "2.0", "id": b["id"],
-                        "result": { "id": "t1", "contextId": "c",
-                                    "status": { "state": "TASK_STATE_COMPLETED",
-                                                "message": { "messageId": "m", "role": "ROLE_AGENT",
-                                                             "parts": [{ "text": "Example Domain" }] } },
-                                    "artifacts": [], "history": [] }
+                        "result": { "task": {
+                            "id": "t1", "contextId": "c",
+                            "status": { "state": "TASK_STATE_COMPLETED",
+                                        "message": { "messageId": "m", "role": "ROLE_AGENT",
+                                                     "parts": [{ "text": "Example Domain" }] } },
+                            "artifacts": [], "history": [] } }
                     }))
                 }),
             );

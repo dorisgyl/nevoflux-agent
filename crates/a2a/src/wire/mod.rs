@@ -84,6 +84,23 @@ impl Codec {
         }
     }
 
+    /// 编 `SendMessage` 的 result。两档形状不同：0.3 回裸 Task，1.0 回
+    /// `SendMessageResponse`（task|message 的 oneof）。
+    pub fn send_message_result(&self, t: &Task) -> Value {
+        match self.0 {
+            ProtocolVersion::V0_3 => v03::send_message_result(t),
+            ProtocolVersion::V1_0 => v1::send_message_result(t),
+        }
+    }
+
+    /// 解 `SendMessage` 的 result（客户端方向）。
+    pub fn parse_send_message_result(&self, v: &Value) -> Result<Task, A2aError> {
+        match self.0 {
+            ProtocolVersion::V0_3 => v03::parse_task(v),
+            ProtocolVersion::V1_0 => v1::parse_send_message_result(v),
+        }
+    }
+
     /// 编 Agent Card。
     pub fn card_to_json(&self, c: &AgentCard) -> Value {
         match self.0 {
@@ -300,9 +317,14 @@ mod tests {
             let a = Codec(ProtocolVersion::V0_3).method_name(m);
             let b = Codec(ProtocolVersion::V1_0).method_name(m);
             assert_ne!(a, b, "{m:?} must be named differently in each version");
+            // Each tier answers to its own name...
             assert_eq!(Codec(ProtocolVersion::V0_3).parse_method(a), Some(m));
-            assert_eq!(Codec(ProtocolVersion::V0_3).parse_method(b), None);
             assert_eq!(Codec(ProtocolVersion::V1_0).parse_method(b), Some(m));
+            // ...and never to the other tier's. (v1.0 also accepts a camelCase
+            // alias of its OWN name — see v1::parse_method — but a 0.3 name
+            // like `message/send` stays foreign, which is what keeps one
+            // endpoint from quietly speaking two protocols.)
+            assert_eq!(Codec(ProtocolVersion::V0_3).parse_method(b), None);
             assert_eq!(Codec(ProtocolVersion::V1_0).parse_method(a), None);
         }
     }

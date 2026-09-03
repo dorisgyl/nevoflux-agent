@@ -93,7 +93,11 @@ pub async fn handle_rpc(backend: &dyn TaskBackend, codec: Codec, body: &Value) -
 
             if method == Method::SendMessage {
                 return RpcOutcome::Json(match backend.send(text, context_id).await {
-                    Ok(t) => ok(&id, codec.task_to_json(&t)),
+                    // Not the bare task: `SendMessage` answers a
+                    // `SendMessageResponse`, which is a oneof of task|message.
+                    // `GetTask` and `CancelTask` DO answer a bare task — the
+                    // asymmetry is theirs, and the codec keeps it.
+                    Ok(t) => ok(&id, codec.send_message_result(&t)),
                     Err(e) => err(codec, &id, &e),
                 });
             }
@@ -301,8 +305,15 @@ mod tests {
         )
         .await;
         let v = json_of(out);
-        assert_eq!(v["result"]["status"]["state"], "TASK_STATE_COMPLETED");
-        assert!(v["result"].get("kind").is_none());
+        // `SendMessage` answers a SendMessageResponse — a oneof of
+        // task|message — not a bare task. GetTask/CancelTask DO answer a bare
+        // task; the asymmetry is the spec's.
+        assert_eq!(v["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert!(v["result"]["task"].get("kind").is_none());
+        assert!(
+            v["result"].get("status").is_none(),
+            "the task must be wrapped, not spliced into the result"
+        );
     }
 
     #[tokio::test]

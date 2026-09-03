@@ -139,7 +139,7 @@ impl A2aClient {
         let result = v
             .get("result")
             .ok_or_else(|| A2aError::InvalidAgentResponse("no result in response".into()))?;
-        self.codec.parse_task(result)
+        self.codec.parse_send_message_result(result)
     }
 
     /// 健康检查：重新拉一次卡片。
@@ -184,14 +184,15 @@ mod tests {
         })
     }
 
+    /// v1.0 wraps SendMessage's result in a SendMessageResponse oneof.
     fn v1_reply(id: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0", "id": id,
-            "result": { "id": "t-1", "contextId": "c",
+            "result": { "task": { "id": "t-1", "contextId": "c",
                         "status": { "state": "TASK_STATE_COMPLETED",
                                     "message": { "messageId": "m", "role": "ROLE_AGENT",
                                                  "parts": [{ "text": "v1 answered" }] } },
-                        "artifacts": [], "history": [] }
+                        "artifacts": [], "history": [] } }
         })
     }
 
