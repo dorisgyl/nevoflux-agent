@@ -887,8 +887,14 @@ mod tests {
                                      "parts": [{ "text": "open example.com" }] } }
         });
         let v = post_json(router(state()), "/a2a/v1", body).await;
-        assert_eq!(v["result"]["status"]["state"], "TASK_STATE_COMPLETED");
-        assert!(v["result"].get("kind").is_none());
+        // SendMessage answers a SendMessageResponse (a oneof of task|message),
+        // so the task is nested. GetTask/CancelTask answer a bare task — see
+        // `get_and_cancel_round_trip`.
+        assert_eq!(
+            v["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        assert!(v["result"]["task"].get("kind").is_none());
     }
 
     #[tokio::test]
@@ -1011,7 +1017,7 @@ mod tests {
             }),
         )
         .await;
-        let id = sent["result"]["id"].as_str().unwrap().to_string();
+        let id = sent["result"]["task"]["id"].as_str().unwrap().to_string();
 
         let got = post_json(
             app.clone(),
@@ -1191,14 +1197,14 @@ mod tests {
         };
 
         let first = post_json(app.clone(), "/a2a/v1", mk("open example.com")).await;
-        let out = first["result"]["status"]["message"]["parts"][0]["text"]
+        let out = first["result"]["task"]["status"]["message"]["parts"][0]["text"]
             .as_str()
             .unwrap();
         assert!(out.contains("flow=true"), "got {out}");
         assert!(out.contains("history=[]"), "first turn has no history: {out}");
 
         let second = post_json(app.clone(), "/a2a/v1", mk("now scroll down")).await;
-        let out = second["result"]["status"]["message"]["parts"][0]["text"]
+        let out = second["result"]["task"]["status"]["message"]["parts"][0]["text"]
             .as_str()
             .unwrap();
         assert!(
@@ -1236,7 +1242,7 @@ mod tests {
             })
         };
         let v = post_json(app.clone(), "/a2a/v1", mk("ctx-a")).await;
-        assert_eq!(v["result"]["contextId"], "ctx-a");
+        assert_eq!(v["result"]["task"]["contextId"], "ctx-a");
         // 未关会话时，另一个 context 仍被拒
         let v = post_json(app.clone(), "/a2a/v1", mk("ctx-b")).await;
         assert_eq!(v["error"]["code"], -32004);
@@ -1256,7 +1262,7 @@ mod tests {
 
         // 关了之后 ctx-b 应当能绑上
         let v = post_json(app.clone(), "/a2a/v1", mk("ctx-b")).await;
-        assert_eq!(v["result"]["contextId"], "ctx-b");
+        assert_eq!(v["result"]["task"]["contextId"], "ctx-b");
         assert!(ContextBinding::global().history_for("ctx-a").is_empty());
     }
 
