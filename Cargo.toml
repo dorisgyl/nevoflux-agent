@@ -17,6 +17,7 @@ members = [
     "crates/llm-gateway",
     "crates/testing",
     "crates/mcp",
+    "crates/a2a",
     "crates/daemon",
     "crates/bridge",
     "crates/brain",

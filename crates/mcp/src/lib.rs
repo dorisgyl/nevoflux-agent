@@ -36,6 +36,7 @@
 //! }
 //! ```
 
+pub mod a2a_backend;
 pub mod backend;
 pub mod client;
 pub mod command;

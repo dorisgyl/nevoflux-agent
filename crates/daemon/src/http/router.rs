@@ -45,6 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/session/close", post(close_session))
         .merge(openai_routes())
+        .merge(crate::http::a2a::a2a_routes())
+        .merge(crate::http::artifacts::artifact_routes())
         .with_state(state)
 }
 
@@ -109,7 +111,7 @@ async fn task_events(
                     Some((Ok(ev), (queue, id, true, last)))
                 }
                 Some(r) => {
-                    let terminal = matches!(r.status, TaskStatus::Succeeded | TaskStatus::Failed);
+                    let terminal = r.status.is_terminal();
                     if last != Some(r.status) || terminal {
                         let data = serde_json::to_string(&r).unwrap_or_default();
                         let ev = Event::default().event("status").data(data);
@@ -352,6 +354,9 @@ async fn close_session(body: Option<Json<CloseSessionRequest>>) -> impl IntoResp
     let report =
         crate::automation::session_holder::teardown_locked(&mut guard, &pm, req.save, req.save_as)
             .await;
+    // The session is over, so the A2A binding should let go too — otherwise the
+    // next context is blocked by a session that no longer exists.
+    crate::http::a2a::ContextBinding::global().unbind();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -387,7 +392,12 @@ mod tests {
         assert_eq!(r.save_as.as_deref(), Some("acme2"));
     }
 
+    /// Serial because closing a session also releases the process-global A2A
+    /// context binding (`http::a2a::ContextBinding`). Without this, the test
+    /// runs in parallel with the A2A tests and unbinds the context one of them
+    /// just established — which shows up there, not here.
     #[tokio::test]
+    #[serial_test::serial]
     async fn session_close_reports_no_active_session() {
         let app = router(test_state());
         let resp = app

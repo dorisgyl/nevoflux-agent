@@ -159,10 +159,16 @@ SSE each drove a real browser task to "Example Domain").
 ```
 **status / result** (`GET /tasks/:id`):
 ```jsonc
-{ "id": "task-0", "status": "succeeded",   // queued | running | succeeded | failed
+{ "id": "task-0", "status": "succeeded",   // queued | running | succeeded | failed | canceled
   "attempts": 1, "output": "The title is Example Domain.", "error": null, "artifacts": [] }
 ```
 The result + a debug bundle are also drained to the task workspace under `/work`.
+
+> **Wire change:** `status` gained a fifth value, `canceled`. A cancelled task
+> used to report `failed` with `error: "cancelled"`; it now reports `canceled`
+> and keeps that same `error` string. Clients that exhaustively match on
+> `status` need updating.
+
 
 ### SSE `GET /tasks/:id/events`
 ```bash
@@ -339,6 +345,99 @@ that can't carry them.
 > non-streaming OpenAI. Enough to drive a headless task from an OpenAI / MCP / ACP
 > client, not full protocol implementations.
 
+## A2A (Agent2Agent) — both directions
+
+This agent is a peer on an A2A network: other agents can hand it work, and it
+can hand work to them.
+
+### Being called
+
+`--a2a-addr` mounts four paths:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/.well-known/agent-card.json` | discovery — lists both protocol versions |
+| `POST` | `/a2a` | JSON-RPC, protocol **0.3.0** |
+| `POST` | `/a2a/v1` | JSON-RPC, protocol **1.0** |
+| `GET` | `/tasks/:id/artifacts/:name` | dereference an artifact returned by URI |
+
+**Why two paths.** A2A v1.0 is a breaking change from v0.3 — RPCs were renamed
+(`message/send` → `sendMessage`), the `kind` discriminator was removed, and the
+state enum became `TASK_STATE_*`. The spec also says an **empty `A2A-Version`
+must be read as 0.3**, so serving only 1.0 would reject every caller that does
+not send the header. Each path speaks exactly one version, which is how the
+card advertises them; sending an `A2A-Version` that disagrees with the path is
+refused with `VersionNotSupported`.
+
+Methods served: `sendMessage`, `sendStreamingMessage` (SSE), `getTask`,
+`cancelTask`, `subscribeToTask`. **Not** served: push-notification webhooks and
+`input-required` — a container has nobody to ask.
+
+```bash
+nevoflux-agent --daemon --headless --a2a-addr 0.0.0.0:8084
+curl -sS localhost:8084/.well-known/agent-card.json | jq .supportedInterfaces
+./examples/a2a-client-v1.sh http://localhost:8084
+```
+
+**mode / profile / policy come from the environment**, never from the request —
+the same `NEVOFLUX_TASK_*` / `NEVOFLUX_POLICY_*` vars the other thin front-ends
+use. A caller that could set `allow_shell` would mean anyone who can reach the
+port can run shell in the container. The card's `skills` are generated from
+whatever tier this deployment is configured for, so callers can *see* the
+capability without being able to *change* it.
+
+**One container serves one context.** `contextId` maps to a task-flow: turns in
+the same context share the browser, the profile clone, and the conversation
+history. A second, differently-named context is refused — run another container
+for it. A message with **no** `contextId` reuses the bound one (or starts one),
+since a caller that named nothing has expressed no conflict. A context is torn
+down after `NEVOFLUX_A2A_CONTEXT_IDLE_SECS` (default 1800) of silence, or via
+`POST /session/close`. **Context history lives in memory: restarting the
+container loses it.** History is capped at the 20 most recent turns, because it
+is replayed into the prompt and an uncapped context would grow the per-turn
+token cost without the caller noticing.
+
+> **Set `NEVOFLUX_WALL_CLOCK_SECS`.** Unlike the OpenAI endpoint, an A2A stream
+> does **not** cancel the task when the client disconnects — the client is
+> allowed to `subscribeToTask` and come back. The queue is serial, so without a
+> budget one disconnected client can hold it. Absent the variable, A2A streaming
+> tasks fall back to 900s and log a warning.
+
+Artifacts left in the task workspace come back on the terminal task: small ones
+inline as base64, larger ones as a `uri` pointing at
+`GET /tasks/:id/artifacts/:name`.
+
+| env var | meaning | default |
+|---|---|---|
+| `NEVOFLUX_A2A_TOKEN` | require `Authorization: Bearer <token>` on the RPC + artifact paths (the card stays public) | unset = no auth |
+| `NEVOFLUX_A2A_PUBLIC_URL` | externally reachable base for URLs in the card and artifact links | the request's `Host` |
+| `NEVOFLUX_A2A_CONTEXT_IDLE_SECS` | tear down an idle context after this long | `1800` |
+| `NEVOFLUX_A2A_INLINE_MAX_BYTES` | inline artifacts up to this size; larger ones get a URI | `262144` |
+
+`subscribeToTask` replays the task's **status transitions**, not its text
+deltas: the delta channel has a single consumer and the first subscriber took
+it. Reconnecting tells you where the task got to, not what it said while you
+were away.
+
+### Calling other agents
+
+A remote A2A agent registers like an MCP server, with `transport: a2a` and the
+Agent Card URL as the command. Its skills become tools named
+`<agent>__<skillId>`; calling one submits a message and waits for the task to
+finish. The client reads the remote card and prefers its 1.0 interface, falling
+back to 0.3.0 — so it talks to either generation without configuration. Put a
+bearer token in the server config's `env` as `A2A_BEARER_TOKEN` if the remote
+requires one.
+
+Two consequences of squeezing A2A through the MCP tool shape, both inherent to
+the protocols rather than to this implementation:
+
+- A2A skills carry **no input schema**, so every generated tool takes a single
+  `task` string.
+- `call_tool` returns once, so a remote task's streaming progress is flattened
+  into the final result. Artifacts come back as inline images or as links.
+
+
 ## Fixed-script mode (no LLM)
 
 For a **deterministic** browser-use pipeline that needs **no LLM provider**, point
@@ -453,3 +552,6 @@ Concurrency/warm capacity is the platform's job (the product runs one browser).
   (phone-driven, no HTTP) services, pre-hardened.
 - `entrypoint.sh` — dbus → Xvfb → (optional VNC) → daemon.
 - `native-host/com.nevoflux.agent.json` — native-messaging manifest (verify path via `about:support`).
+- `examples/a2a-client-v1.sh` / `examples/a2a-client-v03.sh` — drive the agent over
+  A2A, one script per protocol version. Reading them side by side is the shortest
+  description of what v1.0 broke.

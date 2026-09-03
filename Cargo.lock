@@ -4681,6 +4681,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nevoflux-a2a"
+version = "0.3.15"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nevoflux-agent"
 version = "0.3.15"
 dependencies = [
@@ -4819,6 +4835,7 @@ dependencies = [
  "image",
  "monty",
  "monty-types",
+ "nevoflux-a2a",
  "nevoflux-asr",
  "nevoflux-brain",
  "nevoflux-builtin-wasm",
@@ -4930,7 +4947,9 @@ name = "nevoflux-mcp"
 version = "0.3.15"
 dependencies = [
  "async-trait",
+ "axum",
  "futures",
+ "nevoflux-a2a",
  "reqwest 0.12.28",
  "rmcp 3.1.0",
  "serde",

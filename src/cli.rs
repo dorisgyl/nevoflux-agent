@@ -95,6 +95,16 @@ pub struct Cli {
     #[arg(long)]
     pub acp_addr: Option<std::net::SocketAddr>,
 
+    /// Serve the A2A endpoints on this port. e.g. 0.0.0.0:8084
+    ///
+    /// Mounts three paths: `GET /.well-known/agent-card.json` (discovery),
+    /// `POST /a2a` (protocol 0.3.0) and `POST /a2a/v1` (protocol 1.0). Each
+    /// POST path speaks exactly one protocol version — that is how the two are
+    /// advertised in the card, and it keeps the "empty A2A-Version means 0.3"
+    /// rule from ever mattering.
+    #[arg(long)]
+    pub a2a_addr: Option<std::net::SocketAddr>,
+
     /// Serve the token-protected admin API on this port. e.g. 127.0.0.1:8084
     ///
     /// Requires NEVOFLUX_ADMIN_TOKEN; without it the surface is not mounted.

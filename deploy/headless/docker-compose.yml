@@ -31,12 +31,15 @@ services:
     # To split OpenAI / MCP / ACP onto their own ports, add their flags + publish:
     #   command: ["--daemon","--headless","--http-addr","0.0.0.0:8080",
     #             "--openai-addr","0.0.0.0:8081","--mcp-addr","0.0.0.0:8082","--acp-addr","0.0.0.0:8083"]
-    command: ["--daemon", "--headless", "--http-addr", "0.0.0.0:8080"]
+    # A2A needs its own flag either way — it is not served on --http-addr.
+    command: ["--daemon", "--headless", "--http-addr", "0.0.0.0:8080",
+              "--a2a-addr", "0.0.0.0:8084"]
     ports:
       - "8080:8080"           # task API (+ OpenAI /v1): POST /tasks, GET /tasks/:id[/events], /metrics
       # - "8081:8081"         # dedicated OpenAI  (POST /v1/chat/completions) — needs --openai-addr
       # - "8082:8082"         # dedicated MCP     (POST /mcp)                  — needs --mcp-addr
       # - "8083:8083"         # dedicated ACP     (POST /acp)                  — needs --acp-addr
+      - "8084:8084"           # A2A: /.well-known/agent-card.json, POST /a2a (0.3.0), POST /a2a/v1 (1.0)
       # - "6080:6080"         # noVNC in a browser: http://localhost:6080/vnc.html (NEVOFLUX_VNC=1)
       # - "5900:5900"         # raw VNC for native clients (NEVOFLUX_VNC=1). Keep both off in prod.
     environment:
@@ -55,6 +58,16 @@ services:
       # raw VNC on :5900 AND noVNC on :6080 (browser at http://host:6080/vnc.html).
       NEVOFLUX_VNC: "0"
       # NEVOFLUX_VNC_VIEWONLY: "1"   # watch-only (no input) so you can't disturb the run
+      # A2A (Agent2Agent). Served on --a2a-addr: the card plus one path per
+      # protocol version. See the "A2A — both directions" section in README.md.
+      # NEVOFLUX_A2A_TOKEN: ""              # set to require `Authorization: Bearer`
+      # NEVOFLUX_A2A_PUBLIC_URL: ""         # externally reachable base, if behind a proxy
+      # NEVOFLUX_A2A_CONTEXT_IDLE_SECS: "1800"
+      # NEVOFLUX_A2A_INLINE_MAX_BYTES: "262144"
+      # An A2A stream does NOT cancel its task when the client disconnects (it may
+      # resubscribe), and the queue is serial — give tasks a budget or one dropped
+      # client can hold it. Absent this, A2A streams fall back to 900s.
+      # NEVOFLUX_WALL_CLOCK_SECS: "600"
       # Logging level (stderr → `docker compose logs`). The daemon reads RUST_LOG.
       RUST_LOG: "info"
       # Fixed-script mode (no LLM): run a deterministic Python flow instead of the

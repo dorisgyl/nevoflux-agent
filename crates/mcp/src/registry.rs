@@ -24,6 +24,13 @@ pub enum TransportType {
     Stdio,
     /// HTTP/SSE (Streamable HTTP) transport.
     Http,
+    /// A2A agent (`command` holds the Agent Card URL).
+    ///
+    /// A remote A2A agent is registered as if it were an MCP server: its skills
+    /// become tools and one `call_tool` is "send a message, wait for the task".
+    /// That way the registry, connection management, reconnects, permission
+    /// gating and settings UI all carry over unchanged.
+    A2a,
 }
 
 /// Configuration for an MCP server.
@@ -183,6 +190,14 @@ impl McpRegistry {
             TransportType::Http => Arc::new(RmcpClient::connect_http(&config.command).await?),
             TransportType::Stdio => Arc::new(
                 RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?,
+            ),
+            TransportType::A2a => Arc::new(
+                crate::a2a_backend::A2aBackend::connect(
+                    &config.name,
+                    &config.command,
+                    config.env.get("A2A_BEARER_TOKEN").cloned(),
+                )
+                .await?,
             ),
         };
 

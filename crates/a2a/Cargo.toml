@@ -1,0 +1,25 @@
+# crates/a2a/Cargo.toml
+
+[package]
+name = "nevoflux-a2a"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "A2A (Agent2Agent) protocol types, server dispatch and client for NevoFlux Agent"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+reqwest = { workspace = true, features = ["json"] }
+uuid.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+axum = "0.7"
