@@ -5,10 +5,12 @@
 
 pub mod a2a;
 pub mod admin;
+pub mod anthropic_wire;
 pub mod artifacts;
 pub mod metrics;
 pub mod openai_wire;
 pub mod queue;
+pub mod responses_wire;
 pub mod router;
 pub mod rpc;
 pub mod types;

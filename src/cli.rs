@@ -95,6 +95,15 @@ pub struct Cli {
     #[arg(long)]
     pub acp_addr: Option<std::net::SocketAddr>,
 
+    /// Serve the Anthropic Messages API (POST /v1/messages) on a DEDICATED
+    /// port. e.g. 0.0.0.0:8085
+    ///
+    /// Also served on --http-addr. It gets its own flag rather than riding on
+    /// --openai-addr because the headers (`x-api-key`, `anthropic-version`)
+    /// and the error envelope are Anthropic's, not OpenAI's.
+    #[arg(long)]
+    pub anthropic_addr: Option<std::net::SocketAddr>,
+
     /// Serve the A2A endpoints on this port. e.g. 0.0.0.0:8084
     ///
     /// Mounts three paths: `GET /.well-known/agent-card.json` (discovery),

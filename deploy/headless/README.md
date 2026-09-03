@@ -285,7 +285,9 @@ Each is available on the main port and can also bind a **dedicated port**:
 
 | Interface | Endpoint | Dedicated-port flag |
 |---|---|---|
-| OpenAI-compatible | `POST /v1/chat/completions` | `--openai-addr` (also on `--http-addr`) |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | `--openai-addr` (also on `--http-addr`) |
+| OpenAI Responses | `POST /v1/responses` | `--openai-addr` (also on `--http-addr`) |
+| Anthropic Messages | `POST /v1/messages` | `--anthropic-addr` (also on `--http-addr`) |
 | MCP (JSON-RPC 2.0) | `POST /mcp` | `--mcp-addr` |
 | ACP (JSON-RPC 2.0) | `POST /acp` | `--acp-addr` |
 
@@ -339,6 +341,35 @@ caps come from the environment (`TaskRequest::from_env`). Set these on the conta
 Booleans accept `1` / `true` / `yes`. `POST /tasks` still takes all of these per
 request in its JSON body — the env vars are only the defaults for the interfaces
 that can't carry them.
+
+**OpenAI Responses / Anthropic Messages** — same job as chat/completions in
+each protocol's own shapes, blocking and streaming. Point an official SDK at
+the port and it works:
+
+```python
+from openai import OpenAI
+OpenAI(base_url="http://host:8080/v1", api_key="unused").responses.create(
+    model="nevoflux", input="open example.com, report title")
+
+import anthropic
+anthropic.Anthropic(base_url="http://host:8080", api_key="unused").messages.create(
+    model="nevoflux", max_tokens=1024,
+    messages=[{"role": "user", "content": "open example.com, report title"}])
+```
+
+Anthropic gets its own `--anthropic-addr` rather than riding on `--openai-addr`:
+the headers (`x-api-key`, `anthropic-version`) and the error envelope
+(`{"type":"error","error":{...}}`) are Anthropic's, and a flag named `openai`
+serving them would be a lie a reader has to un-learn. Neither endpoint
+validates the API key — like every other front-end here, the deployment's
+network boundary is the gate.
+
+Verified against the official SDKs (blocking + streaming, both protocols):
+
+```bash
+pip install openai anthropic
+BASE=http://127.0.0.1:8080 python crates/daemon/tests/interop_openai_anthropic.py
+```
 
 > **Scope note:** these front-ends are intentionally minimal — single-tool MCP;
 > request/response ACP without streaming `session/update` notifications;

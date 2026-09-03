@@ -236,6 +236,42 @@ impl ScriptRequest {
         }
     }
 
+    /// 由压平的 `(role, text)` 序列构造。
+    ///
+    /// 给那些消息形状与 OpenAI Chat Completions 不同的前端用（Responses 的
+    /// `input` item、Anthropic 的顶层 `system` + 内容块）：它们各自压平一次，
+    /// 后端拿到的仍是同一份契约，不必认识第三、第四种线格式。
+    pub fn from_flat(
+        protocol: &str,
+        model: &str,
+        messages: Vec<(String, String)>,
+        task: &str,
+        stream: bool,
+    ) -> Self {
+        Self {
+            contract_version: 1,
+            protocol: protocol.to_string(),
+            model: model.to_string(),
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| ScriptMessage {
+                    role,
+                    content,
+                    content_parts: Vec::new(),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                })
+                .collect(),
+            arguments: serde_json::json!({}),
+            task: task.to_string(),
+            tools: Vec::new(),
+            tool_choice: None,
+            stream,
+            params: ScriptParams::default(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
     /// 序列化成交给脚本的 JSON 值。
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))

@@ -667,6 +667,7 @@ async fn run_daemon(
     mcp_addr: Option<std::net::SocketAddr>,
     acp_addr: Option<std::net::SocketAddr>,
     a2a_addr: Option<std::net::SocketAddr>,
+    anthropic_addr: Option<std::net::SocketAddr>,
     admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists first — managed daemons need it for the
@@ -795,6 +796,7 @@ async fn run_daemon(
             || mcp_addr.is_some()
             || acp_addr.is_some()
             || a2a_addr.is_some()
+            || anthropic_addr.is_some()
             || admin_addr.is_some()
         {
             use nevoflux_daemon::http;
@@ -939,6 +941,16 @@ async fn run_daemon(
                 });
             }
 
+            if let Some(addr) = anthropic_addr {
+                let app = http::router::anthropic_routes().with_state(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!("Anthropic Messages listening on {} (POST /v1/messages)", addr);
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("Anthropic server error: {}", e);
+                    }
+                });
+            }
+
             if let Some(addr) = a2a_addr {
                 let app = http::a2a::a2a_routes().with_state(state.clone());
                 tokio::spawn(async move {
@@ -957,6 +969,7 @@ async fn run_daemon(
             // is the design, not an oversight.
             tracing::warn!(
                 "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr/--a2a-addr/\
+                 --anthropic-addr/\
                  --admin-addr: no API served"
             );
         }
@@ -1632,6 +1645,7 @@ async fn main() {
             cli.mcp_addr,
             cli.acp_addr,
             cli.a2a_addr,
+            cli.anthropic_addr,
             cli.admin_addr,
         )
         .await
