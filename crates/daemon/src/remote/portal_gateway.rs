@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::gateway::{Capability, OutboundEvent, RemoteGateway};
+use super::gateway::{OutboundEvent, RemoteGateway};
 use super::inject::Injector;
 use super::session::{Inbound, PortalSession, Wire};
 
@@ -1149,10 +1149,6 @@ impl RemoteGateway for PortalGateway {
         &self.id
     }
 
-    fn capability(&self) -> Capability {
-        Capability::FullParity
-    }
-
     async fn project(&self, ev: &OutboundEvent) {
         if let OutboundEvent::Chat(env) = ev {
             // Scope to this gateway's session: the M2 tap fans *every* chat
@@ -1380,7 +1376,6 @@ mod tests {
         let sink = Arc::new(CollectSink::default());
         let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
         assert_eq!(gw.id(), "portal:chan");
-        assert_eq!(gw.capability(), Capability::FullParity);
         gw.project(&OutboundEvent::Chat(chat_env("hi", false)))
             .await;
         assert_eq!(sink.sent.lock().await.len(), 2); // stream_start + stream_delta

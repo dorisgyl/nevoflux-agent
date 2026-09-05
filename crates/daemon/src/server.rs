@@ -1936,6 +1936,59 @@ pub async fn start_server(
         crate::remote::gateway::GatewayRegistry::new(),
     ));
 
+    // What each session is doing, for whoever is showing a session list. One
+    // map for the daemon, not one per connected phone: a phone's list is a
+    // projection of this, and computing it per gateway would mean N copies of
+    // one fact that started counting at N different moments.
+    let remote_tracker = Arc::new(crate::remote::runtime_state::RuntimeTracker::new());
+    remote_tracker.spawn_sweeper();
+
+    // Bring every paired device's control channel back up.
+    //
+    // This is what makes a pairing survive a restart. Before it existed the
+    // desktop minted a channel per `/remote-control` and kept nothing, so a
+    // reboot left every paired phone attached to a relay channel this daemon
+    // would never dial again — with no error on either end. On a laptop that is
+    // a daily event, and it takes the push path down with it: a subscription
+    // travels up the control channel, and there was no control channel.
+    let control_deps = {
+        let pairings = Arc::new(crate::remote::pairing::PairingStore::new(
+            crate::remote::pairing::PairingStore::default_path(),
+        ));
+        let vapid_public = match crate::remote::web_push::VapidStore::new(
+            crate::remote::web_push::VapidStore::default_path(),
+        )
+        .load_or_generate(crate::remote::web_push::DEFAULT_SUBJECT)
+        {
+            Ok(key) => Some(key.public),
+            Err(e) => {
+                // Never fatal: the list still works, only the waking does not.
+                // Said out loud because "push quietly stopped" is the failure
+                // mode this whole path is most likely to hit unnoticed.
+                error!("no VAPID identity, so no device can be woken: {e}");
+                None
+            }
+        };
+        crate::remote::start::ControlDeps {
+            tracker: remote_tracker.clone(),
+            sessions: Arc::new(crate::remote::control_gateway::StorageSessions::new(
+                services.database.clone(),
+            )),
+            pairings,
+            vapid_public,
+            msg_tx: msg_tx.clone(),
+            injector_proxy_id: "remote-control".to_string(),
+            registry: remote_registry.clone(),
+        }
+    };
+    crate::remote::start::set_control_deps(control_deps.clone());
+    {
+        let deps = control_deps;
+        tokio::spawn(async move {
+            crate::remote::start::restore_pairings(&deps).await;
+        });
+    }
+
     // Wire the response channel into HostServices so
     // `mcp_tool_executor::execute_canvas_video_tool` can emit the
     // canvas_video_open_render_tab broadcast on the MCP/ACP path. The
@@ -2006,6 +2059,7 @@ pub async fn start_server(
     // Response writer task: receives (identity, DaemonEnvelope) and writes to correct proxy
     let writer_map = writers.clone();
     let tap_registry = remote_registry.clone();
+    let tap_tracker = remote_tracker.clone();
     tokio::spawn(async move {
         while let Some((identity, response)) = response_rx.recv().await {
             let proxy_id = String::from_utf8_lossy(&identity).to_string();
@@ -2016,6 +2070,12 @@ pub async fn start_server(
             // gateway filters to its own session. No-op when no portal session
             // is active (empty registry).
             if response.channel == Channel::Chat {
+                // Runtime state first, and outside the registry lock: it is a
+                // map write with no IO in it, and it has to happen whether or
+                // not anybody is connected. The list a phone sees on *arriving*
+                // is built from this, so a daemon that has been running alone
+                // all day still has something true to show.
+                tap_tracker.observe(&response.payload);
                 let reg = tap_registry.lock().await;
                 if !reg.is_empty() {
                     tracing::info!(
@@ -8819,6 +8879,103 @@ async fn handle_chat_message(
                         }),
                     }
                 }
+                // --- Pair a device (design §12.4). Distinct from
+                //     `remote.start`, which binds one channel to one session
+                //     for one sitting. A pairing is durable: two channels and a
+                //     code, stored, and dialled again at every startup. The old
+                //     command is left alone until the attach path that replaces
+                //     it lands, so the shipped flow keeps working meanwhile.
+                "remote.pair" => {
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.pair",
+                                "success": false,
+                                "error": { "code": code, "message": message }
+                            }
+                        })
+                    };
+                    match crate::remote::start::control_deps() {
+                        None => fail("NOT_READY", "the daemon is still starting".into()),
+                        Some(deps) => match crate::remote::start::pair_device(deps).await {
+                            Err(e) => fail("PAIR_FAILED", e.to_string()),
+                            Ok((pairing, code)) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "remote.pair",
+                                    "success": true,
+                                    "data": {
+                                        "control_channel_id": pairing.control_channel_id,
+                                        "data_channel_id": pairing.data_channel_id,
+                                        // Shown once and never again: what is
+                                        // stored is the two keys it derives, so
+                                        // there is nothing left to show twice.
+                                        "pairing_code": code,
+                                    }
+                                }
+                            }),
+                        },
+                    }
+                }
+
+                // --- The paired devices, for the sidebar to list and revoke.
+                //     Codes and keys are deliberately absent: this answers "what
+                //     can reach this machine", which needs no secret.
+                "remote.pairings" => {
+                    let rows = crate::remote::start::control_deps()
+                        .map(|deps| deps.pairings.load().unwrap_or_default())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "control_channel_id": p.control_channel_id,
+                                "label": p.label,
+                                "created_at": p.created_at,
+                                "can_be_woken": p.push.is_some(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "type": "system_response",
+                        "payload": {
+                            "request_id": request_id,
+                            "command": "remote.pairings",
+                            "success": true,
+                            "data": { "pairings": rows }
+                        }
+                    })
+                }
+
+                // --- Revoke one device: stop dialling, forget the keys, and
+                //     drop where it was woken. The subscription goes with it —
+                //     an endpoint left behind is a standing capability to make
+                //     somebody's phone buzz.
+                "remote.unpair" => {
+                    let channel = params
+                        .get("control_channel_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let removed = match crate::remote::start::control_deps() {
+                        Some(deps) => {
+                            crate::remote::start::unpair_device(deps, &channel).await
+                        }
+                        None => false,
+                    };
+                    serde_json::json!({
+                        "type": "system_response",
+                        "payload": {
+                            "request_id": request_id,
+                            "command": "remote.unpair",
+                            "success": true,
+                            "data": { "removed": removed }
+                        }
+                    })
+                }
+
                 // --- Remote-gateway S5: start a portal session. Mints a DO JWT
                 // from the stored account token, generates a channel id + a
                 // human-speakable pairing code (the E2E secret), registers a
@@ -8890,7 +9047,10 @@ async fn handle_chat_message(
                                     .and_then(|c| c.remote_control.cloudflare_turn),
                             };
                             match crate::remote::start::open_channel(req, registry, msg_tx).await {
-                                Ok(_gateway) => serde_json::json!({
+                                // The handle is dropped, not discarded: it was
+                                // filed under `channel_id` by `open_channel`,
+                                // which is how `remote.stop` finds it later.
+                                Ok(_channel) => serde_json::json!({
                                     "type": "system_response",
                                     "payload": {
                                         "request_id": request_id,

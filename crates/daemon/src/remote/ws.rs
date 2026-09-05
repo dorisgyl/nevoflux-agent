@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 use super::inject::Injector;
 use super::portal_gateway::{PortalGateway, WireSink};
@@ -233,11 +234,18 @@ impl ReconnectPolicy {
 /// gateway that cached one could never reconnect afterwards — every retry came
 /// back `401 Unauthorized`, forever.
 ///
-/// The loop **never gives up**. After [`UNREGISTER_AFTER`] failed attempts the
-/// gateway is detached from the registry, so a channel that cannot carry frames
-/// stops eating the ones the M2 tap fans to it — but dialling continues, and
-/// coming back re-registers it. Ending the task instead is what used to retire a
-/// channel permanently over a lunch break's worth of no network.
+/// The loop **never gives up on its own**. After [`UNREGISTER_AFTER`] failed
+/// attempts the gateway is detached from the registry, so a channel that cannot
+/// carry frames stops eating the ones the M2 tap fans to it — but dialling
+/// continues, and coming back re-registers it. Ending the task instead is what
+/// used to retire a channel permanently over a lunch break's worth of no
+/// network.
+///
+/// `cancel` is therefore the *only* way out, and the reason one exists: with no
+/// way to end a channel deliberately, a session that was over kept a socket
+/// dialling and a gateway in the registry for the life of the process. Closing
+/// is a decision made above this loop (see [`super::start::ChannelHandle`]),
+/// never one this loop makes for itself.
 ///
 /// `sink` is the same `WsSink` the `gateway` holds — this loop swaps its write
 /// half on each (re)connect so the gateway/`SendSequencer` state survives.
@@ -252,67 +260,86 @@ pub async fn run_gateway(
     sink: Arc<WsSink>,
     gateway: Arc<PortalGateway>,
     registry: Arc<tokio::sync::Mutex<super::gateway::GatewayRegistry>>,
+    cancel: CancellationToken,
 ) {
     let gateway_id = super::gateway::RemoteGateway::id(gateway.as_ref()).to_string();
-    let mut policy = ReconnectPolicy::new();
 
-    loop {
-        // Re-mint per attempt; a cached JWT expires after 15 minutes.
-        let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(target: "remote", "mint relay JWT failed: {e}");
-                back_off(&mut policy, &registry, &gateway_id).await;
-                continue;
-            }
-        };
-        // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
-        let url = format!("{relay_base}/?c={channel_id}&t={token}");
-
-        match connect_async(url.as_str()).await {
-            Ok((ws, _resp)) => {
-                tracing::info!(target: "remote", "relay connected (channel {channel_id})");
-                if policy.on_connected() {
-                    // Detached during the outage; the M2 tap has to find it again.
-                    registry.lock().await.register(gateway.clone());
-                    tracing::info!(target: "remote", "{gateway_id} is back in the registry");
+    let dial = async {
+        let mut policy = ReconnectPolicy::new();
+        loop {
+            // Re-mint per attempt; a cached JWT expires after 15 minutes.
+            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(target: "remote", "mint relay JWT failed: {e}");
+                    back_off(&mut policy, &registry, &gateway_id).await;
+                    continue;
                 }
-                let (write, read) = ws.split();
-                sink.set(write).await;
-                // Tell the portal what this head is set to, before any chat.
-                // Repeated when the relay says someone arrived, because this
-                // one goes nowhere if the channel is still empty.
-                gateway.announce().await;
-                // No offer here. The relay keeps nothing for a channel with no
-                // one attached, so an offer made now reaches whoever happens to
-                // be watching at this instant and nobody else — and a portal
-                // opened a second later would wait forever for one that had
-                // already been thrown away. The relay tells this end when a
-                // portal is there, on joining and on arrival; that is what
-                // triggers the offer, in `on_wire_in`.
-                let up = Instant::now();
-                serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
-                sink.clear().await;
-                let lasted = up.elapsed();
-                if lasted >= STABLE_CONNECTION {
-                    // It did its job; a drop now is not the last one's fault.
-                    policy.on_stable();
-                    tokio::time::sleep(BASE_BACKOFF).await;
-                } else {
-                    tracing::warn!(
-                        target: "remote",
-                        lasted_ms = lasted.as_millis() as u64,
-                        "the relay took this socket and dropped it; backing off"
-                    );
+            };
+            // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
+            let url = format!("{relay_base}/?c={channel_id}&t={token}");
+
+            match connect_async(url.as_str()).await {
+                Ok((ws, _resp)) => {
+                    tracing::info!(target: "remote", "relay connected (channel {channel_id})");
+                    if policy.on_connected() {
+                        // Detached during the outage; the M2 tap has to find it again.
+                        registry.lock().await.register(gateway.clone());
+                        tracing::info!(target: "remote", "{gateway_id} is back in the registry");
+                    }
+                    let (write, read) = ws.split();
+                    sink.set(write).await;
+                    // Tell the portal what this head is set to, before any chat.
+                    // Repeated when the relay says someone arrived, because this
+                    // one goes nowhere if the channel is still empty.
+                    gateway.announce().await;
+                    // No offer here. The relay keeps nothing for a channel with no
+                    // one attached, so an offer made now reaches whoever happens to
+                    // be watching at this instant and nobody else — and a portal
+                    // opened a second later would wait forever for one that had
+                    // already been thrown away. The relay tells this end when a
+                    // portal is there, on joining and on arrival; that is what
+                    // triggers the offer, in `on_wire_in`.
+                    let up = Instant::now();
+                    serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
+                    sink.clear().await;
+                    let lasted = up.elapsed();
+                    if lasted >= STABLE_CONNECTION {
+                        // It did its job; a drop now is not the last one's fault.
+                        policy.on_stable();
+                        tokio::time::sleep(BASE_BACKOFF).await;
+                    } else {
+                        tracing::warn!(
+                            target: "remote",
+                            lasted_ms = lasted.as_millis() as u64,
+                            "the relay took this socket and dropped it; backing off"
+                        );
+                        back_off(&mut policy, &registry, &gateway_id).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "remote", "relay connect failed: {e}");
                     back_off(&mut policy, &registry, &gateway_id).await;
                 }
             }
-            Err(e) => {
-                tracing::warn!(target: "remote", "relay connect failed: {e}");
-                back_off(&mut policy, &registry, &gateway_id).await;
-            }
         }
+    };
+
+    tokio::select! {
+        // Cancellation wins a tie: a channel that is over must not open one
+        // more socket on its way out.
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::info!(target: "remote", "{gateway_id} closed; its dialling loop is done");
+        }
+        _ = dial => {}
     }
+
+    // However this ended, the gateway has to stop receiving. The M2 tap fans
+    // every chat frame to whatever is registered, and this one can no longer
+    // carry any of them.
+    sink.clear().await;
+    registry.lock().await.unregister(&gateway_id);
 }
 
 /// Pump one connected socket until it stops leading anywhere.
@@ -373,6 +400,142 @@ async fn serve(
     }
 }
 
+/// Keep a control channel dialled, and pump it.
+///
+/// A sibling of [`run_gateway`] rather than a generalisation of it. The dial,
+/// the backoff and the keepalive are shared — [`ReconnectPolicy`] and
+/// [`assess`] are the parts that carry the hard-won behaviour, and both are
+/// used here unchanged. What differs is everything above the socket: there is
+/// no sequencer to keep, no injector to feed, and no session to scope to, so
+/// there is nothing for a shared abstraction to hold.
+///
+/// It also never detaches on failure the way the chat gateway does. Detaching
+/// exists to stop the M2 tap fanning chat frames into a socket that cannot
+/// carry them; this gateway ignores chat entirely, so there is nothing to save
+/// by taking it out of the registry, and taking it out would only mean the
+/// commands it answers stop being answered.
+pub async fn run_control_socket(
+    relay_base: &str,
+    channel_id: &str,
+    account_base: String,
+    account_token: String,
+    sink: Arc<WsSink>,
+    gateway: Arc<super::control_gateway::ControlGateway>,
+    on_command: Arc<dyn ControlCommandSink>,
+    cancel: CancellationToken,
+) {
+    let dial = async {
+        let mut policy = ReconnectPolicy::new();
+        loop {
+            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(target: "remote", "mint control relay JWT failed: {e}");
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                    continue;
+                }
+            };
+            let url = format!("{relay_base}/?c={channel_id}&t={token}");
+
+            match connect_async(url.as_str()).await {
+                Ok((ws, _resp)) => {
+                    tracing::info!(target: "remote", "control relay connected (channel {channel_id})");
+                    policy.on_connected();
+                    let (write, read) = ws.split();
+                    sink.set(write).await;
+                    // Nothing is sent here. The relay keeps nothing for a
+                    // channel with nobody on it, so a list put on the wire now
+                    // would reach whoever happens to be attached this instant
+                    // and no one else. The presence notice is what says there
+                    // is an audience, and `on_wire_in` answers it.
+                    let up = Instant::now();
+                    serve_control(read, &sink, &gateway, on_command.as_ref()).await;
+                    sink.clear().await;
+                    if up.elapsed() >= STABLE_CONNECTION {
+                        policy.on_stable();
+                        tokio::time::sleep(BASE_BACKOFF).await;
+                    } else {
+                        tokio::time::sleep(policy.on_failure().wait).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "remote", "control relay connect failed: {e}");
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::info!(target: "remote", "control channel {channel_id} closed");
+        }
+        _ = dial => {}
+    }
+    sink.clear().await;
+}
+
+/// Where a control channel's commands go.
+///
+/// A trait because the things a command needs — the browser request registry,
+/// the plan oneshots, the pairing store — live in the daemon and have no
+/// business being known to a socket loop.
+#[async_trait]
+pub trait ControlCommandSink: Send + Sync {
+    /// Act on one command from a paired device.
+    async fn handle(&self, command: super::control_gateway::ControlCommand);
+}
+
+/// Pump one connected control socket until it stops leading anywhere.
+async fn serve_control(
+    mut read: WsRead,
+    sink: &WsSink,
+    gateway: &Arc<super::control_gateway::ControlGateway>,
+    on_command: &dyn ControlCommandSink,
+) {
+    let mut last_inbound = Instant::now();
+    let mut ticker = tokio::time::interval(PING_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            item = read.next() => match item {
+                Some(Ok(msg)) => {
+                    // Counted before control frames are filtered out: a pong is
+                    // the strongest evidence the path is alive, and it is the
+                    // one message that never becomes a wire.
+                    last_inbound = Instant::now();
+                    if let Some(wire) = message_to_wire(msg) {
+                        if let Some(cmd) = gateway.on_wire_in(&wire).await {
+                            on_command.handle(cmd).await;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(target: "remote", "control socket error: {e} - reconnecting");
+                    return;
+                }
+                None => {
+                    tracing::warn!(target: "remote", "control relay disconnected - reconnecting");
+                    return;
+                }
+            },
+            _ = ticker.tick() => match assess(last_inbound.elapsed()) {
+                Liveness::Dead => {
+                    tracing::warn!(
+                        target: "remote",
+                        "control relay silent for {SILENT_DEADLINE:?} - reconnecting"
+                    );
+                    return;
+                }
+                Liveness::Ping => sink.ping().await,
+            },
+        }
+    }
+}
+
 /// The relay channel that carries this session's media.
 ///
 /// A sibling of the chat channel rather than the same one. The relay routes by
@@ -392,61 +555,77 @@ pub fn media_channel_of(channel_id: &str) -> String {
 /// back this way. So there is no read loop to run — inbound frames are drained
 /// and dropped, which is what keeps the keepalive's pongs from piling up.
 ///
-/// Never gives up, for the same reason [`run_gateway`] does not: a media socket
-/// that retired itself over a lunch break would leave the session permanently
-/// unable to show a picture, with nothing in the logs to say why.
+/// Never gives up on its own, for the same reason [`run_gateway`] does not: a
+/// media socket that retired itself over a lunch break would leave the session
+/// permanently unable to show a picture, with nothing in the logs to say why.
+/// `cancel` — shared with the chat socket — is the one way out.
 pub async fn run_media_socket(
     relay_base: &str,
     channel_id: &str,
     account_base: String,
     account_token: String,
     sink: Arc<WsSink>,
+    cancel: CancellationToken,
 ) {
     let channel = media_channel_of(channel_id);
-    let mut policy = ReconnectPolicy::new();
 
-    loop {
-        let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(target: "remote", "mint media relay JWT failed: {e}");
-                tokio::time::sleep(policy.on_failure().wait).await;
-                continue;
-            }
-        };
-        let url = format!("{relay_base}/?c={channel}&t={token}");
+    let dial = async {
+        let mut policy = ReconnectPolicy::new();
+        loop {
+            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(target: "remote", "mint media relay JWT failed: {e}");
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                    continue;
+                }
+            };
+            let url = format!("{relay_base}/?c={channel}&t={token}");
 
-        match connect_async(url.as_str()).await {
-            Ok((ws, _resp)) => {
-                tracing::info!(target: "remote", "media relay connected (channel {channel})");
-                policy.on_connected();
-                let (write, read) = ws.split();
-                sink.set(write).await;
-                let up = Instant::now();
-                serve_media(read, &sink).await;
-                // Clearing the write half is what makes `is_connected` false, so
-                // the next range falls back to the chat socket rather than being
-                // written into a socket that leads nowhere.
-                sink.clear().await;
-                let lasted = up.elapsed();
-                if lasted >= STABLE_CONNECTION {
-                    policy.on_stable();
-                    tokio::time::sleep(BASE_BACKOFF).await;
-                } else {
-                    tracing::warn!(
-                        target: "remote",
-                        lasted_ms = lasted.as_millis() as u64,
-                        "the relay took this media socket and dropped it; backing off"
-                    );
+            match connect_async(url.as_str()).await {
+                Ok((ws, _resp)) => {
+                    tracing::info!(target: "remote", "media relay connected (channel {channel})");
+                    policy.on_connected();
+                    let (write, read) = ws.split();
+                    sink.set(write).await;
+                    let up = Instant::now();
+                    serve_media(read, &sink).await;
+                    // Clearing the write half is what makes `is_connected` false, so
+                    // the next range falls back to the chat socket rather than being
+                    // written into a socket that leads nowhere.
+                    sink.clear().await;
+                    let lasted = up.elapsed();
+                    if lasted >= STABLE_CONNECTION {
+                        policy.on_stable();
+                        tokio::time::sleep(BASE_BACKOFF).await;
+                    } else {
+                        tracing::warn!(
+                            target: "remote",
+                            lasted_ms = lasted.as_millis() as u64,
+                            "the relay took this media socket and dropped it; backing off"
+                        );
+                        tokio::time::sleep(policy.on_failure().wait).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "remote", "media relay connect failed: {e}");
                     tokio::time::sleep(policy.on_failure().wait).await;
                 }
             }
-            Err(e) => {
-                tracing::warn!(target: "remote", "media relay connect failed: {e}");
-                tokio::time::sleep(policy.on_failure().wait).await;
-            }
         }
+    };
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::info!(target: "remote", "media channel {channel} closed");
+        }
+        _ = dial => {}
     }
+
+    // So a range written after the close falls back to the chat socket rather
+    // than into a write half nobody is reading.
+    sink.clear().await;
 }
 
 /// Pump one connected media socket until it stops leading anywhere.
@@ -705,5 +884,173 @@ mod tests {
         // control frames are not relayed
         assert_eq!(message_to_wire(Message::Ping(vec![])), None);
         assert_eq!(message_to_wire(Message::Close(None)), None);
+    }
+
+    // --- ⑤ channel shutdown ------------------------------------------------
+
+    /// A gateway whose channel never had to reach the network.
+    fn closable(session: &str, channel: &str) -> (Arc<WsSink>, Arc<PortalGateway>) {
+        let sink = Arc::new(WsSink::new());
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            sink.clone(),
+            session,
+            None,
+            None,
+            channel,
+        ));
+        (sink, gw)
+    }
+
+    #[tokio::test]
+    async fn cancelling_ends_the_dialling_loop() {
+        // The loop is deliberately unkillable by failure — that is what stopped
+        // a lunch break's worth of no network from retiring a channel for good.
+        // The cost of that decision is that nothing else could end it either:
+        // a channel that is over kept dialling for the life of the process.
+        let (sink, gw) = closable("sess-cancel-loop", "chan-cancel-loop");
+        let registry = Arc::new(Mutex::new(super::super::gateway::GatewayRegistry::new()));
+        registry.lock().await.register(gw.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let injector: Arc<dyn Injector> =
+            Arc::new(super::super::inject::ChannelInjector::new(tx, "p"));
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn(run_gateway(
+            "ws://127.0.0.1:1",          // nothing listens
+            "chan-cancel-loop",
+            "http://127.0.0.1:1".into(), // and the mint refuses at once
+            "token".into(),
+            "sess-cancel-loop".into(),
+            injector,
+            sink,
+            gw,
+            registry.clone(),
+            cancel.clone(),
+        ));
+
+        // Long enough to have failed an attempt and settled into the backoff.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelling must end the loop, not merely ask it to")
+            .expect("the task must finish without panicking");
+
+        // And it must leave: the M2 tap fans every chat frame to whatever is
+        // registered, and this gateway can no longer carry one.
+        assert!(
+            registry.lock().await.is_empty(),
+            "a closed channel must stop eating fan_out"
+        );
+        super::super::push::forget("sess-cancel-loop");
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_first_dial_still_ends_it() {
+        // Cancel is biased in the select, so a channel closed in the same tick
+        // it was opened must not get one more socket on its way out.
+        let (sink, gw) = closable("sess-cancel-early", "chan-cancel-early");
+        let registry = Arc::new(Mutex::new(super::super::gateway::GatewayRegistry::new()));
+        registry.lock().await.register(gw.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let injector: Arc<dyn Injector> =
+            Arc::new(super::super::inject::ChannelInjector::new(tx, "p"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_gateway(
+                "ws://127.0.0.1:1",
+                "chan-cancel-early",
+                "http://127.0.0.1:1".into(),
+                "token".into(),
+                "sess-cancel-early".into(),
+                injector,
+                sink,
+                gw,
+                registry.clone(),
+                cancel,
+            ),
+        )
+        .await
+        .expect("an already-cancelled channel must return immediately");
+
+        assert!(registry.lock().await.is_empty());
+        super::super::push::forget("sess-cancel-early");
+    }
+
+    #[tokio::test]
+    async fn cancelling_ends_the_control_loop_too() {
+        // The control channel is the one a paired device depends on for
+        // everything, so it dials as stubbornly as the others — and needs the
+        // same single way out.
+        struct Ignore;
+        #[async_trait]
+        impl ControlCommandSink for Ignore {
+            async fn handle(&self, _: super::super::control_gateway::ControlCommand) {}
+        }
+        struct NoSessions;
+        #[async_trait]
+        impl super::super::control_gateway::SessionSource for NoSessions {
+            async fn page(&self, _: u32) -> Vec<super::super::session_list::StoredSession> {
+                Vec::new()
+            }
+            async fn by_ids(
+                &self,
+                _: &[String],
+            ) -> Vec<super::super::session_list::StoredSession> {
+                Vec::new()
+            }
+        }
+
+        let sink = Arc::new(WsSink::new());
+        let gateway = Arc::new(super::super::control_gateway::ControlGateway::new(
+            None,
+            sink.clone(),
+            Arc::new(super::super::runtime_state::RuntimeTracker::new()),
+            Arc::new(NoSessions),
+            "chan-cancel-control",
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_control_socket(
+            "ws://127.0.0.1:1",
+            "chan-cancel-control",
+            "http://127.0.0.1:1".into(),
+            "token".into(),
+            sink,
+            gateway,
+            Arc::new(Ignore),
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelling must end the control loop")
+            .expect("the task must finish without panicking");
+    }
+
+    #[tokio::test]
+    async fn cancelling_ends_the_media_loop_too() {
+        // The media socket dials on its own and had the same problem.
+        let sink = Arc::new(WsSink::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_media_socket(
+            "ws://127.0.0.1:1",
+            "chan-cancel-media",
+            "http://127.0.0.1:1".into(),
+            "token".into(),
+            sink,
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelling must end the media loop")
+            .expect("the task must finish without panicking");
     }
 }

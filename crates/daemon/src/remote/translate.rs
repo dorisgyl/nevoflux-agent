@@ -209,11 +209,10 @@ impl Translator {
         };
         let params = p.get("params");
         // `description` is the action on its own; `question` wraps it in prose
-        // the portal's own dialog already says. Prefer the bare one.
-        let prompt = params
-            .and_then(|q| q.get("description").or_else(|| q.get("question")))
-            .and_then(Value::as_str)
-            .unwrap_or("Allow this action?");
+        // the portal's own dialog already says. Prefer the bare one. Shared
+        // with `classify_state` so the list and the dialog ask the same thing.
+        let prompt = gate_prompt(params);
+        let prompt = prompt.as_str();
         let options: Vec<&str> = params
             .and_then(|q| q.get("options"))
             .and_then(Value::as_array)
@@ -656,6 +655,286 @@ fn portal_attachments(frame: &Value) -> Vec<nevoflux_protocol::Attachment> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn gate(session: &str, id: &str, desc: &str) -> Value {
+        json!({"type": "browser_tool_request", "payload": {
+            "request_id": id, "session_id": session, "action": "ask_user",
+            "params": {"description": desc}, "timeout_ms": 1000
+        }})
+    }
+
+    #[test]
+    fn a_gate_blocks_the_session_it_names() {
+        let (sess, sig) = classify_state(&gate("s1", "r7", "Send the email?")).unwrap();
+        assert_eq!(sess, "s1");
+        assert_eq!(
+            sig,
+            StateSignal::Block {
+                kind: BlockKind::Gate,
+                // The answer key. `BrowserRequestRegistry` is keyed by this, so
+                // it is what a remote end has to send back — and it means the
+                // remote end never has to name a session to answer.
+                request_id: Some("r7".into()),
+                prompt: "Send the email?".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_list_asks_exactly_what_the_dialog_asks() {
+        // Two renderings of one question. If they drift, the phone approves
+        // something worded differently from what the desktop is showing.
+        let payload = gate("s1", "r7", "Send the email?");
+        let frames = Translator::new().downlink(&payload);
+        let dialog = frames[0]["gate"]["prompt"].as_str().unwrap();
+        let (_, sig) = classify_state(&payload).unwrap();
+        match sig {
+            StateSignal::Block { prompt, .. } => assert_eq!(prompt, dialog),
+            other => panic!("expected a block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browser_actions_that_are_not_questions_say_nothing() {
+        // Relaxing this filter is what would push every click the agent makes
+        // onto someone's phone.
+        let mut p = gate("s1", "r7", "x");
+        p["payload"]["action"] = json!("click");
+        assert!(classify_state(&p).is_none());
+    }
+
+    #[test]
+    fn a_plan_blocks_without_an_answer_key() {
+        // `PlanProposal` carries no id of its own and is settled by session, so
+        // there is nothing here for the remote end to answer with. Whoever
+        // tracks state mints that token — handing out the session id instead is
+        // exactly what the uplink path refuses to accept.
+        let (sess, sig) = classify_state(&json!({"type": "plan_proposal", "payload": {
+            "session_id": "s2", "summary": "Refactor the parser", "steps": []
+        }}))
+        .unwrap();
+        assert_eq!(sess, "s2");
+        assert_eq!(
+            sig,
+            StateSignal::Block {
+                kind: BlockKind::Plan,
+                request_id: None,
+                prompt: "Refactor the parser".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn either_resolution_unblocks_whoever_was_waiting() {
+        // Both are daemon-wide broadcasts: answered at the desktop, the phone's
+        // card has to go too.
+        for ty in ["browser_tool_resolved", "plan_resolved"] {
+            let (sess, sig) =
+                classify_state(&json!({"type": ty, "payload": {"session_id": "s3"}})).unwrap();
+            assert_eq!(sess, "s3");
+            assert_eq!(sig, StateSignal::Unblock, "{ty}");
+        }
+    }
+
+    #[test]
+    fn a_stream_runs_until_it_is_done() {
+        let open = json!({"type": "stream_chunk", "payload": {"session_id": "s4", "content": "hi", "done": false}});
+        assert_eq!(classify_state(&open).unwrap().1, StateSignal::Running);
+        let shut = json!({"type": "stream_chunk", "payload": {"session_id": "s4", "content": "", "done": true}});
+        assert_eq!(classify_state(&shut).unwrap().1, StateSignal::Stopped);
+    }
+
+    #[test]
+    fn stop_closes_a_turn_that_never_sent_a_final_chunk() {
+        // `stop_generation` cancels the forwarder, so the `done:true` that
+        // normally ends a turn never arrives. Without this arm the session
+        // would sit at Running until the TTL swept it.
+        let idle = json!({"type": "agent_state", "payload": {"session_id": "s5", "state": "idle"}});
+        assert_eq!(classify_state(&idle).unwrap().1, StateSignal::Stopped);
+        let busy = json!({"type": "agent_state", "payload": {"session_id": "s5", "state": "busy"}});
+        assert!(classify_state(&busy).is_none());
+    }
+
+    #[test]
+    fn a_payload_with_no_session_is_not_guessed_at() {
+        // The whole point of the domain shrink: an `error` frame carries no
+        // session on any of its 32 emission sites, and attributing one to the
+        // most recent session would be a lie the list shows as fact.
+        assert!(classify_state(&json!({"type": "error", "payload": {"message": "boom"}})).is_none());
+        assert!(classify_state(&json!({"type": "stream_chunk", "payload": {"content": "x"}})).is_none());
+    }
+
+    #[test]
+    fn unrelated_types_say_nothing() {
+        for ty in ["system_response", "events_delivery", "artifact_start"] {
+            assert!(
+                classify_state(&json!({"type": ty, "payload": {"session_id": "s6"}})).is_none(),
+                "{ty}"
+            );
+        }
+    }
+
+    /// The correspondence this whole split rests on.
+    ///
+    /// `downlink` and `classify_state` are two matches over one payload type
+    /// set. Either can grow an arm the other lacks, and nothing else would
+    /// notice: the list would just quietly stop tracking a state, or track one
+    /// the reader never sees. This asserts the relationship, not the behaviour
+    /// of either side — that is what makes it worth having.
+    #[test]
+    fn state_bearing_types_are_attributable() {
+        let cases = [
+            gate("s1", "r1", "q"),
+            json!({"type": "plan_proposal", "payload": {"session_id": "s1", "summary": "s", "steps": []}}),
+            json!({"type": "browser_tool_resolved", "payload": {"session_id": "s1", "request_id": "r1"}}),
+            json!({"type": "plan_resolved", "payload": {"session_id": "s1"}}),
+            json!({"type": "stream_chunk", "payload": {"session_id": "s1", "content": "x", "done": false}}),
+            json!({"type": "agent_state", "payload": {"session_id": "s1", "state": "idle", "done": true}}),
+            json!({"type": "session_cleared", "payload": {"session_id": "s1"}}),
+        ];
+        for payload in cases {
+            let ty = payload["type"].as_str().unwrap().to_string();
+            assert!(
+                classify_state(&payload).is_some(),
+                "{ty} bears state but classify_state ignores it"
+            );
+            assert!(
+                !Translator::new().downlink(&payload).is_empty(),
+                "{ty} bears state but downlink renders nothing for it"
+            );
+            assert!(
+                payload["payload"].get("session_id").is_some(),
+                "{ty} bears state and so must carry a session_id (invariant 5)"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Runtime-state classification (design §5)
+// ============================================================================
+
+/// Which kind of question a session is stopped on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// A browser `ask_user` permission dialog.
+    Gate,
+    /// A plan waiting to be confirmed before it runs.
+    Plan,
+}
+
+/// What one daemon chat payload says about a session's runtime state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateSignal {
+    /// The session is stopped, waiting on a person.
+    Block {
+        /// Gate or plan.
+        kind: BlockKind,
+        /// The key an answer has to carry, where the wire has one.
+        ///
+        /// A gate is settled by `request_id` — that is what
+        /// `BrowserRequestRegistry` is keyed by, and it travels on the frame. A
+        /// plan is settled by session, and carries no id of its own, so there
+        /// is nothing to put here; whoever tracks state mints the token the
+        /// remote end answers with rather than handing out a session id.
+        request_id: Option<String>,
+        /// The words the local dialog is showing.
+        prompt: String,
+    },
+    /// Whatever was blocking this session has been settled — by anyone,
+    /// anywhere. See the `plan_resolved` / `browser_tool_resolved` broadcasts.
+    Unblock,
+    /// A turn is open.
+    Running,
+    /// The turn closed.
+    Stopped,
+}
+
+/// What `payload` says about which session, if anything.
+///
+/// **Deliberately stateless, and deliberately not a method on [`Translator`].**
+/// The two are parallel projections of the same payload, not a parent and a child:
+/// `downlink` renders frames for a reader, this renders state for a list. A
+/// list is kept once for the whole daemon while a `Translator` exists per
+/// session, so routing this through one would mean running a synthesizer —
+/// `current_stream`, `next_stream`, the markdown `holdback` — for every session
+/// merely to read a `kind` back out and throw the frames away.
+///
+/// Every signal below is decidable from the payload alone, and every one of
+/// them carries a `session_id`; that is the invariant this function depends on
+/// and `state_bearing_types_are_attributable` locks down.
+pub fn classify_state(payload: &Value) -> Option<(String, StateSignal)> {
+    let ty = payload.get("type").and_then(Value::as_str)?;
+    let p = payload.get("payload");
+    let session = p
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str)?
+        .to_string();
+
+    let signal = match ty {
+        // Only `ask_user`. Every other browser action is the agent driving the
+        // local browser and carries no question — the same filter `ask_user`
+        // applies downlink, for the same reason.
+        "browser_tool_request" => {
+            if p.and_then(|p| p.get("action")).and_then(Value::as_str) != Some("ask_user") {
+                return None;
+            }
+            StateSignal::Block {
+                kind: BlockKind::Gate,
+                request_id: p
+                    .and_then(|p| p.get("request_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                prompt: gate_prompt(p.and_then(|p| p.get("params"))),
+            }
+        }
+        "plan_proposal" => StateSignal::Block {
+            kind: BlockKind::Plan,
+            request_id: None,
+            prompt: p
+                .and_then(|p| p.get("summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("Review this plan?")
+                .to_string(),
+        },
+        "browser_tool_resolved" | "plan_resolved" => StateSignal::Unblock,
+        "stream_chunk" => {
+            if p.and_then(|p| p.get("done")).and_then(Value::as_bool) == Some(true) {
+                StateSignal::Stopped
+            } else {
+                StateSignal::Running
+            }
+        }
+        // The stop button, and the end of a turn that produced no final chunk.
+        "agent_state" => {
+            if p.and_then(|p| p.get("state")).and_then(Value::as_str) != Some("idle") {
+                return None;
+            }
+            StateSignal::Stopped
+        }
+        // A cleared session is not running and is not blocked on anything that
+        // still exists.
+        "session_cleared" => StateSignal::Stopped,
+        _ => return None,
+    };
+    Some((session, signal))
+}
+
+/// The words a gate is asking, matching what the local dialog shows.
+///
+/// Shared with [`Translator::ask_user`] on purpose: a list that paraphrased the
+/// question differently from the dialog would be answering a third thing.
+fn gate_prompt(params: Option<&Value>) -> String {
+    params
+        .and_then(|q| q.get("description").or_else(|| q.get("question")))
+        .and_then(Value::as_str)
+        .unwrap_or("Allow this action?")
+        .to_string()
 }
 
 /// Translate a portal `OutboundFrame` (JSON) into a daemon `SidebarMessage` for
