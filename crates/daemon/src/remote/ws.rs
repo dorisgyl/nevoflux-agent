@@ -255,7 +255,6 @@ pub async fn run_gateway(
     channel_id: &str,
     account_base: String,
     account_token: String,
-    session_id: String,
     injector: Arc<dyn Injector>,
     sink: Arc<WsSink>,
     gateway: Arc<PortalGateway>,
@@ -301,7 +300,7 @@ pub async fn run_gateway(
                     // portal is there, on joining and on arrival; that is what
                     // triggers the offer, in `on_wire_in`.
                     let up = Instant::now();
-                    serve(read, &sink, &gateway, &session_id, injector.as_ref()).await;
+                    serve(read, &sink, &gateway, injector.as_ref()).await;
                     sink.clear().await;
                     let lasted = up.elapsed();
                     if lasted >= STABLE_CONNECTION {
@@ -355,7 +354,6 @@ async fn serve(
     mut read: WsRead,
     sink: &WsSink,
     gateway: &Arc<PortalGateway>,
-    session_id: &str,
     injector: &dyn Injector,
 ) {
     let mut last_inbound = Instant::now();
@@ -374,7 +372,7 @@ async fn serve(
                     // filtered out.
                     last_inbound = Instant::now();
                     if let Some(wire) = message_to_wire(msg) {
-                        gateway.on_wire_in(wire, session_id, injector).await;
+                        gateway.on_wire_in(wire, injector).await;
                     }
                 }
                 Some(Err(e)) => {
@@ -921,7 +919,6 @@ mod tests {
             "chan-cancel-loop",
             "http://127.0.0.1:1".into(), // and the mint refuses at once
             "token".into(),
-            "sess-cancel-loop".into(),
             injector,
             sink,
             gw,
@@ -967,7 +964,6 @@ mod tests {
                 "chan-cancel-early",
                 "http://127.0.0.1:1".into(),
                 "token".into(),
-                "sess-cancel-early".into(),
                 injector,
                 sink,
                 gw,

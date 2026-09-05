@@ -61,7 +61,7 @@ pub enum OpenError {
 /// all four outlive the call that opened them. [`super::ws::run_gateway`]
 /// deliberately never stops on its own, so before this existed there was no way
 /// to end a channel at all: the sockets kept dialling and
-/// `push::portal_attached` kept saying somebody was listening, for the life of
+/// `push::portal_showing` kept saying somebody was listening, for the life of
 /// the process. `cleanup_uploads` had no callers for the same reason — there
 /// was no point at which anything could say the session was over.
 #[derive(Clone)]
@@ -240,7 +240,7 @@ pub async fn open_channel_with_token(
         .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
     // The JWT is re-minted per connect attempt inside the loop, so hand it the
     // account credentials rather than a token that expires in 15 minutes.
-    let (ch, sid) = (req.channel_id.clone(), req.session_id.clone());
+    let ch = req.channel_id.clone();
     let (acct_base, acct_token) = (base, account_token);
     let reg = registry.clone();
     let gw = gateway.clone();
@@ -268,7 +268,7 @@ pub async fn open_channel_with_token(
         let cancel = cancel.clone();
         tokio::spawn(async move {
             super::ws::run_gateway(
-                &relay, &ch, acct_base, acct_token, sid, injector, sink, gw, reg, cancel,
+                &relay, &ch, acct_base, acct_token, injector, sink, gw, reg, cancel,
             )
             .await;
         });
@@ -354,6 +354,7 @@ pub async fn open_control_channel_with_token(
     if let Some(public) = req.vapid_public {
         gateway = gateway.with_vapid_public(public);
     }
+    gateway = gateway.with_data_channel_id(req.pairing.data_channel_id.clone());
     let gateway = Arc::new(gateway);
     registry.lock().await.register(gateway.clone());
     let cancel = CancellationToken::new();
@@ -405,6 +406,9 @@ pub struct ControlDeps {
     pub sessions: Arc<dyn super::control_gateway::SessionSource>,
     /// The paired devices on disk.
     pub pairings: Arc<super::pairing::PairingStore>,
+    /// For re-resolving what a session is allowed to do when a device switches
+    /// to it. Asked per attach, never inherited — see `SessionAuthority`.
+    pub database: Arc<nevoflux_storage::Database>,
     /// The key devices subscribe to push with, when there is one.
     pub vapid_public: Option<String>,
     /// The daemon's message pipeline, for injecting answers.
@@ -442,11 +446,27 @@ pub async fn open_for_pairing(
         deps.msg_tx.clone(),
         deps.injector_proxy_id.clone(),
     ));
-    let commands = Arc::new(super::control_commands::ControlCommands::new(
-        injector,
-        deps.pairings.clone(),
-        pairing.control_channel_id.clone(),
-    ));
+    // The data channel comes up unbound and stays dialled. It carries nothing
+    // until a device asks for a conversation, and carrying nothing costs
+    // nothing: `project` drops every frame while there is no binding, so a
+    // background loop can run all day without a byte of it being sealed and
+    // written. What it buys is that choosing a conversation is a rebind rather
+    // than a dial — no handshake, no key derivation, no renegotiated peer
+    // connection.
+    let data = open_data_channel(deps, pairing).await?;
+    let commands = Arc::new(
+        super::control_commands::ControlCommands::new(
+            injector,
+            deps.pairings.clone(),
+            pairing.control_channel_id.clone(),
+        )
+        .with_data_channel(
+            data,
+            Arc::new(super::control_commands::StorageAuthority::new(
+                deps.database.clone(),
+            )),
+        ),
+    );
     open_control_channel(
         ControlRequest {
             pairing: pairing.clone(),
@@ -458,6 +478,64 @@ pub async fn open_for_pairing(
         &deps.registry,
     )
     .await
+}
+
+/// Bring up the always-on, initially unbound data channel for one pairing.
+async fn open_data_channel(
+    deps: &ControlDeps,
+    pairing: &super::pairing::Pairing,
+) -> Result<Arc<PortalGateway>, OpenError> {
+    let account_token = stored_account_token().ok_or(OpenError::NotLoggedIn)?;
+    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+    let channel_id = pairing.data_channel_id.clone();
+
+    let sink = Arc::new(super::ws::WsSink::new());
+    let media_sink = Arc::new(super::ws::WsSink::new());
+    let gateway = Arc::new(
+        PortalGateway::unbound(pairing.data_key(), sink.clone(), &channel_id)
+            .with_media_sink(media_sink.clone()),
+    );
+    deps.registry.lock().await.register(gateway.clone());
+
+    let relay = std::env::var("NEVOFLUX_RELAY_URL")
+        .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
+    let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
+        deps.msg_tx.clone(),
+        deps.injector_proxy_id.clone(),
+    ));
+    // Shares the pairing's fate: closing the pairing closes both its channels.
+    let cancel = CancellationToken::new();
+    {
+        let (relay, ch, base, token, cancel) = (
+            relay.clone(),
+            channel_id.clone(),
+            base.clone(),
+            account_token.clone(),
+            cancel.clone(),
+        );
+        tokio::spawn(async move {
+            super::ws::run_media_socket(&relay, &ch, base, token, media_sink, cancel).await;
+        });
+    }
+    {
+        let (gw, reg) = (gateway.clone(), deps.registry.clone());
+        tokio::spawn(async move {
+            super::ws::run_gateway(
+                &relay,
+                &channel_id,
+                base,
+                account_token,
+                injector,
+                sink,
+                gw,
+                reg,
+                cancel,
+            )
+            .await;
+        });
+    }
+    Ok(gateway)
 }
 
 /// Dial every paired device's control channel. Reports how many came up.
@@ -608,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn closing_releases_what_the_session_held() {
         // `cleanup_uploads` had no callers at all, so `push::forget` never ran
-        // and `portal_attached` stayed true for the life of the process — long
+        // and `portal_showing` stayed true for the life of the process — long
         // after the socket was gone. Synthesis asks that predicate whether its
         // audio has anywhere to go, so it went fire-and-forget to nobody and
         // the tool reported success.
@@ -622,7 +700,7 @@ mod tests {
             "chan-close",
         ));
         registry.lock().await.register(gateway.clone());
-        assert!(super::super::push::portal_attached("sess-close"));
+        assert!(super::super::push::portal_showing("sess-close"));
 
         let handle = ChannelHandle {
             gateway_id: "portal:chan-close".into(),
@@ -633,7 +711,7 @@ mod tests {
         handle.close().await;
 
         assert!(
-            !super::super::push::portal_attached("sess-close"),
+            !super::super::push::portal_showing("sess-close"),
             "a closed channel has no listener"
         );
         assert!(registry.lock().await.is_empty());

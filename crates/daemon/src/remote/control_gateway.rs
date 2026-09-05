@@ -64,6 +64,8 @@ pub struct ControlGateway {
     sessions: Arc<dyn SessionSource>,
     /// This daemon's `applicationServerKey`, for the device to subscribe with.
     vapid_public: Option<String>,
+    /// The channel conversations arrive on for this pairing.
+    data_channel_id: Option<String>,
 }
 
 impl ControlGateway {
@@ -82,12 +84,22 @@ impl ControlGateway {
             tracker,
             sessions,
             vapid_public: None,
+            data_channel_id: None,
         }
     }
 
     /// Advertise the key a device must subscribe with.
     pub fn with_vapid_public(mut self, public: impl Into<String>) -> Self {
         self.vapid_public = Some(public.into());
+        self
+    }
+
+    /// Advertise where conversations arrive.
+    ///
+    /// The device cannot work this out: its scope carries the control channel
+    /// and the person typed a code, and that is everything it was given.
+    pub fn with_data_channel_id(mut self, channel_id: impl Into<String>) -> Self {
+        self.data_channel_id = Some(channel_id.into());
         self
     }
 
@@ -116,7 +128,11 @@ impl ControlGateway {
 
     /// Put the current list on the wire.
     pub async fn sync(&self) {
-        let frame = sessions_frame(&self.rows().await, self.vapid_public.as_deref());
+        let frame = sessions_frame(
+            &self.rows().await,
+            self.vapid_public.as_deref(),
+            self.data_channel_id.as_deref(),
+        );
         self.send(frame).await;
     }
 
@@ -256,6 +272,27 @@ impl ControlGateway {
                     auth: field("auth")?,
                 }))
             }
+            // Show a conversation, or stop showing one.
+            //
+            // This is the one command where the device does name a session, and
+            // it has to: choosing what to look at is the whole point. What it
+            // may name is bounded instead — the id has to be one this daemon
+            // would have put on a list, checked against the same query that
+            // builds one, so "what this pairing can see" has exactly one
+            // definition rather than two that can drift apart.
+            "attach" => {
+                let session = frame.get("sessionId").and_then(|v| v.as_str())?.to_string();
+                if !self.rows().await.iter().any(|r| r.session_id == session) {
+                    tracing::warn!(
+                        target: "remote",
+                        %session,
+                        "a device asked for a session that is not on its list"
+                    );
+                    return None;
+                }
+                Some(ControlCommand::Attach { session })
+            }
+            "detach" => Some(ControlCommand::Detach),
             // The device says it has no usable subscription any more — cleared
             // permissions, or a key that no longer matches. Better than leaving
             // an endpoint that will only ever answer 410.
@@ -271,6 +308,13 @@ impl ControlGateway {
 /// socket, and nothing about browser request registries or plan oneshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
+    /// Show this conversation on the data channel.
+    Attach {
+        /// Checked against the list before it gets this far.
+        session: String,
+    },
+    /// Stop showing a conversation.
+    Detach,
     /// Remember where to wake this device.
     Subscribe(super::web_push::Subscription),
     /// Forget where to wake this device.
@@ -296,13 +340,20 @@ pub enum ControlCommand {
 /// subscription bound to the old one — the service keeps accepting pushes and
 /// the phone simply never hears them — so the sooner a mismatch is visible, the
 /// smaller the window in which somebody is relying on a channel that is dead.
-fn sessions_frame(rows: &[SessionRow], vapid_public: Option<&str>) -> serde_json::Value {
+fn sessions_frame(
+    rows: &[SessionRow],
+    vapid_public: Option<&str>,
+    data_channel_id: Option<&str>,
+) -> serde_json::Value {
     let mut frame = serde_json::json!({
         "kind": "sessions",
         "rows": rows.iter().map(row_json).collect::<Vec<_>>(),
     });
     if let Some(key) = vapid_public {
         frame["pushKey"] = serde_json::json!(key);
+    }
+    if let Some(channel) = data_channel_id {
+        frame["dataChannelId"] = serde_json::json!(channel);
     }
     frame
 }
@@ -637,6 +688,66 @@ mod tests {
         let (gw, sink, _) = build(vec![stored("s1", 1)]);
         gw.sync().await;
         assert!(sink.frames()[0].get("pushKey").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_list_says_where_conversations_arrive() {
+        // The device cannot work this out: its scope carries the control
+        // channel and the person typed a code, and that is all it was given.
+        let (_, sink, tracker) = build(vec![stored("s1", 1)]);
+        let gw = Arc::new(
+            ControlGateway::new(
+                None,
+                sink.clone(),
+                tracker,
+                Arc::new(Fixed(vec![stored("s1", 1)])),
+                "chan-1",
+            )
+            .with_data_channel_id("chan-data"),
+        );
+        gw.sync().await;
+        assert_eq!(sink.frames()[0]["dataChannelId"], "chan-data");
+    }
+
+    #[tokio::test]
+    async fn attaching_is_refused_for_a_session_that_is_not_on_the_list() {
+        // The one command a device may address by naming a session, so it is
+        // the one that has to be bounded — against the same query that built
+        // the list, so there is one definition of what a pairing can see.
+        let (gw, _, _) = build(vec![stored("s1", 1)]);
+        let ask = |session: &str| {
+            Wire::Text(
+                serde_json::to_string(&WireMessage::Frame {
+                    seq: None,
+                    frame: json!({"kind": "attach", "sessionId": session}),
+                })
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            gw.on_wire_in(&ask("s1")).await,
+            Some(ControlCommand::Attach {
+                session: "s1".into()
+            })
+        );
+        assert_eq!(
+            gw.on_wire_in(&ask("not-on-the-list")).await,
+            None,
+            "a session this device was never shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_can_say_it_is_done_looking() {
+        let (gw, _, _) = build(vec![stored("s1", 1)]);
+        let wire = Wire::Text(
+            serde_json::to_string(&WireMessage::Frame {
+                seq: None,
+                frame: json!({"kind": "detach"}),
+            })
+            .unwrap(),
+        );
+        assert_eq!(gw.on_wire_in(&wire).await, Some(ControlCommand::Detach));
     }
 
     #[tokio::test]

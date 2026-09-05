@@ -296,6 +296,17 @@ impl PortalSession {
         self.translator.open_stream_id()
     }
 
+    /// Tell the far end to discard what it has and reload from scratch.
+    ///
+    /// The same frame `resume` falls back to when the gap is wider than the
+    /// buffer, used here for the other case that makes incremental catch-up
+    /// meaningless: this channel is now showing a different conversation, so
+    /// there is nothing on the far end worth keeping and its sequencer has to
+    /// go back to zero along with ours.
+    pub fn resync_frame(&self) -> Wire {
+        self.encode(&WireMessage::Resync)
+    }
+
     pub fn downlink_frame(&mut self, frame: Value) -> Wire {
         let wire = self.sequencer.tag(frame);
         self.encode(&wire)

@@ -35,11 +35,63 @@ fn is_approval(choice: &str) -> bool {
     APPROVALS.iter().any(|a| a.eq_ignore_ascii_case(choice))
 }
 
+/// What the daemon says a session is allowed to do.
+///
+/// A trait so a rebind can be tested without a database, and so the answer has
+/// exactly one source. It is deliberately asked *per attach* rather than
+/// inherited from whatever the channel was showing before: `mode` rides on
+/// every remote turn and is a grant, and the local invariant is that a channel
+/// grants exactly what the target session already had. Carrying the previous
+/// binding's mode across would let a phone raise a session's privileges simply
+/// by switching to it — silently, because every layer would be doing its own
+/// job correctly.
+#[async_trait]
+pub trait SessionAuthority: Send + Sync {
+    /// `(mode, execution_tier)` for `session_id`.
+    async fn authorization(&self, session_id: &str) -> (Option<String>, Option<String>);
+}
+
+/// The live authority, over the daemon's database.
+pub struct StorageAuthority {
+    db: Arc<nevoflux_storage::Database>,
+}
+
+impl StorageAuthority {
+    /// Read authority out of `db`.
+    pub fn new(db: Arc<nevoflux_storage::Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl SessionAuthority for StorageAuthority {
+    async fn authorization(&self, session_id: &str) -> (Option<String>, Option<String>) {
+        use nevoflux_storage::SessionRepository;
+        // `sessions.mode` is the session's own, persisted. Its domain is
+        // narrower than the channel's (`chat | agent` against
+        // `chat | browser | agent`), so a session that was being driven in
+        // browser mode resolves to whatever it was created as. Narrower is the
+        // safe direction, and it is recorded rather than papered over.
+        let mode = SessionRepository::new(&self.db)
+            .get(session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.mode.as_str().to_string());
+        let tier = crate::agent_host::resolve_execution_tier_for(&self.db, session_id)
+            .as_setting()
+            .to_string();
+        (mode, Some(tier))
+    }
+}
+
 /// Acts on control-channel commands for one pairing.
 pub struct ControlCommands {
     injector: Arc<dyn Injector>,
     pairings: Arc<super::pairing::PairingStore>,
     control_channel_id: String,
+    /// The data channel this pairing shows conversations on, once one exists.
+    data: Option<Arc<super::portal_gateway::PortalGateway>>,
+    authority: Option<Arc<dyn SessionAuthority>>,
 }
 
 impl ControlCommands {
@@ -53,7 +105,20 @@ impl ControlCommands {
             injector,
             pairings,
             control_channel_id: control_channel_id.into(),
+            data: None,
+            authority: None,
         }
+    }
+
+    /// Give this pairing a data channel to show conversations on.
+    pub fn with_data_channel(
+        mut self,
+        data: Arc<super::portal_gateway::PortalGateway>,
+        authority: Arc<dyn SessionAuthority>,
+    ) -> Self {
+        self.data = Some(data);
+        self.authority = Some(authority);
+        self
     }
 
     /// The uplink payload for one answer, or `None` if it does not translate.
@@ -112,6 +177,22 @@ impl super::ws::ControlCommandSink for ControlCommands {
                         "a subscription arrived for a pairing that is gone"
                     ),
                     Err(e) => tracing::error!(target: "remote", "could not store a subscription: {e}"),
+                }
+            }
+            ControlCommand::Attach { session } => {
+                let (Some(data), Some(authority)) = (&self.data, &self.authority) else {
+                    tracing::warn!(
+                        target: "remote",
+                        "a device asked to open a conversation on a pairing with no data channel"
+                    );
+                    return;
+                };
+                let (mode, tier) = authority.authorization(&session).await;
+                data.attach(session, mode, tier).await;
+            }
+            ControlCommand::Detach => {
+                if let Some(data) = &self.data {
+                    data.detach().await;
                 }
             }
             ControlCommand::Unsubscribe => {

@@ -36,43 +36,32 @@ pub trait WireSink: Send + Sync {
 /// notification/activity events have no portal frame yet and are dropped here
 /// (social gateways render those).
 pub struct PortalGateway {
-    session: Mutex<PortalSession>,
+    /// The conversation this channel is showing, and everything scoped to it.
+    ///
+    /// `None` while the remote end is looking at the session list rather than at
+    /// a conversation. That distinction is not cosmetic: `push::portal_showing`
+    /// is a *behaviour* switch, not a status read — synthesis asks it whether
+    /// its audio has somewhere to go, and answers `true` by returning at once
+    /// and pushing parts as they are made. A binding left pointing at whatever
+    /// was last open would make that predicate lie, and the audio would be
+    /// pushed to a phone showing a list while the return value that also
+    /// carried it was thrown away.
+    ///
+    /// It also stops a background loop's every `stream_delta` being encrypted,
+    /// sequenced, buffered and written to a socket nobody is reading.
+    binding: tokio::sync::RwLock<Option<SessionBinding>>,
+    /// The channel key. Held here because it belongs to the channel, not to
+    /// whichever conversation is currently bound: rebinding must not re-derive
+    /// it, which is what keeps Argon2id to the two passes done at pairing.
+    key: Option<[u8; 32]>,
     sink: Arc<dyn WireSink>,
-    /// Only chat for this session is projected — the M2 tap fans *every* chat
-    /// `DaemonEnvelope` to every gateway.
-    session_id: String,
     /// Unique per channel (`portal:<channel_id>`) so the registry can drop this
     /// gateway specifically; several may exist if the user opens more than one.
     id: String,
-    /// `request_id`s of system commands this gateway sent on the portal's
-    /// behalf, awaiting their reply.
-    ///
-    /// System responses carry no session id, so the session filter cannot pass
-    /// them and must not simply be relaxed — that would hand this portal every
-    /// other session's replies. Matching the id means a portal sees exactly the
-    /// answers to questions it asked.
-    pending_queries: Mutex<std::collections::HashSet<String>>,
+    /// The bare channel id, for rooting a new binding's asset store.
+    channel_id: String,
     /// This channel's staging area for original images sent from the phone.
     uploads: Mutex<super::upload::UploadStore>,
-    /// Media the head holds for this session, served on request rather than
-    /// written into the assistant's prose.
-    ///
-    /// Shared with the capture point: a screenshot is taken deep in the agent
-    /// host, which knows a session id and nothing about portals. Both ends ask
-    /// the registry for the same store rather than threading one through.
-    assets: std::sync::Arc<std::sync::Mutex<super::asset::AssetStore>>,
-    /// Asset ids already announced, so a reference repeated across deltas does
-    /// not announce the same media twice.
-    announced: Mutex<std::collections::HashSet<String>>,
-    /// What the turn currently open has already put on the wire.
-    ///
-    /// Scoped to the turn on purpose. It is the candidate set for repairing a
-    /// body reference that names nothing, and a broken reference must only ever
-    /// be pointed at media the same reply produced — hanging it on the previous
-    /// message's picture would be a different wrong answer, not a fix.
-    turn_assets: Mutex<TurnAssets>,
-    /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
-    push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
     /// Which path this session's media takes, and whether a peer connection is
     /// forming. Always `Relay` in a build without the `webrtc` feature.
     rtc: Arc<super::rtc::RtcState>,
@@ -101,6 +90,102 @@ pub struct PortalGateway {
     /// side is connected; otherwise it takes the chat socket, which costs
     /// head-of-line delay and delivers the picture.
     media_sink: Option<Arc<dyn WireSink>>,
+}
+
+/// Everything scoped to the conversation a channel is currently showing.
+///
+/// Split out because a `PortalGateway` is two things at once, and only one of
+/// them changes when the remote end switches conversations. The socket, the
+/// upload staging area (rooted at the *channel*), the peer connection and the
+/// ICE configuration all belong to the channel: tearing them down to change
+/// which conversation is on screen would renegotiate a WebRTC connection whose
+/// offer/answer window is designed to take up to two and a half minutes, and
+/// would delete a directory the next conversation is about to use.
+///
+/// Rebinding rather than rebuilding also avoids a worse failure. The dialling
+/// loop never stops on its own, so a rebuilt gateway would leave the old one
+/// still dialling — and because the channel id is reused, it would reconnect to
+/// the very room the new one is using, with a second `SendSequencer` answering
+/// the same `resume{from}`.
+struct SessionBinding {
+    /// The conversation being shown.
+    session_id: String,
+    /// Translator plus `SendSequencer`.
+    ///
+    /// Replaced wholesale on rebind, which is what resets `seq` to zero. Keeping
+    /// one sequencer across two conversations would leave both their frames in
+    /// one replay buffer, and a single `resume{from}` would then replay one
+    /// conversation into the other's view — a content leak, not a display bug.
+    session: Mutex<PortalSession>,
+    /// Media the head holds for this session, served on request rather than
+    /// written into the assistant's prose.
+    ///
+    /// Shared with the capture point: a screenshot is taken deep in the agent
+    /// host, which knows a session id and nothing about portals. Both ends ask
+    /// the registry for the same store rather than threading one through.
+    assets: std::sync::Arc<std::sync::Mutex<super::asset::AssetStore>>,
+    /// Asset ids already announced, so a reference repeated across deltas does
+    /// not announce the same media twice.
+    announced: Mutex<std::collections::HashSet<String>>,
+    /// What the turn currently open has already put on the wire.
+    ///
+    /// Scoped to the turn on purpose. It is the candidate set for repairing a
+    /// body reference that names nothing, and a broken reference must only ever
+    /// be pointed at media the same reply produced — hanging it on the previous
+    /// message's picture would be a different wrong answer, not a fix.
+    turn_assets: Mutex<TurnAssets>,
+    /// `request_id`s of system commands this gateway sent on the portal's
+    /// behalf, awaiting their reply.
+    ///
+    /// System responses carry no session id, so the session filter cannot pass
+    /// them and must not simply be relaxed — that would hand this portal every
+    /// other session's replies. Matching the id means a portal sees exactly the
+    /// answers to questions it asked.
+    pending_queries: Mutex<std::collections::HashSet<String>>,
+    /// Taken by `spawn_pump`. `None` afterwards, so a second call is a no-op.
+    push_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>,
+}
+
+impl SessionBinding {
+    /// Bind `session_id`, claiming its push channel and asset store.
+    fn new(
+        session_id: String,
+        channel_id: &str,
+        key: Option<[u8; 32]>,
+        mode: Option<String>,
+        execution_tier: Option<String>,
+    ) -> Self {
+        let assets = super::asset::store_for(
+            &session_id,
+            super::asset::AssetStore::root_for(channel_id),
+            ASSET_QUOTA_BYTES,
+        );
+        let push_rx = super::push::register(&session_id);
+        Self {
+            session: Mutex::new(PortalSession::new(key, mode, execution_tier)),
+            assets,
+            announced: Mutex::new(std::collections::HashSet::new()),
+            turn_assets: Mutex::new(TurnAssets::default()),
+            pending_queries: Mutex::new(std::collections::HashSet::new()),
+            push_rx: Mutex::new(Some(push_rx)),
+            session_id,
+        }
+    }
+
+    /// Release what this binding claimed process-wide.
+    ///
+    /// Dropping the push registration is the part that matters: it is what
+    /// `portal_showing` reads, and leaving it behind makes that predicate claim
+    /// an audience for a conversation nobody is looking at. Dropping the sender
+    /// also ends the pump task, which is how the next binding gets to start its
+    /// own.
+    ///
+    /// The upload directory is deliberately not touched — it is rooted at the
+    /// channel, and the next binding uses it.
+    fn release(&self) {
+        super::asset::forget_session(&self.session_id);
+        super::push::forget(&self.session_id);
+    }
 }
 
 /// How much disk one remote session may occupy. With a 20 MB per-image cap
@@ -167,26 +252,33 @@ impl PortalGateway {
         execution_tier: Option<String>,
         channel_id: &str,
     ) -> Self {
-        let session_id: String = session_id.into();
-        let session_ref = session_id.clone();
+        let gw = Self::unbound(key, sink, channel_id);
+        // Set through the lock's owner rather than through the lock: `new` is
+        // called from async code, where `blocking_write` panics.
+        let binding = SessionBinding::new(session_id.into(), channel_id, key, mode, execution_tier);
         Self {
-            session: Mutex::new(PortalSession::new(key, mode, execution_tier)),
+            binding: tokio::sync::RwLock::new(Some(binding)),
+            ..gw
+        }
+    }
+
+    /// A channel with no conversation on it yet.
+    ///
+    /// What a paired device holds between opening the app and choosing
+    /// something to look at. Everything channel-scoped is live — the socket,
+    /// the staging area, the peer path — and nothing session-scoped exists,
+    /// which is what keeps `portal_showing` honest about there being no
+    /// audience for anything.
+    pub fn unbound(key: Option<[u8; 32]>, sink: Arc<dyn WireSink>, channel_id: &str) -> Self {
+        Self {
+            binding: tokio::sync::RwLock::new(None),
+            key,
             sink,
-            session_id,
             id: format!("portal:{channel_id}"),
-            pending_queries: Mutex::new(std::collections::HashSet::new()),
             uploads: Mutex::new(super::upload::UploadStore::new(
                 super::upload::UploadStore::root_for(channel_id),
                 UPLOAD_QUOTA_BYTES,
             )),
-            assets: super::asset::store_for(
-                &session_ref,
-                super::asset::AssetStore::root_for(channel_id),
-                ASSET_QUOTA_BYTES,
-            ),
-            announced: Mutex::new(std::collections::HashSet::new()),
-            turn_assets: Mutex::new(TurnAssets::default()),
-            push_rx: Mutex::new(Some(super::push::register(&session_ref))),
             rtc: Arc::new(super::rtc::RtcState::new()),
             ice_servers: Vec::new(),
             cloudflare_turn: None,
@@ -199,7 +291,98 @@ impl PortalGateway {
             #[cfg(feature = "webrtc")]
             gave_up_on_peer: std::sync::atomic::AtomicBool::new(false),
             media_sink: None,
+            channel_id: channel_id.to_string(),
         }
+    }
+
+    /// The conversation on screen, if there is one.
+    pub async fn bound_session(&self) -> Option<String> {
+        self.binding
+            .read()
+            .await
+            .as_ref()
+            .map(|b| b.session_id.clone())
+    }
+
+    /// Show `session_id`, replacing whatever was on screen.
+    ///
+    /// The order here is the contract, and each step exists because leaving it
+    /// out breaks something specific:
+    ///
+    /// 1. **Release the old binding.** Its push registration is what
+    ///    `portal_showing` reads; left behind, synthesis on the old session goes
+    ///    fire-and-forget to a phone that has moved on.
+    /// 2. **Take the new authorisation from the daemon, never from the request.**
+    ///    `mode` rides on every remote turn and is a grant, not a display field
+    ///    — the local invariant is that a channel grants exactly what the target
+    ///    session already had. Inheriting the previous binding's mode would let
+    ///    a phone silently raise a session's privileges by switching to it.
+    /// 3. **Resync.** A new binding means a new `SendSequencer` counting from
+    ///    zero, while the far end is still holding the last seq of the previous
+    ///    conversation. Without this it waits for frames that will never come.
+    /// 4. **Say what the new session is set to**, so the tier shown above an
+    ///    approval button belongs to the session being approved.
+    pub async fn attach(
+        self: &Arc<Self>,
+        session_id: impl Into<String>,
+        mode: Option<String>,
+        execution_tier: Option<String>,
+    ) {
+        let session_id = session_id.into();
+        {
+            let mut slot = self.binding.write().await;
+            if let Some(previous) = slot.as_ref() {
+                if previous.session_id == session_id {
+                    return; // already showing it; a resync would only churn
+                }
+                previous.release();
+            }
+            *slot = Some(SessionBinding::new(
+                session_id.clone(),
+                &self.channel_id,
+                self.key,
+                mode,
+                execution_tier,
+            ));
+        }
+        // The pump follows the binding: the previous one ended when its sender
+        // was dropped above.
+        self.spawn_pump().await;
+        self.resync().await;
+        self.announce().await;
+        tracing::info!(target: "remote", session = %session_id, "the channel is showing this session");
+    }
+
+    /// Stop showing anything.
+    ///
+    /// Not merely cosmetic. While nothing is bound, every chat frame for what
+    /// used to be here stops being translated, sealed, sequenced and written —
+    /// a background loop can run all day without spending a phone's data on a
+    /// conversation nobody has open — and `portal_showing` tells the truth
+    /// again.
+    pub async fn detach(&self) {
+        let mut slot = self.binding.write().await;
+        if let Some(previous) = slot.take() {
+            previous.release();
+            tracing::info!(
+                target: "remote",
+                session = %previous.session_id,
+                "the channel is showing nothing"
+            );
+        }
+    }
+
+    /// Tell the far end to throw away what it has and reload.
+    ///
+    /// Downlink-only, and already in the protocol — it exists for a `resume`
+    /// that cannot be honoured from the buffer. Rebinding is its second natural
+    /// use and costs no protocol change.
+    async fn resync(&self) {
+        let slot = self.binding.read().await;
+        let Some(binding) = slot.as_ref() else { return };
+        let wire = binding.session.lock().await.resync_frame();
+        drop(slot);
+        self.sink.send(wire).await;
     }
 
     /// Give this gateway a dedicated media socket to answer ranges on.
@@ -255,18 +438,31 @@ impl PortalGateway {
     /// Separate from `new` because encryption lives behind an async lock and
     /// the constructor is not async. Calling it twice is harmless.
     pub async fn spawn_pump(self: &std::sync::Arc<Self>) {
-        let Some(mut rx) = self.push_rx.lock().await.take() else {
+        let taken = {
+            let slot = self.binding.read().await;
+            match slot.as_ref() {
+                Some(binding) => binding.push_rx.lock().await.take(),
+                None => None,
+            }
+        };
+        let Some(mut rx) = taken else {
             return;
         };
         let gw = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             while let Some(mut frame) = rx.recv().await {
+                // Whatever this belongs to is no longer on screen — the binding
+                // that owned the receiver has been replaced. Dropping the frame
+                // is right: it would be sequenced into a conversation it did not
+                // come from.
+                let slot = gw.binding.read().await;
+                let Some(binding) = slot.as_ref() else { continue };
                 // The producer knows a session, not which stream is open. That
                 // is session state, so it is filled in here rather than being
                 // threaded out to every tool that might push something.
                 let stamped = frame.get("streamId").is_some();
                 if !stamped {
-                    let sid = gw.session.lock().await.current_stream_id();
+                    let sid = binding.session.lock().await.current_stream_id();
                     if let Some(obj) = frame.as_object_mut() {
                         obj.insert("streamId".into(), serde_json::Value::String(sid));
                     }
@@ -278,7 +474,8 @@ impl PortalGateway {
                     stamped_at_source = stamped,
                     "push frame downlink"
                 );
-                let wire = gw.session.lock().await.downlink_frame(frame);
+                let wire = binding.session.lock().await.downlink_frame(frame);
+                drop(slot);
                 gw.sink.send(wire).await;
             }
         });
@@ -295,8 +492,10 @@ impl PortalGateway {
         name: &str,
         mime_type: &str,
     ) -> Option<String> {
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return None };
         let offer = {
-            let mut store = self.assets.lock().expect("asset store");
+            let mut store = b.assets.lock().expect("asset store");
             match store.put(bytes, name, mime_type) {
                 Ok(o) => o,
                 Err(e) => {
@@ -309,7 +508,8 @@ impl PortalGateway {
         let frame = serde_json::json!({
             "kind": "asset", "streamId": stream_id, "asset": offer,
         });
-        let wire = self.session.lock().await.downlink_frame(frame);
+        let wire = b.session.lock().await.downlink_frame(frame);
+        drop(slot);
         self.sink.send(wire).await;
         Some(id)
     }
@@ -323,16 +523,20 @@ impl PortalGateway {
     /// `turn_assets` holds what that announcement took. Between them they cover
     /// the whole turn, whichever side of the announcement the text falls on.
     async fn turn_candidates(&self) -> Vec<String> {
-        let stream = self.session.lock().await.current_stream_id();
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else {
+            return Vec::new();
+        };
+        let stream = b.session.lock().await.current_stream_id();
         let mut out = {
-            let turn = self.turn_assets.lock().await;
+            let turn = b.turn_assets.lock().await;
             if turn.stream == stream {
                 turn.ids.clone()
             } else {
                 Vec::new()
             }
         };
-        for id in self.assets.lock().expect("asset store").pending_ids() {
+        for id in b.assets.lock().expect("asset store").pending_ids() {
             if !out.contains(&id) {
                 out.push(id);
             }
@@ -353,10 +557,12 @@ impl PortalGateway {
     /// yielded a truncated one, and this warned about media nobody had asked
     /// for.
     async fn announce_referenced(&self, named: &[String]) {
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return };
         // Everything stored since the last turn, plus anything the text names.
         // The stored ones are what make a picture appear at all; the named ones
         // are usually the same offers and are deduped below.
-        let mut ids: Vec<String> = super::asset::take_pending_for_session(&self.session_id)
+        let mut ids: Vec<String> = super::asset::take_pending_for_session(&b.session_id)
             .into_iter()
             .map(|o| o.id)
             .collect();
@@ -366,18 +572,18 @@ impl PortalGateway {
             }
         }
         for id in ids {
-            if !self.announced.lock().await.insert(id.clone()) {
+            if !b.announced.lock().await.insert(id.clone()) {
                 continue;
             }
             let offer = {
-                let store = self.assets.lock().expect("asset store");
+                let store = b.assets.lock().expect("asset store");
                 store.offer(&id)
             };
             let Some(offer) = offer else {
                 tracing::warn!(target: "remote", %id, "asset announced but the store has no such id");
                 continue;
             };
-            let stream = self.session.lock().await.current_stream_id();
+            let stream = b.session.lock().await.current_stream_id();
             tracing::info!(
                 target: "remote",
                 %id, bytes = offer.size, mime = %offer.mime_type, stream = %stream,
@@ -388,13 +594,13 @@ impl PortalGateway {
                 "streamId": stream.clone(),
                 "asset": offer,
             });
-            let wire = self.session.lock().await.downlink_frame(frame);
+            let wire = b.session.lock().await.downlink_frame(frame);
             self.sink.send(wire).await;
             // Recorded after it is on the wire, so the candidate set never
             // offers to repair a reference towards media the portal has not
             // been told about.
             {
-                let mut turn = self.turn_assets.lock().await;
+                let mut turn = b.turn_assets.lock().await;
                 if turn.stream != stream {
                     turn.stream = stream;
                     turn.ids.clear();
@@ -439,8 +645,10 @@ impl PortalGateway {
 
         // Scoped so the guard cannot outlive the block: held across the await
         // below it would make this future non-Send.
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return };
         let served = {
-            let store = self.assets.lock().expect("asset store");
+            let store = b.assets.lock().expect("asset store");
             match store.read(id, offset, length) {
                 Ok(bytes) => {
                     let eof = store.is_eof(id, offset, bytes.len());
@@ -488,7 +696,7 @@ impl PortalGateway {
         };
         let fits_peer = fits_the_data_channel(payload_len);
 
-        let mut session = self.session.lock().await;
+        let mut session = b.session.lock().await;
         // Destination is decided with the frame, not from the request. They
         // differ exactly when the read failed: the range was headed off the chat
         // socket, the error that replaced it is not.
@@ -651,14 +859,27 @@ impl PortalGateway {
 
     /// Point the media store at a temporary directory (tests only).
     #[cfg(test)]
-    pub fn with_asset_root(self, root: std::path::PathBuf) -> Self {
-        Self {
-            assets: std::sync::Arc::new(std::sync::Mutex::new(super::asset::AssetStore::new(
-                root,
-                ASSET_QUOTA_BYTES,
-            ))),
-            ..self
+    pub fn with_asset_root(mut self, root: std::path::PathBuf) -> Self {
+        // `get_mut` rather than a lock: this owns the value, so there is nothing
+        // to contend with — and `blocking_write` inside a runtime panics, which
+        // is exactly what it did here.
+        if let Some(binding) = self.binding.get_mut().as_mut() {
+            binding.assets = std::sync::Arc::new(std::sync::Mutex::new(
+                super::asset::AssetStore::new(root, ASSET_QUOTA_BYTES),
+            ));
         }
+        self
+    }
+
+    /// The bound conversation's media store (tests only).
+    #[cfg(test)]
+    pub async fn assets(&self) -> std::sync::Arc<std::sync::Mutex<super::asset::AssetStore>> {
+        self.binding
+            .read()
+            .await
+            .as_ref()
+            .map(|b| std::sync::Arc::clone(&b.assets))
+            .expect("a bound gateway has a store")
     }
 
     /// End of session: remove everything this channel put on disk.
@@ -669,8 +890,9 @@ impl PortalGateway {
     /// whereas the value can outlive it in a registry.
     pub async fn cleanup_uploads(&self) {
         self.uploads.lock().await.cleanup();
-        super::asset::forget_session(&self.session_id);
-        super::push::forget(&self.session_id);
+        if let Some(binding) = self.binding.read().await.as_ref() {
+            binding.release();
+        }
     }
 
     /// Apply one `upload_*` frame. A rejection goes back as an `error` frame so
@@ -713,7 +935,12 @@ impl PortalGateway {
         drop(store);
         if let Err(e) = outcome {
             tracing::warn!(target: "remote", id, error = %e, "remote upload rejected");
-            let wire = self.session.lock().await.error_frame(&e.to_string());
+            let wire = {
+                let slot = self.binding.read().await;
+                let Some(b) = slot.as_ref() else { return };
+                let w = b.session.lock().await.error_frame(&e.to_string());
+                w
+            };
             self.sink.send(wire).await;
         }
     }
@@ -727,7 +954,12 @@ impl PortalGateway {
     /// every chunk was projected, written to the socket without error, and
     /// showed nothing. Same mistake as the offer, in the line above it.
     pub async fn announce(&self) {
-        let wires = self.session.lock().await.session_state();
+        let wires = {
+            let slot = self.binding.read().await;
+            let Some(b) = slot.as_ref() else { return };
+            let w = b.session.lock().await.session_state();
+            w
+        };
         for w in wires {
             self.sink.send(w).await;
         }
@@ -930,8 +1162,10 @@ impl PortalGateway {
     /// closure runs while the session lock is held, and reaching through
     /// `&self` there would nest an async lock inside a sync one.
     pub async fn resume(&self, from: u64) {
-        let assets = std::sync::Arc::clone(&self.assets);
-        let wires = self
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return };
+        let assets = std::sync::Arc::clone(&b.assets);
+        let wires = b
             .session
             .lock()
             .await
@@ -951,7 +1185,6 @@ impl PortalGateway {
     pub async fn on_wire_in(
         self: &std::sync::Arc<Self>,
         wire: Wire,
-        session_id: &str,
         injector: &dyn Injector,
     ) {
         // The relay's own presence notice, which is plaintext and not a
@@ -988,7 +1221,9 @@ impl PortalGateway {
         // outstanding is re-sent rather than rebuilt, and repeats are capped.
         self.spawn_offer();
 
-        let Some(msg) = self.session.lock().await.decode_wire(&wire) else {
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return };
+        let Some(msg) = b.session.lock().await.decode_wire(&wire) else {
             return;
         };
         // Peek at the frame before routing: knowing whether it names any
@@ -1005,11 +1240,11 @@ impl PortalGateway {
         };
 
         let message_id = uuid::Uuid::new_v4().to_string();
-        let routed = self
+        let routed = b
             .session
             .lock()
             .await
-            .route(msg, session_id, &message_id, &local_files);
+            .route(msg, &b.session_id, &message_id, &local_files);
         match routed {
             Inbound::Upload(frame) => self.apply_upload(&frame).await,
             Inbound::AssetPull(frame) => self.apply_asset_pull(&frame).await,
@@ -1022,7 +1257,7 @@ impl PortalGateway {
                         .and_then(|p| p.get("request_id"))
                         .and_then(|v| v.as_str())
                     {
-                        self.pending_queries.lock().await.insert(id.to_string());
+                        b.pending_queries.lock().await.insert(id.to_string());
                     }
                 }
                 injector.inject(payload).await
@@ -1047,7 +1282,10 @@ impl PortalGateway {
         else {
             return false;
         };
-        self.pending_queries.lock().await.remove(id)
+        let slot = self.binding.read().await;
+        let Some(b) = slot.as_ref() else { return false };
+        let claimed = b.pending_queries.lock().await.remove(id);
+        claimed
     }
 }
 
@@ -1151,6 +1389,13 @@ impl RemoteGateway for PortalGateway {
 
     async fn project(&self, ev: &OutboundEvent) {
         if let OutboundEvent::Chat(env) = ev {
+            // Nothing bound means nothing to show: the far end is on the list,
+            // not in a conversation. Dropping here is what keeps a background
+            // loop's every delta from being sealed, sequenced and written to a
+            // socket nobody is reading.
+            let Some(bound) = self.bound_session().await else {
+                return;
+            };
             // Scope to this gateway's session: the M2 tap fans *every* chat
             // envelope to every gateway, and `server.rs` stamps `session_id`
             // into each chat payload for exactly this purpose. Anything without
@@ -1160,7 +1405,7 @@ impl RemoteGateway for PortalGateway {
                 .get("payload")
                 .and_then(|p| p.get("session_id"))
                 .and_then(|s| s.as_str());
-            if sid != Some(self.session_id.as_str())
+            if sid != Some(bound.as_str())
                 && !self.is_our_reply(env).await
                 && !is_user_notification(env)
             {
@@ -1182,7 +1427,9 @@ impl RemoteGateway for PortalGateway {
             // back 404.
             let candidates = std::sync::Mutex::new(self.turn_candidates().await);
             let named = std::sync::Mutex::new(Vec::<String>::new());
-            let assets = std::sync::Arc::clone(&self.assets);
+            let slot = self.binding.read().await;
+            let Some(b) = slot.as_ref() else { return };
+            let assets = std::sync::Arc::clone(&b.assets);
             let resolve = |id: &str| -> super::translate::RefFate {
                 let mut unclaimed = candidates.lock().expect("ref candidates");
                 if assets.lock().expect("asset store").contains(id) {
@@ -1202,14 +1449,14 @@ impl RemoteGateway for PortalGateway {
                 super::translate::RefFate::Drop
             };
             let (wires, open) = {
-                let mut session = self.session.lock().await;
+                let mut session = b.session.lock().await;
                 let wires = session.on_chat(&env.payload, &resolve);
                 (wires, session.open_stream_id())
             };
             let named = named.into_inner().expect("named refs");
             // So a tool starting during this turn can stamp what it makes
             // later with the turn that asked for it.
-            super::push::set_stream(&self.session_id, open.as_deref());
+            super::push::set_stream(&b.session_id, open.as_deref());
             tracing::info!(target: "remote", "gateway.project: {} wire(s) out", wires.len());
             for w in wires {
                 self.sink.send(w).await;
@@ -1279,6 +1526,115 @@ mod tests {
         chat_env_for("sess", content, done)
     }
 
+    // --- rebinding -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_unbound_channel_shows_nothing_and_claims_no_audience() {
+        // What a paired device holds while it is on the session list. The
+        // predicate matters more than the silence: synthesis asks it whether its
+        // audio has somewhere to go, and answering `true` here would push parts
+        // to a view nobody has open while discarding the return value that also
+        // carried them.
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::unbound(None, sink.clone(), "chan-unbound");
+        assert_eq!(gw.bound_session().await, None);
+        assert!(!super::super::push::portal_showing("sess-unbound"));
+
+        gw.project(&OutboundEvent::Chat(chat_env_for("sess-unbound", "hi", false)))
+            .await;
+        assert!(
+            sink.sent.lock().await.is_empty(),
+            "nothing is bound, so nothing may be sealed, sequenced and written"
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_claims_the_session_and_detaching_gives_it_back() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-attach"));
+
+        gw.attach("sess-attach", Some("chat".into()), Some("read-only".into()))
+            .await;
+        assert_eq!(gw.bound_session().await, Some("sess-attach".into()));
+        assert!(super::super::push::portal_showing("sess-attach"));
+
+        gw.detach().await;
+        assert_eq!(gw.bound_session().await, None);
+        assert!(
+            !super::super::push::portal_showing("sess-attach"),
+            "a channel showing nothing is not an audience for anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebinding_releases_the_conversation_it_left() {
+        // The bug this prevents: `portal_showing` stays true for a session the
+        // device has moved on from, so its synthesis goes fire-and-forget into
+        // a view that is gone.
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-rebind"));
+        gw.attach("sess-first", None, None).await;
+        gw.attach("sess-second", None, None).await;
+
+        assert_eq!(gw.bound_session().await, Some("sess-second".into()));
+        assert!(!super::super::push::portal_showing("sess-first"));
+        assert!(super::super::push::portal_showing("sess-second"));
+        gw.detach().await;
+    }
+
+    #[tokio::test]
+    async fn rebinding_tells_the_far_end_to_start_over() {
+        // A new binding is a new `SendSequencer` counting from zero while the
+        // far end still holds the last seq of the previous conversation. Without
+        // a resync it waits for frames that will never be sent.
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-resync"));
+        gw.attach("sess-resync", None, None).await;
+
+        let wires = sink.sent.lock().await.clone();
+        let kinds: Vec<String> = wires
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<serde_json::Value>(t).ok(),
+                Wire::Binary(_) => None,
+            })
+            .filter_map(|v| v.get("k").and_then(|k| k.as_str()).map(str::to_string))
+            .collect();
+        assert!(kinds.iter().any(|k| k == "resync"), "got {kinds:?}");
+        gw.detach().await;
+    }
+
+    #[tokio::test]
+    async fn only_the_bound_conversation_is_projected() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-scope"));
+        gw.attach("sess-shown", None, None).await;
+        sink.sent.lock().await.clear();
+
+        gw.project(&OutboundEvent::Chat(chat_env_for("sess-other", "hi", false)))
+            .await;
+        assert!(sink.sent.lock().await.is_empty(), "another session's frame");
+
+        gw.project(&OutboundEvent::Chat(chat_env_for("sess-shown", "hi", false)))
+            .await;
+        assert!(!sink.sent.lock().await.is_empty(), "the bound session's frame");
+        gw.detach().await;
+    }
+
+    #[tokio::test]
+    async fn attaching_to_what_is_already_shown_changes_nothing() {
+        // A repeat would resync the far end for no reason, throwing away a
+        // transcript it already has and making it reload.
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-same"));
+        gw.attach("sess-same", None, None).await;
+        sink.sent.lock().await.clear();
+
+        gw.attach("sess-same", None, None).await;
+        assert!(sink.sent.lock().await.is_empty());
+        gw.detach().await;
+    }
+
     #[test]
     fn upload_ids_are_read_off_the_frame() {
         assert_eq!(
@@ -1323,7 +1679,7 @@ mod tests {
                                 "sha256": hex::encode(Sha256::digest(&png)) }),
             serde_json::json!({ "kind": "user_message", "text": "看这张", "uploads": ["u1"] }),
         ] {
-            gw.on_wire_in(frame_wire(frame), "sess", &inj).await;
+            gw.on_wire_in(frame_wire(frame), &inj).await;
         }
 
         let got = inj.injected.lock().await.clone();
@@ -1348,7 +1704,6 @@ mod tests {
             frame_wire(
                 serde_json::json!({ "kind": "upload_chunk", "id": "ghost", "seq": 0, "data": "AAAA" }),
             ),
-            "sess",
             &inj,
         )
         .await;
@@ -1512,7 +1867,8 @@ mod tests {
             gw = gw.with_media_sink(m);
         }
         let id = {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             store.put(&[7u8; 4096], "clip.mp4", "video/mp4").unwrap().id
         };
         (gw, chat, id, dir)
@@ -1543,7 +1899,8 @@ mod tests {
         let gw = PortalGateway::new(None, sink.clone(), session, None, None, session)
             .with_asset_root(dir.path().to_path_buf());
         let id = {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             store.put(&[7u8; 64], "clip.mp4", "video/mp4").unwrap().id
         };
         (gw, sink, id, dir)
@@ -1645,7 +2002,8 @@ mod tests {
         // wrong picture in the reader's message is not a repair.
         let (gw, sink, _first, _d) = gateway_mid_turn("sess-two").await;
         {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             store.put(&[8u8; 64], "other.mp4", "video/mp4").unwrap();
         }
 
@@ -1671,13 +2029,15 @@ mod tests {
             .with_asset_root(dir.path().to_path_buf());
         let big = vec![1u8; super::super::asset::CHUNK_BYTES + 4096];
         let offer = {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             store.put(&big, "clip.mp4", "video/mp4").unwrap()
         };
         let advertised = offer.chunk_bytes.expect("the head states a preference");
 
         let served = {
-            let store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let store = assets.lock().expect("asset store");
             store.read(&offer.id, 0, advertised).unwrap().len()
         };
         assert_eq!(served, advertised, "a plan must never come back short");
@@ -1855,7 +2215,8 @@ mod tests {
             .with_asset_root(dir.path().to_path_buf())
             .with_media_sink(media.clone());
         let id = {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             let big = vec![3u8; super::super::asset::CHUNK_BYTES * 2];
             store.put(&big, "big.mp4", "video/mp4").unwrap().id
         };
@@ -1896,7 +2257,8 @@ mod tests {
             .with_asset_root(dir.path().to_path_buf())
             .with_media_sink(media.clone());
         let id = {
-            let mut store = gw.assets.lock().expect("asset store");
+            let assets = gw.assets().await;
+            let mut store = assets.lock().expect("asset store");
             let big = vec![5u8; super::super::asset::CHUNK_BYTES];
             store.put(&big, "big.mp4", "video/mp4").unwrap().id
         };
@@ -2026,9 +2388,7 @@ mod tests {
             "chan",
         ));
         let inj = CollectInjector::default();
-        gw.on_wire_in(
-            frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
-            "sess",
+        gw.on_wire_in(frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
             &inj,
         )
         .await;
@@ -2056,16 +2416,14 @@ mod tests {
         ));
         let inj = CollectInjector::default();
         for notice in [r#"{"k":"peers","n":0}"#, r#"{"k":"peers","n":1}"#] {
-            gw.on_wire_in(Wire::Text(notice.into()), "sess", &inj).await;
+            gw.on_wire_in(Wire::Text(notice.into()), &inj).await;
             assert!(
                 inj.injected.lock().await.is_empty(),
                 "a relay notice is not a turn: {notice}"
             );
         }
 
-        gw.on_wire_in(
-            frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
-            "sess",
+        gw.on_wire_in(frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi" })),
             &inj,
         )
         .await;
@@ -2090,7 +2448,7 @@ mod tests {
         gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0,1 buffered
         sink.sent.lock().await.clear();
         let resume = Wire::Text(serde_json::to_string(&WireMessage::Resume { from: 1 }).unwrap());
-        gw.on_wire_in(resume, "sess", &CollectInjector::default())
+        gw.on_wire_in(resume, &CollectInjector::default())
             .await;
         assert_eq!(sink.sent.lock().await.len(), 1); // resent seq 1
     }
@@ -2134,9 +2492,7 @@ mod tests {
         // gathering that built it was spent for nothing.
         let sink = Arc::new(CollectSink::default());
         let gw = sealed_gw(sink.clone());
-        gw.on_wire_in(
-            Wire::Text(r#"{"k":"peers","n":0}"#.into()),
-            "sess",
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":0}"#.into()),
             &CollectInjector::default(),
         )
         .await;
@@ -2156,9 +2512,7 @@ mod tests {
         // offer that had already been thrown away.
         let sink = Arc::new(CollectSink::default());
         let gw = sealed_gw(sink.clone());
-        gw.on_wire_in(
-            Wire::Text(r#"{"k":"peers","n":1}"#.into()),
-            "sess",
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()),
             &CollectInjector::default(),
         )
         .await;
@@ -2242,7 +2596,7 @@ mod tests {
         // limit that never trips, on the network it exists for.
         let inj = CollectInjector::default();
         for _ in 0..3 {
-            gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), "sess", &inj)
+            gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), &inj)
                 .await;
         }
         // Each of those sent an announce, which is right and is not an offer.
@@ -2322,14 +2676,14 @@ mod tests {
         ));
         let inj = CollectInjector::default();
 
-        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":0}"#.into()), "sess", &inj)
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":0}"#.into()), &inj)
             .await;
         assert!(
             sink.sent.lock().await.is_empty(),
             "nothing to say to an empty channel"
         );
 
-        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), "sess", &inj)
+        gw.on_wire_in(Wire::Text(r#"{"k":"peers","n":1}"#.into()), &inj)
             .await;
         assert!(
             !sink.sent.lock().await.is_empty(),

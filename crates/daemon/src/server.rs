@@ -1975,6 +1975,7 @@ pub async fn start_server(
                 services.database.clone(),
             )),
             pairings,
+            database: services.database.clone(),
             vapid_public,
             msg_tx: msg_tx.clone(),
             injector_proxy_id: "remote-control".to_string(),
