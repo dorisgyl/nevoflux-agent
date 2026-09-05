@@ -49,6 +49,13 @@ fn is_approval(choice: &str) -> bool {
 pub trait SessionAuthority: Send + Sync {
     /// `(mode, execution_tier)` for `session_id`.
     async fn authorization(&self, session_id: &str) -> (Option<String>, Option<String>);
+
+    /// The conversation so far, as frames, oldest first.
+    ///
+    /// Answering an approval without the exchange around it is answering the
+    /// same words the desktop shows but with none of the context — which is
+    /// what makes reading it worth a rebind at all.
+    async fn history(&self, session_id: &str) -> Vec<serde_json::Value>;
 }
 
 /// The live authority, over the daemon's database.
@@ -82,7 +89,34 @@ impl SessionAuthority for StorageAuthority {
             .to_string();
         (mode, Some(tier))
     }
+
+    async fn history(&self, session_id: &str) -> Vec<serde_json::Value> {
+        use nevoflux_storage::{ListMessagesParams, MessageRepository};
+        // Newest first, then trimmed to a byte budget from that end — the end
+        // of a conversation is the part that explains the question being asked
+        // now. The count here is only a ceiling on how much is read; `replay`
+        // decides how much is sent.
+        let params = ListMessagesParams {
+            session_id: session_id.to_string(),
+            limit: Some(HISTORY_SCAN_LIMIT),
+            offset: None,
+            before_id: None,
+            after_id: None,
+        };
+        let mut messages = MessageRepository::new(&self.db)
+            .list(params)
+            .unwrap_or_default();
+        messages.reverse();
+        super::history::replay(&messages)
+    }
 }
+
+/// How many stored messages to read before the byte budget is applied.
+///
+/// A ceiling on the query, not on the replay. `list` takes a count and nothing
+/// else, so the byte budget is spent over whatever this returns; two hundred
+/// messages is comfortably more prose than the budget can carry.
+const HISTORY_SCAN_LIMIT: u32 = 200;
 
 /// Acts on control-channel commands for one pairing.
 pub struct ControlCommands {
@@ -188,7 +222,11 @@ impl super::ws::ControlCommandSink for ControlCommands {
                     return;
                 };
                 let (mode, tier) = authority.authorization(&session).await;
-                data.attach(session, mode, tier).await;
+                // Read before the rebind, so the transcript put on the wire is
+                // the one that belongs to the session being opened rather than
+                // whatever arrives while it is being opened.
+                let history = authority.history(&session).await;
+                data.attach(session, mode, tier, history).await;
             }
             ControlCommand::Detach => {
                 if let Some(data) = &self.data {

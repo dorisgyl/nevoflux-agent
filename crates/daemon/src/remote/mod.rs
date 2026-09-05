@@ -15,6 +15,7 @@ pub mod control_gateway;
 pub mod control_service;
 pub mod crypto;
 pub mod gateway;
+pub mod history;
 pub mod identity;
 pub mod inject;
 pub mod local_media;

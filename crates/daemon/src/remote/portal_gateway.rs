@@ -327,6 +327,7 @@ impl PortalGateway {
         session_id: impl Into<String>,
         mode: Option<String>,
         execution_tier: Option<String>,
+        history: Vec<serde_json::Value>,
     ) {
         let session_id = session_id.into();
         {
@@ -350,6 +351,7 @@ impl PortalGateway {
         self.spawn_pump().await;
         self.resync().await;
         self.announce().await;
+        self.replay(&history).await;
         tracing::info!(target: "remote", session = %session_id, "the channel is showing this session");
     }
 
@@ -370,6 +372,27 @@ impl PortalGateway {
                 "the channel is showing nothing"
             );
         }
+    }
+
+    /// Put a replayed conversation on the wire, after the resync that emptied
+    /// the far end and before anything live arrives.
+    ///
+    /// Sequenced like any other downlink frame, so a reconnect mid-replay
+    /// resumes rather than starting over.
+    async fn replay(&self, frames: &[serde_json::Value]) {
+        if frames.is_empty() {
+            return;
+        }
+        for frame in frames {
+            let wire = {
+                let slot = self.binding.read().await;
+                let Some(b) = slot.as_ref() else { return };
+                let w = b.session.lock().await.downlink_frame(frame.clone());
+                w
+            };
+            self.sink.send(wire).await;
+        }
+        tracing::info!(target: "remote", frames = frames.len(), "replayed the conversation");
     }
 
     /// Tell the far end to throw away what it has and reload.
@@ -1553,7 +1576,7 @@ mod tests {
         let sink = Arc::new(CollectSink::default());
         let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-attach"));
 
-        gw.attach("sess-attach", Some("chat".into()), Some("read-only".into()))
+        gw.attach("sess-attach", Some("chat".into()), Some("read-only".into()), Vec::new())
             .await;
         assert_eq!(gw.bound_session().await, Some("sess-attach".into()));
         assert!(super::super::push::portal_showing("sess-attach"));
@@ -1573,8 +1596,8 @@ mod tests {
         // a view that is gone.
         let sink = Arc::new(CollectSink::default());
         let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-rebind"));
-        gw.attach("sess-first", None, None).await;
-        gw.attach("sess-second", None, None).await;
+        gw.attach("sess-first", None, None, Vec::new()).await;
+        gw.attach("sess-second", None, None, Vec::new()).await;
 
         assert_eq!(gw.bound_session().await, Some("sess-second".into()));
         assert!(!super::super::push::portal_showing("sess-first"));
@@ -1589,7 +1612,7 @@ mod tests {
         // a resync it waits for frames that will never be sent.
         let sink = Arc::new(CollectSink::default());
         let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-resync"));
-        gw.attach("sess-resync", None, None).await;
+        gw.attach("sess-resync", None, None, Vec::new()).await;
 
         let wires = sink.sent.lock().await.clone();
         let kinds: Vec<String> = wires
@@ -1608,7 +1631,7 @@ mod tests {
     async fn only_the_bound_conversation_is_projected() {
         let sink = Arc::new(CollectSink::default());
         let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-scope"));
-        gw.attach("sess-shown", None, None).await;
+        gw.attach("sess-shown", None, None, Vec::new()).await;
         sink.sent.lock().await.clear();
 
         gw.project(&OutboundEvent::Chat(chat_env_for("sess-other", "hi", false)))
@@ -1627,10 +1650,10 @@ mod tests {
         // transcript it already has and making it reload.
         let sink = Arc::new(CollectSink::default());
         let gw = Arc::new(PortalGateway::unbound(None, sink.clone(), "chan-same"));
-        gw.attach("sess-same", None, None).await;
+        gw.attach("sess-same", None, None, Vec::new()).await;
         sink.sent.lock().await.clear();
 
-        gw.attach("sess-same", None, None).await;
+        gw.attach("sess-same", None, None, Vec::new()).await;
         assert!(sink.sent.lock().await.is_empty());
         gw.detach().await;
     }
