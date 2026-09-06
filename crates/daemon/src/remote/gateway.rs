@@ -18,19 +18,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nevoflux_protocol::DaemonEnvelope;
 
-/// What a gateway can faithfully render (design §9.2 capability axis).
-/// Orthogonal to notify projection — even a `TextOnly` gateway renders
-/// notifications.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capability {
-    /// Full conversation parity (artifact cards, tool chips, plan, browser
-    /// tool round-trips) — e.g. the portal gateway.
-    FullParity,
-    /// Text-only degraded head (no local executor); rich frames are projected
-    /// lossily — e.g. Slack / telegram.
-    TextOnly,
-}
-
 /// A user-facing notification (design §9.1 `Notification`), sourced from the
 /// EventBus `ui:notification:*` topic (see `crate::notify`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,10 +57,8 @@ pub enum OutboundEvent {
 /// daemon's unified injection point directly, not through this trait.
 #[async_trait]
 pub trait RemoteGateway: Send + Sync {
-    /// Stable id: `"portal" | "slack" | "telegram"`.
+    /// Stable id: `"portal:<channel>" | "control:<channel>" | "slack" | …`.
     fn id(&self) -> &str;
-    /// What this gateway can faithfully render.
-    fn capability(&self) -> Capability;
     /// Render `ev` into this gateway's medium (encrypt + send for portal;
     /// format + post for social).
     async fn project(&self, ev: &OutboundEvent);
@@ -189,7 +174,6 @@ mod tests {
     /// Records every event it is asked to project.
     struct MockGateway {
         id: String,
-        cap: Capability,
         seen: Arc<Mutex<Vec<OutboundEvent>>>,
     }
 
@@ -198,19 +182,15 @@ mod tests {
         fn id(&self) -> &str {
             &self.id
         }
-        fn capability(&self) -> Capability {
-            self.cap
-        }
         async fn project(&self, ev: &OutboundEvent) {
             self.seen.lock().unwrap().push(ev.clone());
         }
     }
 
-    fn mock(id: &str, cap: Capability) -> (Arc<MockGateway>, Arc<Mutex<Vec<OutboundEvent>>>) {
+    fn mock(id: &str) -> (Arc<MockGateway>, Arc<Mutex<Vec<OutboundEvent>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let gw = Arc::new(MockGateway {
             id: id.into(),
-            cap,
             seen: seen.clone(),
         });
         (gw, seen)
@@ -226,8 +206,8 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_reaches_every_gateway() {
-        let (portal, portal_seen) = mock("portal", Capability::FullParity);
-        let (slack, slack_seen) = mock("slack", Capability::TextOnly);
+        let (portal, portal_seen) = mock("portal");
+        let (slack, slack_seen) = mock("slack");
         let mut reg = GatewayRegistry::new();
         reg.register(portal);
         reg.register(slack);
@@ -236,16 +216,16 @@ mod tests {
 
         reg.fan_out(&notif()).await;
 
-        // notify is a per-gateway projection: BOTH received it, regardless of
-        // capability (design §9.1 — orthogonal to capability()).
+        // notify is a per-gateway projection: BOTH received it, whatever each
+        // one is able to render it as.
         assert_eq!(portal_seen.lock().unwrap().as_slice(), &[notif()]);
         assert_eq!(slack_seen.lock().unwrap().as_slice(), &[notif()]);
     }
 
     #[tokio::test]
     async fn unregister_removes_only_the_named_gateway() {
-        let (portal, portal_seen) = mock("portal:chan-a", Capability::FullParity);
-        let (other, other_seen) = mock("portal:chan-b", Capability::FullParity);
+        let (portal, portal_seen) = mock("portal:chan-a");
+        let (other, other_seen) = mock("portal:chan-b");
         let mut reg = GatewayRegistry::new();
         reg.register(portal);
         reg.register(other);
@@ -327,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_preserves_variant() {
-        let (gw, seen) = mock("portal", Capability::FullParity);
+        let (gw, seen) = mock("portal");
         let mut reg = GatewayRegistry::new();
         reg.register(gw);
 

@@ -509,7 +509,7 @@ pub async fn synthesize_local(
     // for: no portal attached, or a composition that wants the file itself.
     let live = session
         .as_deref()
-        .is_some_and(crate::remote::push::portal_attached)
+        .is_some_and(crate::remote::push::portal_showing)
         && req.composition_id.is_none();
 
     if live {

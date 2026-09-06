@@ -2,7 +2,7 @@
 //!
 //! ## 听众是传进来的,不是查出来的
 //!
-//! 工具侧的 `tts_synthesize_local` 用 `remote::push::portal_attached(session)` 问「有没有
+//! 工具侧的 `tts_synthesize_local` 用 `remote::push::portal_showing(session)` 问「有没有
 //! 人在听」,再决定要不要 fire-and-forget。那个判断对**对话语音**是错的:
 //! 「这个 session 上有消费者」分不清一段视频旁白和一句说给坐在 sidebar 前的人
 //! 听的回答。sidebar 一旦注册进同一张表,videocut / Loops 的旁白稿就会被念给

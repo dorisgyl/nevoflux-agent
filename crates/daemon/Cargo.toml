@@ -202,6 +202,12 @@ pulldown-cmark = "0.12"
 
 # Encryption (AES-256-GCM for learning data at rest)
 aes-gcm = "0.10"
+
+# Web Push (design §6): VAPID is an ES256 assertion and RFC 8291 seals the
+# payload with ECDH over P-256 + HKDF. Both are pure-Rust and pull no HTTP
+# client of their own — the alternative, a `web-push` crate, brings its own.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "std"] }
+hkdf = "0.12"
 base64 = "0.22"
 
 # ffmpeg subprocess management (video skill render pipeline)

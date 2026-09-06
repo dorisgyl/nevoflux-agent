@@ -145,9 +145,13 @@ pub async fn run(deps: ServiceDeps) -> Result<(), String> {
         ice_servers: cfg.remote_control.ice_servers.clone(),
         cloudflare_turn: cfg.remote_control.cloudflare_turn.clone(),
     };
-    let gateway = super::start::open_channel(req, &deps.registry, &deps.msg_tx)
+    let channel = super::start::open_channel(req, &deps.registry, &deps.msg_tx)
         .await
         .map_err(|e| e.to_string())?;
+    let gateway = channel
+        .portal()
+        .expect("a data channel always has a portal gateway")
+        .clone();
 
     // 7. The one thing a person needs. stdout, not the log: this is the
     //    product of having started the container.

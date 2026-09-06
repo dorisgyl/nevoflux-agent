@@ -1189,12 +1189,28 @@ impl DaemonHostFunctions {
 /// the next tool call. Any missing/legacy/invalid value falls back to the
 /// safest tier (read-only) via `ExecutionTier::from_setting`.
 pub(crate) fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
+    resolve_execution_tier_for(&services.database, &services.session_id)
+}
+
+/// The same resolution, addressed by database and session rather than by a
+/// whole `HostServices`.
+///
+/// Split out for the remote control channel, which has to re-resolve a
+/// session's tier when a paired device switches to it and has no host services
+/// to hand. Two implementations of "what is this session allowed to do" is
+/// precisely the drift worth avoiding: the tier is shown above an approval
+/// button, and a second copy would eventually show one session's authority over
+/// another session's question.
+pub(crate) fn resolve_execution_tier_for(
+    database: &nevoflux_storage::Database,
+    session_id: &str,
+) -> nevoflux_protocol::ExecutionTier {
     use nevoflux_storage::ConfigRepository;
-    let repo = ConfigRepository::new(&services.database);
+    let repo = ConfigRepository::new(database);
 
     // Per-session override (does not leak to the global default).
-    if !services.session_id.is_empty() {
-        let key = format!("config:session:{}:agentExecution", services.session_id);
+    if !session_id.is_empty() {
+        let key = format!("config:session:{}:agentExecution", session_id);
         if let Ok(Some(v)) = repo.get(&key) {
             if let Some(s) = v.as_str() {
                 return nevoflux_protocol::ExecutionTier::from_setting(s);
@@ -5550,7 +5566,7 @@ impl HostFunctions for DaemonHostFunctions {
     fn speech_reaches_a_listener(&self) -> bool {
         self.session_id
             .as_deref()
-            .is_some_and(crate::remote::push::portal_attached)
+            .is_some_and(crate::remote::push::portal_showing)
     }
 
     fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {

@@ -16,7 +16,6 @@
 use nevoflux_protocol::chat::SidebarMessage;
 use serde_json::Value;
 
-use super::crypto::{self, SealedFrame};
 use super::relay_protocol::{Resend, SendSequencer, WireMessage};
 use super::translate::{self, Translator};
 
@@ -297,6 +296,17 @@ impl PortalSession {
         self.translator.open_stream_id()
     }
 
+    /// Tell the far end to discard what it has and reload from scratch.
+    ///
+    /// The same frame `resume` falls back to when the gap is wider than the
+    /// buffer, used here for the other case that makes incremental catch-up
+    /// meaningless: this channel is now showing a different conversation, so
+    /// there is nothing on the far end worth keeping and its sequencer has to
+    /// go back to zero along with ours.
+    pub fn resync_frame(&self) -> Wire {
+        self.encode(&WireMessage::Resync)
+    }
+
     pub fn downlink_frame(&mut self, frame: Value) -> Wire {
         let wire = self.sequencer.tag(frame);
         self.encode(&wire)
@@ -368,12 +378,10 @@ impl PortalSession {
         }
     }
 
+    /// The channel envelope, shared with the control channel — see
+    /// [`super::channel_codec`]. Only the sequencing above it differs.
     fn encode(&self, wire: &WireMessage) -> Wire {
-        let json = serde_json::to_vec(wire).expect("WireMessage serializes");
-        match &self.key {
-            Some(_) => self.seal(json),
-            None => Wire::Text(String::from_utf8(json).expect("json is utf-8")),
-        }
+        super::channel_codec::encode(self.key.as_ref(), wire)
     }
 
     /// Seal a payload for the channel, or pass it through as binary when this
@@ -382,37 +390,11 @@ impl PortalSession {
     /// Media frames take this directly: they are bytes either way, and there is
     /// no text form of them to fall back to in plaintext mode.
     fn seal(&self, payload: Vec<u8>) -> Wire {
-        match &self.key {
-            Some(k) => {
-                let sealed = crypto::seal_frame(k, &payload).expect("seal_frame");
-                let mut bytes = Vec::with_capacity(sealed.nonce.len() + sealed.ciphertext.len());
-                bytes.extend_from_slice(&sealed.nonce);
-                bytes.extend_from_slice(&sealed.ciphertext);
-                Wire::Binary(bytes)
-            }
-            None => Wire::Binary(payload),
-        }
+        super::channel_codec::seal(self.key.as_ref(), payload)
     }
 
     fn decode(&self, w: &Wire) -> Option<WireMessage> {
-        let json = match (w, &self.key) {
-            (Wire::Text(s), _) => s.clone().into_bytes(),
-            (Wire::Binary(b), Some(k)) => {
-                if b.len() < 12 {
-                    return None;
-                }
-                let (nonce, ciphertext) = b.split_at(12);
-                let mut n = [0u8; 12];
-                n.copy_from_slice(nonce);
-                let frame = SealedFrame {
-                    nonce: n,
-                    ciphertext: ciphertext.to_vec(),
-                };
-                crypto::open_frame(k, &frame).ok()?
-            }
-            (Wire::Binary(_), None) => return None, // no key to open binary
-        };
-        serde_json::from_slice(&json).ok()
+        super::channel_codec::decode(self.key.as_ref(), w)
     }
 }
 
